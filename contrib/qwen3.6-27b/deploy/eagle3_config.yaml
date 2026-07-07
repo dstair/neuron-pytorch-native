@@ -1,0 +1,16 @@
+model: /models/Qwen3.6-27B
+tensor_parallel_size: 4
+max_model_len: 256
+max_num_seqs: 1
+enable_prefix_caching: false
+port: 8000
+speculative_config:
+  method: eagle3
+  model: /models/eagle3-draft
+  num_speculative_tokens: 3
+additional_config:
+  neuron_config:
+    on_device_sampling_config:
+      all_greedy: "true"
+    num_batched_tokens_buckets: [256]
+    num_seqs_buckets: [1]
