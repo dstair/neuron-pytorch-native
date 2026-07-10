@@ -144,6 +144,50 @@ DeltaNet state are tiny at seq=256). Throughput-optimal is high-BS masked-dense;
 latency-optimal is BS=1 true-sparse (sparse only wins at BS≤4, since it gathers
 `T·K` experts and `T·K ≥ 64` once batch grows).
 
+### Decode — long-context batch sweep (seq=10000 and 20000, masked-dense MoE + `DN_NKI+GQATAIL`)
+
+At long context the KV cache is no longer negligible, so the batch ceiling is set by
+**device HBM** (24 GB/core), not by throughput scaling. Weights are a fixed
+~19.1 GB/core; each sequence's KV cache grows with batch × seq, and past a point the
+NEFF fails to load (`NRT_RESOURCE: Failed to allocate resource`).
+
+| Seq | BS | TPOT (ms) | tok/s | scale | notes |
+|--|--|--|--|--|--|
+| 10000 | 1 | 62.2 | 16.1 | 1.0× | 19.1 GB/core |
+| 10000 | 4 | 131.2 | 30.5 | 1.9× | |
+| 10000 | 8 | 164.3 | 48.7 | **3.0×** | **peak that fits** |
+| 10000 | 16 | — | — | — | OOM on device load |
+| 20000 | 1 | 122.5 | 8.2 | 1.0× | 19.1 GB/core |
+
+At seq=10000 the throughput knee is **BS=8 (48.7 tok/s)**; BS=16 exceeds HBM and
+fails to load. At seq=20000 the per-sequence KV cache is 2× larger, lowering the
+ceiling further. This is a memory ceiling, not a compute one — which is exactly where
+FP8 experts help (see below): halving the expert weights frees the headroom to push
+the batch ceiling higher. (20k batch sweep numbers pending; BS=1 shown.)
+
+### FP8 experts — a memory/capacity lever, not a decode-latency win
+
+FP8 (e4m3, per-output-channel row scales) on the MoE experts is wired in behind
+`MOE_FP8=1`. It is **CPU-validated coherent** (fp8-vs-bf16 cosine 0.9991) and delivers
+its headline benefit as a **memory saving: expert weights 16→8 GB/core, total
+~19→11 GB/core**.
+
+However, across three independent attempts it did **not** improve decode latency:
+
+| Path | Result |
+|---|---|
+| Hand-rolled FP8 grouped-matvec (`MOE_FP8=1`) | BS=1 72.3 ms vs 32.8 ms bf16 — **2.2× slower** |
+| `nkilib` fused MoE, bf16 (`MOE_NKILIB=1`) | BS=1 **28.2 ms (best bf16)**; FP8 path blocked |
+| `nkilib` fused MoE, FP8-row | compile/dtype wall on this toolchain (legacy-e4m3 vs torch e4m3fn) — not reachable |
+
+The reason is the BS=1 GEMV regime: FP8 replaces wide fused GEMMs with many tiny
+per-expert matvecs (moving-free=1), and the per-instruction dispatch overhead dwarfs
+the bandwidth saved. FP8's real value here is **capacity** — the ~8 GB/core it frees is
+what would let the long-context batch ceiling above go higher (e.g. BS=16 at 10k, which
+currently OOMs in bf16). Making FP8 also win latency would need the dequant fused into
+one wide kernel, or the BS≫1 regime where matvecs become GEMMs. All FP8 paths are
+default-off; **bf16 is the recommended decode default.**
+
 ### Prefill (prompt throughput)
 
 | Test | Framework | Config | Latency | Prompt tok/s |
