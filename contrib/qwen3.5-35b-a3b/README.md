@@ -137,12 +137,22 @@ DeltaNet state are tiny at seq=256). Throughput-optimal is high-BS masked-dense;
 latency-optimal is BS=1 true-sparse (sparse only wins at BS≤4, since it gathers
 `T·K` experts and `T·K ≥ 64` once batch grows).
 
-### Prefill
+### Prefill (prompt throughput)
 
-Prefill currently runs eager (pure-torch DeltaNet recurrence), so TTFT is not yet
-optimized — a compiled chunked-prefill path (as in the [27B](../qwen3.6-27b)) is a
-pending lever (`GQA_FLASH_PREFILL` / `DN_CHUNK_NKI` kernels are in the tree for
-this). No representative prefill throughput number is published yet.
+| Test | Framework | Config | Latency | Prompt tok/s |
+|---|---|---|---|---|
+| Bucketed prefill, flash-GQA + DeltaNet-chunk kernels | PyTorch Native | N=20000 | 77.2 s (warm) | **259.2** |
+| Eager prefill (pre-kernelization) | PyTorch Native | N=4000 | 146.7 s | 27.3 |
+| Eager prefill (pre-kernelization) | PyTorch Native | N=2000 | 68.4 s | 29.3 |
+
+The fast 20k path uses **eager sequence-bucketing** (`--bucket-chunk 2048
+--bucket-compile 0`) with the flash-GQA (`GQA_FLASH_PREFILL=1`) and chunked-DeltaNet
+(`DN_CHUNK_NKI=1`) NKI kernels plus pad-token masking, giving coherent output with no
+OOM and a ~9 min one-time cold compile. This was a ~9× improvement over the original
+eager path (which OOM'd at 20k and, when it fit, ran ~29 tok/s with a 2.7-hour
+compile). Two kernel bugs had to be fixed to make the fast path both correct and
+fast — pad-token DeltaNet-state corruption and an L2-norm epsilon-semantics mismatch
+on near-zero rows (see `kernels/tests/`).
 
 **20k context:** memory fits at ~19.1 GB/core, but cold-compile of the single fixed
 20k-decode graph is very long (attention-over-20000 tiling) — use a persistent
