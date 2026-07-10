@@ -158,12 +158,14 @@ NEFF fails to load (`NRT_RESOURCE: Failed to allocate resource`).
 | 10000 | 8 | 164.3 | 48.7 | **3.0×** | **peak that fits** |
 | 10000 | 16 | — | — | — | OOM on device load |
 | 20000 | 1 | 122.5 | 8.2 | 1.0× | 19.1 GB/core |
+| 20000 | 4 | — | — | — | OOM on device load |
 
 At seq=10000 the throughput knee is **BS=8 (48.7 tok/s)**; BS=16 exceeds HBM and
-fails to load. At seq=20000 the per-sequence KV cache is 2× larger, lowering the
-ceiling further. This is a memory ceiling, not a compute one — which is exactly where
-FP8 experts help (see below): halving the expert weights frees the headroom to push
-the batch ceiling higher. (20k batch sweep numbers pending; BS=1 shown.)
+fails to load. At seq=20000 the per-sequence KV cache is 2× larger, so the ceiling
+drops to **BS=1** — even BS=4 fails to load. This is a memory ceiling, not a compute
+one, and it is exactly where FP8 experts help (see below): halving the expert weights
+(~19→11 GB/core) frees the headroom to push the long-context batch ceiling higher
+(e.g. BS=16 at 10k, or BS>1 at 20k, both of which OOM in bf16 today).
 
 ### FP8 experts — a memory/capacity lever, not a decode-latency win
 
