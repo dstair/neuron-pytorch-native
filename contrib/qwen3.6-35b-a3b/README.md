@@ -1,10 +1,17 @@
-# Qwen3.5-35B-A3B (MoE) on Trainium2 (PyTorch Native)
+# Qwen3.6-35B-A3B (MoE) on Trainium2 (PyTorch Native)
 
-A PyTorch-Native inference implementation of the sparse-MoE **Qwen3.5-35B-A3B**
+A PyTorch-Native inference implementation of the sparse-MoE **Qwen3.6-35B-A3B**
 model (~3B active parameters of 35B) on a single Trainium2 device
 (`trn2.3xlarge`, TP=4, LNC=2). It shares the DeltaNet + GQA backbone structure of
 the [dense 27B](../qwen3.6-27b) but replaces the dense MLP with a 256-expert
 top-8 mixture of experts, and targets a fixed long-context (20,000-token) regime.
+
+> **Naming.** The model is published as
+> [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) on Hugging
+> Face, but its architecture class is `Qwen3_5MoeForConditionalGeneration`
+> (`model_type: qwen3_5_moe`) — "3.5" names the architecture family, "3.6" names
+> the release. The two are the same architecture, so this code runs on the HF
+> checkpoint unchanged.
 
 The whole 40-layer model — DeltaNet, GQA, and MoE — compiles to a single NEFF via
 `torch.compile(fullgraph=True, backend="neuron")`.
