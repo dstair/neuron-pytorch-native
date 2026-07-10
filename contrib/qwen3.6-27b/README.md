@@ -79,20 +79,47 @@ All are **default-off**; the baseline path is byte-identical without them.
 | `NORMFUSE=1` | NKI RMSNorm |
 | `LEANKV=1`, `NOREDUCE=1`, `DNF32STATE=1` | Reference levers, ruled out (kept for A/B) |
 
-## Results (trn2.3xlarge, TP=4, LNC=2, bf16)
+## Performance summary
 
-**Decode throughput** — batched decode is the product surface:
+All numbers are `trn2.3xlarge`, TP=4, LNC=2, bf16, measured with a
+`torch.neuron`-synchronized timer (async-enqueue artifacts excluded). "PyTorch
+Native" = this repo's `static_decode.py` (single compiled NEFF). "XLA" reference
+points are the [NxDI](https://github.com/aws-neuron/neuronx-distributed-inference)
+implementation of the same model on the torch-xla stack, for comparison.
 
-| Config | BS=1 | BS=8 | BS=16 |
-|---|---|---|---|
-| TPOT (ms, synced) | 35.5 | 127.6 | 253.5 |
-| Throughput (tok/s) | 28.2 | **62.7** | ~63 |
+### Decode (TPOT / throughput)
 
-BS=8 improved 55.6 → 58.8 → 62.7 tok/s across the batched-DeltaNet (`DNBATCHED_V2`)
-and GQA-tail (`GQATAIL`) kernels.
+| Test | Framework | BS | TPOT (ms, synced) | Throughput (tok/s) |
+|---|---|---|---|---|
+| Decode-only, `static_decode.py` | PyTorch Native | 1 | 35.9 | 28.2 |
+| Decode-only, `DNBATCHED_V2` + `GQATAIL` | PyTorch Native | 8 | **127.6** | **62.7** |
+| Decode-only, `DNBATCHED_V2` + `GQATAIL` | PyTorch Native | 16 | 253.5 | 63.1 |
+| Decode, NxDI (single-stream, published) | XLA | 1 | 54.2 | 18.5 |
+| Decode, NxDI offline `llm.generate` | XLA | 8 | 361 | 22.2 |
+| Decode, NxDI offline `llm.generate` | XLA | 16 | 525 | 30.5 |
 
-**Prefill** — compiled chunked prefill = **83.7 ms/forward @ S=128 BS=1
-(1530 prompt tok/s)** vs the eager-path artifact 6847 ms / 19 tok/s (~82×).
+- BS=1 synced steady-state TPOT is **35.9 ms**; the realistic host-synchronized
+  greedy loop (a `.item()` D2H per token) is ~43.6 ms.
+- BS=8 improved 55.6 → 58.8 → 62.7 tok/s across the batched-DeltaNet
+  (`DNBATCHED_V2`) and GQA-tail (`GQATAIL`) kernels.
+- Throughput plateaus ~63 tok/s: 8→16 adds only ~0.4 tok/s (per-step work grows
+  nearly linearly with batch; see the barrier-bound analysis below).
+- The XLA/NxDI rows are not a strict head-to-head (different serving overhead and
+  the offline path carries per-step Python scheduler + sampling cost) — treat them
+  as an independent reference, not an A/B against the Native numbers.
+
+### Prefill (TTFT / prompt throughput)
+
+| Test | Framework | Config | Latency | Prompt tok/s |
+|---|---|---|---|---|
+| Prefill, compiled chunked-DeltaNet kernel | PyTorch Native | S=128, BS=1 | **83.7 ms** (warm) | **1530** |
+| Prefill, eager fallback (unoptimized) | PyTorch Native | S=128, BS=1 | 6847 ms | 19 |
+
+Wiring the validated chunked-DeltaNet NKI kernel makes the prefill graph
+compilable (one custom call/layer instead of an un-compilable data-dependent torch
+chunk-loop), giving a **~82×** speedup over the eager fallback. Cold compile of the
+prefill graph is ~391 s (one-time; NEFF cached after). Enabling chunked prefill
+does not regress decode (BS=1 TPOT stays 36.7 ms).
 
 ### The core finding: BS=8 decode is barrier-bound, not compute-bound
 
@@ -112,9 +139,11 @@ headroom for larger batch, not per-step TPOT.
 ## Serving (vLLM-Neuron)
 
 `deploy/` contains scripts for serving the model through a vLLM-Neuron fork in
-three modes — baseline bf16, chunked-prefill, and EAGLE3 speculative decode
-(~3–3.8× decode speedup at BS=1). These target a container image and model weights
-referenced via `${ECR_REGISTRY}` / model mount paths; `source ../../.env` first
-(see the repo root README). The serving-side model plugin lives in a separate
-vLLM-Neuron fork and is not included here — these scripts document the runtime
-configuration (env flags, TP, mounts, EAGLE3 config).
+three modes — baseline bf16, chunked-prefill, and EAGLE3 speculative decode. These
+target a container image and model weights referenced via `${ECR_REGISTRY}` / model
+mount paths; `source ../../.env` first (see the repo root README). The serving-side
+model plugin lives in a separate vLLM-Neuron fork and is not included here — these
+scripts document the runtime configuration (env flags, TP, mounts, EAGLE3 config).
+
+> The performance numbers above are all from the PyTorch-Native `static_decode.py`
+> harness. vLLM-Neuron serving throughput numbers are intentionally omitted.

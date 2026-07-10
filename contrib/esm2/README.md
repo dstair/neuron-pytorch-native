@@ -108,6 +108,10 @@ torchrun --nproc-per-node 1 train_esm.py --model-size 650M \
 
 ### Validated Configurations (trn2.3xlarge, 96GB HBM)
 
+Framework: **PyTorch Native** (`torch.compile(backend="neuron")`). These are
+end-to-end MLM fine-tuning **training** steps (forward + backward + optimizer),
+not inference.
+
 | Model | Batch | Seq Len | Compile Time | Step Time | Samples/sec |
 |-------|-------|---------|--------------|-----------|-------------|
 | 8M | 4 | 128 | ~70s | ~0.7s | 5.7 |

@@ -97,35 +97,52 @@ Set `QWEN35_MODEL_PATH` (or `--model-path`) to the weights directory.
 | `MOE_FP8=1` | FP8 MoE experts |
 | `MOE_SHARED_ONLY`, `NOREDUCE`, `DN_PASSTHROUGH` | Diagnostics (default off) |
 
-## Results (trn2.3xlarge, TP=4, LNC=2, seq=2048, synced 50-iter)
+## Performance summary
 
-**Decode TPOT progression (BS=1):**
+All numbers are `trn2.3xlarge`, TP=4, LNC=2, measured with a `torch.neuron`-
+synchronized 50-iter timer. "PyTorch Native" = this repo's `static_decode_35b.py`
+(single compiled NEFF). The "XLA" reference is the
+[NxDI](https://github.com/aws-neuron/neuronx-distributed-inference) implementation
+of the same model (PR #60) on the torch-xla stack.
 
-| Config | TPOT | tok/s |
-|---|---|---|
-| masked-dense MoE (start) | 66.2 ms | 15.1 |
-| + true-sparse MoE (`MOE_SPARSE=1`) | 33.4 ms | 30.0 |
-| + DeltaNet micro-opt | 32.8 ms | 30.5 |
-| + `GQATAIL=1` | 24.4 ms | 40.9 |
-| **+ `DNBATCHED_V2=1`** | **23.2 ms** | **43.2** |
+### Decode — BS=1 optimization progression (seq=2048)
 
-2.86× total. True-sparse MoE gives ~2× (not ~8×) because the MoE expert GEMMs were
-only about half the step — DeltaNet/GQA/projections/norms/all-reduces are the rest.
+| Config | Framework | TPOT (ms) | tok/s |
+|---|---|---|---|
+| masked-dense MoE (start) | PyTorch Native | 66.2 | 15.1 |
+| + true-sparse MoE (`MOE_SPARSE=1`) | PyTorch Native | 33.4 | 30.0 |
+| + DeltaNet micro-opt | PyTorch Native | 32.8 | 30.5 |
+| + `GQATAIL=1` | PyTorch Native | 24.4 | 40.9 |
+| **+ `DNBATCHED_V2=1`** | PyTorch Native | **23.2** | **43.2** |
+| NxDI reference (PR #60) | XLA | 18.4 | 54.3 |
 
-**Batch sweep (seq=256, masked-dense MoE + `DN_NKI+GQATAIL+DNBATCHED_V2`):**
+2.86× total from these levers. True-sparse MoE gives ~2× (not ~8×) because the MoE
+expert GEMMs are only about half the step — DeltaNet / GQA / projections / norms /
+all-reduces are the rest. The NxDI (XLA) reference is faster at BS=1; it is the
+validated oracle (100% token-match vs CPU) but its MoE uses a non-portable NxDI
+library module.
 
-| BS | TPOT (ms) | tok/s | scale |
-|--|--|--|--|
-| 1 | 54.9 | 18.2 | 1.0× |
-| 4 | 70.1 | 57.0 | 3.1× |
-| 8 | 84.3 | 94.9 | 5.2× |
-| 16 | 120.4 | 132.9 | 7.3× |
-| 32 | 188.3 | 170.0 | 9.3× |
+### Decode — batch sweep (seq=256, masked-dense MoE + `DN_NKI+GQATAIL+DNBATCHED_V2`)
+
+| BS | Framework | TPOT (ms) | tok/s | scale |
+|--|--|--|--|--|
+| 1 | PyTorch Native | 54.9 | 18.2 | 1.0× |
+| 4 | PyTorch Native | 70.1 | 57.0 | 3.1× |
+| 8 | PyTorch Native | 84.3 | 94.9 | 5.2× |
+| 16 | PyTorch Native | 120.4 | 132.9 | 7.3× |
+| 32 | PyTorch Native | 188.3 | 170.0 | 9.3× |
 
 Near-linear throughput scaling to BS=32 with no OOM (weights fixed ~19 GB/core; KV +
 DeltaNet state are tiny at seq=256). Throughput-optimal is high-BS masked-dense;
 latency-optimal is BS=1 true-sparse (sparse only wins at BS≤4, since it gathers
 `T·K` experts and `T·K ≥ 64` once batch grows).
+
+### Prefill
+
+Prefill currently runs eager (pure-torch DeltaNet recurrence), so TTFT is not yet
+optimized — a compiled chunked-prefill path (as in the [27B](../qwen3.6-27b)) is a
+pending lever (`GQA_FLASH_PREFILL` / `DN_CHUNK_NKI` kernels are in the tree for
+this). No representative prefill throughput number is published yet.
 
 **20k context:** memory fits at ~19.1 GB/core, but cold-compile of the single fixed
 20k-decode graph is very long (attention-over-20000 tiling) — use a persistent
@@ -135,7 +152,7 @@ latency-optimal is BS=1 true-sparse (sparse only wins at BS≤4, since it gather
 
 The validated NxDI implementation
 (`aws-neuron/neuronx-distributed-inference` PR #60,
-`jimburtoft:contrib/qwen3.5-35b-a3b`) is the correctness oracle: 100% token-match
-vs CPU, BS=1 54.3 tok/s / 18.4 ms/tok on the same hardware. Its MoE uses an NxDI
-library module and is not portable, which is why this implementation carries its
-own MoE kernels and CPU oracle.
+`jimburtoft:contrib/qwen3.5-35b-a3b`, torch-xla) is the correctness oracle: 100%
+token-match vs CPU, BS=1 54.3 tok/s / 18.4 ms/tok on the same hardware. Its MoE uses
+an NxDI library module and is not portable, which is why this implementation carries
+its own MoE kernels and CPU oracle.

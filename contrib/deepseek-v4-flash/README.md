@@ -77,7 +77,9 @@ command to back up the sharded weights; `source ../../.env` to set the bucket
 
 ## Results (trn2.48xlarge, TP=64, BF16, 8-token generation, NEFF cached)
 
-Optimization progression on the full model:
+Framework: **PyTorch Native** (eager execution with `torch.compile(backend="neuron")`
+applied to the Hyper-Connections / sinkhorn subgraphs). End-to-end generation
+(prefill TTFT + decode). Optimization progression on the full model:
 
 | Step | TTFT | Decode tok/s | Total (8 tok) | Change |
 |---|---|---|---|---|
