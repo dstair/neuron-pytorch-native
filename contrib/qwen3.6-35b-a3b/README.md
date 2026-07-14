@@ -13,8 +13,9 @@ top-8 mixture of experts, and targets a fixed long-context (20,000-token) regime
 > the release. The two are the same architecture, so this code runs on the HF
 > checkpoint unchanged.
 
-The whole 40-layer model — DeltaNet, GQA, and MoE — compiles to a single NEFF via
-`torch.compile(fullgraph=True, backend="neuron")`.
+The whole 40-layer decode model compiles to a single NEFF via
+`torch.compile(fullgraph=True, backend="neuron")`. Long-context prefill uses four
+coarse 10-layer NEFFs to stay below the compiler instruction limit.
 
 ## Architecture
 
@@ -61,7 +62,8 @@ st_reader.py            safetensors weight reader / sharder
 kernels/                NKI kernels + torch.ops registrations (*_ops.py)
   deltanet_full_batched_35b*   batched DeltaNet decode (8 v-heads/core)
   deltanet_chunked_prefill_35b*  chunked-prefill DeltaNet
-  gqa_tail_35b*, gqa_flash_prefill_35b*  fused GQA decode tail + flash prefill
+  gqa_tail_35b*, gqa_flash_prefill_35b*  fused GQA decode tail + local flash prefill
+  gqa_cte_35b*, gqa_rope_kv_35b*  nkilib CTE attention + dynamic RoPE/KV update
   fp8_group_matvec*    FP8 grouped matvec for MoE experts
   tests/               CPU MoE oracle (vs canonical Qwen3Moe), device smoke tests
 deploy/profile/         device-profiling capture + neuron-explorer UI scripts
@@ -87,6 +89,14 @@ DN_NKI=1 MOE_SPARSE=1 GQATAIL=1 DNBATCHED_V2=1 \
   torchrun --nproc-per-node=4 static_decode_35b.py \
     --num-layers 40 --max-seq-len 2048 --batch-size 1 --bench
 
+# Validated compiled prefill, N=20000, BS=1
+PYTHONPATH=<nki-library>/src/nkilib_src \
+MOE_CTE=1 GQA_CTE_PREFILL=1 GQA_DYNAMIC_ROPE_KV=1 \
+DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
+  torchrun --nproc-per-node=4 static_decode_35b.py \
+    --num-layers 40 --max-seq-len 20480 --prefill-bench 20000 \
+    --bucket-chunk 1024 --bucket-compile 1 --prefill-splits 4 --skip-compile
+
 # CPU correctness (no device)
 python3 static_decode_35b.py --cpu --num-layers 40
 ```
@@ -101,6 +111,9 @@ Set `QWEN35_MODEL_PATH` (or `--model-path`) to the weights directory.
 | `MOE_SPARSE=1` | True-sparse MoE dispatch (gathers only the top-8 experts) — ~2× at BS=1 |
 | `GQATAIL=1` | Fused GQA attention-tail kernel |
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
+| `MOE_CTE=1` | Long-token nkilib context-encoding MoE kernel for prefill |
+| `GQA_CTE_PREFILL=1` | Prefix-aware nkilib CTE attention; requires `GQA_DYNAMIC_ROPE_KV=1` |
+| `DN_CHUNK_NKI=1`, `CHUNK_SIZE=16` | Stable long-context DeltaNet prefill kernel |
 | `MOE_FP8=1` | FP8 MoE experts |
 | `MOE_SHARED_ONLY`, `NOREDUCE`, `DN_PASSTHROUGH` | Diagnostics (default off) |
 
@@ -108,7 +121,7 @@ Set `QWEN35_MODEL_PATH` (or `--model-path`) to the weights directory.
 
 All numbers are `trn2.3xlarge`, TP=4, LNC=2, measured with a `torch.neuron`-
 synchronized 50-iter timer. "PyTorch Native" = this repo's `static_decode_35b.py`
-(single compiled NEFF). The "XLA" reference is the
+(one compiled decode NEFF or four coarse prefill NEFFs). The "XLA" reference is the
 [NxDI](https://github.com/aws-neuron/neuronx-distributed-inference) implementation
 of the same model (PR #60) on the torch-xla stack.
 
@@ -194,22 +207,45 @@ default-off; **bf16 is the recommended decode default.**
 
 | Test | Framework | Config | Latency | Prompt tok/s |
 |---|---|---|---|---|
+| **Compiled CTE-GQA + CTE-MoE + DeltaNet C16** | PyTorch Native | N=20000, bucket=1024 | **17.374 s** | **1151.1** |
+| Compiled CTE-GQA + CTE-MoE + DeltaNet C16 | PyTorch Native | N=20000, bucket=512 | 17.855 s | 1120.1 |
+| Compiled CTE-GQA + CTE-MoE + DeltaNet C16 | PyTorch Native | N=20000, bucket=2048 | 20.632 s | 969.4 |
+| Compiled flash-GQA + CTE-MoE + DeltaNet C16 | PyTorch Native | N=20000, bucket=512 | 20.886 s | 957.6 |
 | Bucketed prefill, flash-GQA + DeltaNet-chunk kernels | PyTorch Native | N=20000 | 77.2 s (warm) | **259.2** |
 | Eager prefill (pre-kernelization) | PyTorch Native | N=4000 | 146.7 s | 27.3 |
 | Eager prefill (pre-kernelization) | PyTorch Native | N=2000 | 68.4 s | 29.3 |
 
-The fast 20k path uses **eager sequence-bucketing** (`--bucket-chunk 2048
---bucket-compile 0`) with the flash-GQA (`GQA_FLASH_PREFILL=1`) and chunked-DeltaNet
-(`DN_CHUNK_NKI=1`) NKI kernels plus pad-token masking, giving coherent output with no
-OOM and a ~9 min one-time cold compile. This was a ~9× improvement over the original
-eager path (which OOM'd at 20k and, when it fit, ran ~29 tok/s with a 2.7-hour
-compile). Two kernel bugs had to be fixed to make the fast path both correct and
-fast — pad-token DeltaNet-state corruption and an L2-norm epsilon-semantics mismatch
-on near-zero rows (see `kernels/tests/`).
+The current 20k path uses 1024-token buckets, four compiled 10-layer segments,
+runtime bucket offsets/valid lengths, the CTE MoE kernel, and `CHUNK_SIZE=16`.
+The nkilib CTE attention kernel only visits the used KV prefix; it measured
+0.77-0.81 ms per production-shape GQA call versus 11.66-11.69 ms for the local
+fixed-KMAX flash kernel. At full depth this improves 957.6 to 1120.1 tok/s and
+preserves the validated real-prompt continuation. The warm and timed synthetic
+fingerprints were identical.
 
-**20k context:** memory fits at ~19.1 GB/core, but cold-compile of the single fixed
-20k-decode graph is very long (attention-over-20000 tiling) — use a persistent
-`NEURON_COMPILE_CACHE_URL` mount so it is a one-time cost, or seq-bucketing.
+CTE also removes the descriptor ceiling at bucket 2048: all four segments
+compiled and loaded. That configuration is nevertheless slower (969.4 tok/s).
+The CTE attention kernel itself scales efficiently from active-query sizes 512
+to 1024 to 2048 (about 0.79, 1.28, and 2.11 ms), so the regression is in the
+larger surrounding compiled graph. The matched bucket-1024 run measured 1151.1
+tok/s and is the current optimum.
+
+`GQA_CTE_PREFILL=1` needs a recent nkilib with `attention_cte` support for
+head-dim 256 and runtime `prior_used_len`; the nkilib bundled in the current DLC
+rejects head dimensions above 128. Point `PYTHONPATH` at a compatible
+`nki-library/src/nkilib_src`.
+
+The original 259.2 tok/s path used eager sequence bucketing
+(`--bucket-chunk 2048 --bucket-compile 0`) with local flash GQA and chunked
+DeltaNet. Two kernel bugs had to be fixed before compilation was trustworthy:
+pad-token DeltaNet-state corruption and an L2-norm epsilon-semantics mismatch on
+near-zero rows (see `kernels/tests/`). DeltaNet C32 is faster but becomes
+non-finite at long context, so C16 remains a correctness requirement.
+
+**20k context:** memory fits at ~19.1 GB/core. Preserve
+`NEURON_COMPILE_CACHE_URL` on NVMe: the first CTE-GQA run, including four segment
+compiles and the 20k warm pass, took 861.6 seconds; cached execution is 17.9
+seconds.
 
 ## Reference
 

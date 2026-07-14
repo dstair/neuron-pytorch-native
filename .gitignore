@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local planning notes
+**/prefill_optimization_plan.md
+
+# Local Qwen model experiment records (may contain instance paths and logs)
+contrib/qwen3.6-35b-a3b/experiments/

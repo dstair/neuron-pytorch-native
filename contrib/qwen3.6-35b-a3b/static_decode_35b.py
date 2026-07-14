@@ -69,15 +69,46 @@ USE_GQA_FLASH_PREFILL = os.environ.get("GQA_FLASH_PREFILL", "0") == "1"
 if USE_GQA_FLASH_PREFILL:
     import gqa_flash_prefill_35b_ops  # registers torch.ops.gqa35b.flash_prefill
 
+# Production nkilib context-encoding attention with fixed prior-cache storage and
+# runtime prior_used_len. Unlike the local flash kernel, it only computes over
+# the used prefix plus the active chunk.
+USE_GQA_CTE_PREFILL = os.environ.get("GQA_CTE_PREFILL", "0") == "1"
+if USE_GQA_CTE_PREFILL:
+    if USE_GQA_FLASH_PREFILL:
+        raise RuntimeError("GQA_CTE_PREFILL and GQA_FLASH_PREFILL are mutually exclusive")
+    import gqa_cte_35b_ops  # registers torch.ops.gqa35b.cte_prefill
+
+# Runtime-offset partial RoPE + aliased KV-cache writes. This removes q_base
+# specialization from compiled bucket graphs; it requires the flash chunk kernel,
+# which already consumes the same runtime scalar for its causal mask.
+USE_GQA_DYNAMIC_ROPE_KV = os.environ.get("GQA_DYNAMIC_ROPE_KV", "0") == "1"
+if USE_GQA_DYNAMIC_ROPE_KV:
+    if not (USE_GQA_FLASH_PREFILL or USE_GQA_CTE_PREFILL):
+        raise RuntimeError(
+            "GQA_DYNAMIC_ROPE_KV requires GQA_FLASH_PREFILL=1 or GQA_CTE_PREFILL=1"
+        )
+    import gqa_rope_kv_35b_ops  # registers torch.ops.gqa35b.rope_kv_dynamic
+if USE_GQA_CTE_PREFILL and not USE_GQA_DYNAMIC_ROPE_KV:
+    raise RuntimeError("GQA_CTE_PREFILL requires GQA_DYNAMIC_ROPE_KV=1")
+
 # NKI chunked-prefill DeltaNet kernel (env DN_CHUNK_NKI=1). ONE @nki.jit call/layer
 # for the whole-sequence chunked gated-delta-rule (Woodbury doubling), replacing the
 # pure-torch chunked_prefill loop that is compile-hostile under torch.compile
 # (NCC_IMGN901 vectorizer bug). Ported from 27B deltanet_chunked_v2 (V_HEADS 12->8).
 # Takes initial state, returns final state -> composes with bucketed prefill. Default OFF.
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "64"))
+# C=64 is unstable on deep real-weight prefixes even though random kernel tests
+# pass. C=32 is finite at S=2048 but fails at layer 18 around token 10752.
+# C=16 is finite through two full 40-layer S=20000 passes.
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "16"))
 USE_DN_CHUNK_NKI = os.environ.get("DN_CHUNK_NKI", "0") == "1"
 if USE_DN_CHUNK_NKI:
     import deltanet_chunked_prefill_35b_ops  # registers torch.ops.deltanet35b.chunked_prefill
+
+# Eager-only diagnostic for preserving the exact recurrent-kernel inputs at a
+# long-context failure. Keep disabled for compiled production runs.
+DN_CAPTURE_DIR = os.environ.get("DN_CAPTURE_DIR", "")
+DN_CAPTURE_LAYER = int(os.environ.get("DN_CAPTURE_LAYER", "-1"))
+DN_CAPTURE_CHUNK = int(os.environ.get("DN_CAPTURE_CHUNK", "-1"))
 
 # FP8 expert weights (env MOE_FP8=1, requires MOE_SPARSE=1). The MoE expert
 # GEMMs are ~90% of the BS=1 decode HBM read, and the step is 95% DMA-bound
@@ -103,6 +134,18 @@ USE_MOE_NKILIB = os.environ.get("MOE_NKILIB", "0") == "1"
 if USE_MOE_NKILIB:
     from nkilib.core.moe.moe_tkg.moe_tkg import moe_tkg as _nkilib_moe_tkg
     from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
+
+# Context-encoding MoE kernel (env MOE_CTE=1). Unlike moe_tkg, moe_cte accepts
+# long token dimensions and computes expert work in routed blocks. Routing
+# metadata is built at runtime with fixed tensor shapes by moe_cte_adapter.py.
+USE_MOE_CTE = os.environ.get("MOE_CTE", "0") == "1"
+if USE_MOE_CTE:
+    if USE_MOE_NKILIB:
+        raise RuntimeError("MOE_CTE and MOE_NKILIB are mutually exclusive")
+    from torch_neuronx import wrap_nki
+    from moe_cte_adapter import pack_local_routes
+    from moe_cte_35b import nki_moe_cte_35b
+    _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_35b)[2]
 
 
 def rw_to_global(rw_top, sel, device):
@@ -318,12 +361,14 @@ class StaticDecode35B(nn.Module):
             reg(f"l{i}_post_norm", lw["post_norm"], lw, "post_norm")
             # MoE (all layers)
             reg(f"l{i}_router", lw["router"], lw, "router")
-            if USE_MOE_NKILIB:
-                # Repack to the nkilib moe_tkg layout: gate_up [E,2I,H]->[E,H,2,I],
+            if USE_MOE_NKILIB or USE_MOE_CTE:
+                # Repack to the nkilib MoE layout: gate_up [E,2I,H]->[E,H,2,I],
                 # down [E,H,I]->[E,I,H]. FP8-ROW quant (per-out-channel) when MOE_FP8.
                 gu = lw["gate_up"]; dn = lw["down"]              # [E,2I,H],[E,H,I]
                 Ec = gu.shape[0]; II = gu.shape[1] // 2; HH = gu.shape[2]
                 if USE_MOE_FP8:
+                    if USE_MOE_CTE:
+                        raise RuntimeError("MOE_CTE does not yet support MOE_FP8")
                     gq, gs = quantize_experts_fp8(gu)           # weights are e4m3 below
                     dq, ds = quantize_experts_fp8(dn)
                     # quantize_experts_fp8 returns int8 [E,IN,OUT] + scale [E,OUT,1];
@@ -397,7 +442,20 @@ class StaticDecode35B(nn.Module):
         """x: [B, 1, H] (decode) or [1, S, H] (prefill). Returns same shape."""
         lead = x.shape[:-1]
         x2d = x.reshape(-1, D.HIDDEN)
+        if USE_MOE_CTE:
+            return self._moe_cte(i, x2d, lead).to(x.dtype)
         if USE_MOE_NKILIB:
+            # moe_tkg maps tokens to the NKI partition dimension (max 128).
+            # Prefill buckets are larger, so invoke the opaque kernel in fixed
+            # token chunks and restore the original leading shape afterward.
+            T = x2d.shape[0]
+            chunk = int(os.environ.get("MOE_PREFILL_CHUNK", "128"))
+            if chunk > 0 and T > chunk:
+                parts = []
+                for cs in range(0, T, chunk):
+                    ce = min(cs + chunk, T)
+                    parts.append(self._moe_nkilib(i, x2d[cs:ce], (ce - cs,)))
+                return torch.cat(parts, dim=0).reshape(*lead, D.HIDDEN).to(x.dtype)
             return self._moe_nkilib(i, x2d, lead).to(x.dtype)
         if USE_MOE_FP8:
             gate_up = getattr(self, f"l{i}_gate_up_q")   # int8 fp8 bytes
@@ -439,6 +497,58 @@ class StaticDecode35B(nn.Module):
         routed = functional_all_reduce(routed, "sum", self.tp_group)
         out = routed + shared
         return out.reshape(*lead, D.HIDDEN).to(x.dtype)
+
+    def _moe_cte(self, i, x2d, lead):
+        """Long-token MoE using nkilib's blockwise context-encoding kernel."""
+        T = x2d.shape[0]
+        E = self.e_hi - self.e_lo
+        block_size = int(os.environ.get("MOE_CTE_BLOCK", "512"))
+        if block_size % 256:
+            raise ValueError("MOE_CTE_BLOCK must be a multiple of 256")
+
+        xf = x2d.float()
+        logits = F.linear(xf, getattr(self, f"l{i}_router").float())
+        rw = F.softmax(logits, dim=1, dtype=torch.float)
+        rw_top, sel = torch.topk(rw, D.TOP_K, dim=-1)
+        if D.NORM_TOPK_PROB:
+            rw_top = rw_top / rw_top.sum(dim=-1, keepdim=True)
+
+        local = sel - self.e_lo
+        on_rank = (local >= 0) & (local < E)
+        local_safe = local.clamp(0, E - 1)
+        affinities = torch.zeros(T, E, dtype=torch.float, device=x2d.device)
+        affinities.scatter_add_(
+            1, local_safe, rw_top * on_rank.to(rw_top.dtype)
+        )
+        affinities = torch.cat(
+            [affinities, torch.zeros(1, E, dtype=affinities.dtype, device=x2d.device)]
+        ).to(torch.bfloat16)
+        hidden = torch.cat(
+            [x2d.to(torch.bfloat16), torch.zeros(1, D.HIDDEN, dtype=torch.bfloat16, device=x2d.device)]
+        )
+        token_position_to_id, block_to_expert, conditions = pack_local_routes(
+            sel.to(torch.int32), self.e_lo, E, block_size
+        )
+        routed = _nkilib_moe_cte_hop(
+            hidden,
+            affinities.reshape(-1, 1),
+            getattr(self, f"l{i}_k_gate_up"),
+            getattr(self, f"l{i}_k_down"),
+            token_position_to_id,
+            block_to_expert,
+            conditions,
+            block_size,
+        )
+        routed = routed[:T]
+        routed = functional_all_reduce(routed.float(), "sum", self.tp_group)
+
+        sg = torch.sigmoid(F.linear(xf, getattr(self, f"l{i}_sh_sigmoid").float()))
+        sh = F.linear(
+            F.silu(F.linear(xf, getattr(self, f"l{i}_sh_gate").float()))
+            * F.linear(xf, getattr(self, f"l{i}_sh_up").float()),
+            getattr(self, f"l{i}_sh_down").float(),
+        )
+        return (routed + sg * sh).reshape(*lead, D.HIDDEN)
 
     def _moe_nkilib(self, i, x2d, lead):
         """MoE via the nkilib moe_tkg fused kernel. Router computed here; the
@@ -731,7 +841,7 @@ class StaticDecode35B(nn.Module):
         logits = self._lin("lm_head_w", hidden[:, -1:, :])
         return logits.squeeze(0), dn_states, cv_states, kv_k, kv_v
 
-    def _deltanet_prefill(self, i, x, dn_states, cv_states):
+    def _deltanet_prefill(self, i, x, dn_states, cv_states, valid_len=None):
         di = D.deltanet_index(i)
         td = self.td
         KH, VH = td["dn_k_heads"], td["dn_v_heads"]
@@ -771,9 +881,18 @@ class StaticDecode35B(nn.Module):
         # rows would corrupt the carried state that decode reads. Zero beta (→ the
         # delta-rule k_beta/v_beta updates vanish = identity recurrence step) and g
         # (→ decay 1.0, harmless once beta=0) for pad rows. Same fix class as the
-        # vLLM chunked-prefill pad-token bug. Only the last chunk sets _dn_valid_len.
-        vlen = getattr(self, "_dn_valid_len", None)
-        if vlen is not None and vlen < S:
+        # vLLM chunked-prefill pad-token bug. The reusable compiled path passes
+        # valid_len as a runtime scalar so a partial final bucket does not create
+        # another graph specialization. The attribute remains for static eager
+        # controls.
+        if valid_len is not None:
+            positions = torch.arange(S, dtype=torch.int32, device=beta.device)
+            pad = (positions < valid_len.reshape(-1)[0]).to(beta.dtype)[:, None]
+            beta = beta * pad
+            g = g * pad
+        else:
+            vlen = getattr(self, "_dn_valid_len", None)
+        if valid_len is None and vlen is not None and vlen < S:
             pad = torch.zeros(S, VH, dtype=beta.dtype, device=beta.device)
             pad[:vlen] = 1.0
             beta = beta * pad
@@ -790,6 +909,35 @@ class StaticDecode35B(nn.Module):
             g_hm = g.transpose(0, 1).reshape(VH * S, 1).contiguous()
             beta_hm = beta.float().transpose(0, 1).reshape(VH * S, 1).contiguous()
             state_in = dn_states[di, 0].float()               # [VH*KD, VD]
+            capture_here = (
+                DN_CAPTURE_DIR
+                and i == DN_CAPTURE_LAYER
+                and getattr(self, "_prefill_chunk_index", -1) == DN_CAPTURE_CHUNK
+                and not getattr(self, "_dn_capture_done", False)
+            )
+            if capture_here:
+                os.makedirs(DN_CAPTURE_DIR, exist_ok=True)
+                torch.save(
+                    {
+                        "layer": i,
+                        "chunk_index": self._prefill_chunk_index,
+                        "state": state_in.detach().cpu(),
+                        "query": q_hm.detach().cpu(),
+                        "key": k_hm.detach().cpu(),
+                        "value": v_hm.detach().cpu(),
+                        "g": g_hm.detach().cpu(),
+                        "beta": beta_hm.detach().cpu(),
+                        "m_incl": self.chunk_m_incl.detach().cpu(),
+                        "m_strict": self.chunk_m_strict.detach().cpu(),
+                        "eye": self.chunk_eye.detach().cpu(),
+                    },
+                    os.path.join(
+                        DN_CAPTURE_DIR,
+                        f"dn_layer{i}_chunk{self._prefill_chunk_index}"
+                        f"_rank{self.rank}.pt",
+                    ),
+                )
+                self._dn_capture_done = True
             out_hm, new_state = torch.ops.deltanet35b.chunked_prefill(
                 state_in, q_hm, k_hm, v_hm, g_hm, beta_hm,
                 self.chunk_m_incl, self.chunk_m_strict, self.chunk_eye)
@@ -869,13 +1017,12 @@ class StaticDecode35B(nn.Module):
         out = functional_all_reduce(out, "sum", self.tp_group)
         return out.unsqueeze(0)
 
-    # ── Bucketed/chunked prefill (compiled ONCE, reused per chunk) ──
+    # ── Bucketed/chunked prefill ──
     def _gqa_prefill_chunk(self, i, x, q_base, chunk, kv_k, kv_v):
         """GQA for one prompt chunk of `chunk` tokens starting at global row
-        q_base (PYTHON INT). Writes this chunk's K/V into the full KV buffer
-        at [q_base : q_base+chunk] and flash-attends the chunk's queries against
-        the whole KMAX buffer via the dynamic-q_base chunk kernel (causal mask
-        also excludes the still-zero tail)."""
+        q_base. The established path receives a Python integer; the reusable
+        compiled path receives a runtime int32 [1,1] tensor and performs RoPE
+        lookup plus cache writes in an aliased NKI custom op."""
         gi = D.gqa_index(i)
         td = self.td
         QH = td["gqa_q_heads"]
@@ -893,32 +1040,52 @@ class StaticDecode35B(nn.Module):
         query = rms_norm(query, q_norm_w)
         key = rms_norm(key, k_norm_w)
 
-        # global positions for rope = q_base + [0..chunk); q_base is a Python int so
-        # this is a static-shape arange slice (matches the eager _gqa_prefill idiom;
-        # avoids the dynamic-tensor index_select that NRT-errored at chunk>0).
-        positions = torch.arange(q_base, q_base + chunk, device=x.device)
-        cos = self.rope_cos.squeeze(0).squeeze(0)[positions].unsqueeze(1)
-        sin = self.rope_sin.squeeze(0).squeeze(0)[positions].unsqueeze(1)
-        query, key = apply_rope(query, key, cos, sin)
-        query = query.to(x.dtype); key = key.to(x.dtype)
+        if USE_GQA_DYNAMIC_ROPE_KV:
+            q_f, k_active, k_filled, v_filled = torch.ops.gqa35b.rope_kv_dynamic(
+                query.permute(1, 0, 2).contiguous(),
+                key[:, 0].contiguous(),
+                value[:, 0].contiguous(),
+                self.rope_cos.squeeze(0).squeeze(0),
+                self.rope_sin.squeeze(0).squeeze(0),
+                kv_k[gi, 0, 0],
+                kv_v[gi, 0, 0],
+                q_base,
+            )
+            qb = q_base.float()
+        else:
+            # Static offset path retained for eager controls and old compile caches.
+            positions = torch.arange(q_base, q_base + chunk, device=x.device)
+            cos = self.rope_cos.squeeze(0).squeeze(0)[positions].unsqueeze(1)
+            sin = self.rope_sin.squeeze(0).squeeze(0)[positions].unsqueeze(1)
+            query, key = apply_rope(query, key, cos, sin)
+            query = query.to(x.dtype); key = key.to(x.dtype)
 
-        # Write chunk K/V into the full buffer at the contiguous positions
-        # [q_base : q_base+chunk]. NOTE: a multi-row scatter_ with an arange-derived
-        # expanded index is MISCOMPILED by torch.compile(backend=neuron) (the written
-        # buffer diverges from eager — verified kvbuf_maxdiff~0.03). index_copy_ along
-        # dim=2 with the 1-D `positions` index is the compile-safe contiguous write.
-        key_t = key.transpose(0, 1).to(kv_k.dtype)        # [NKV,chunk,HD]
-        val_t = value.transpose(0, 1).to(kv_v.dtype)
-        kv_k[gi, 0].index_copy_(1, positions, key_t)      # kv_k[gi,0]=[NKV,max_seq,HD]
-        kv_v[gi, 0].index_copy_(1, positions, val_t)
+            # scatter_ was observed to miscompile here; index_copy_ is safe when
+            # positions are static.
+            key_t = key.transpose(0, 1).to(kv_k.dtype)
+            val_t = value.transpose(0, 1).to(kv_v.dtype)
+            kv_k[gi, 0].index_copy_(1, positions, key_t)
+            kv_v[gi, 0].index_copy_(1, positions, val_t)
+            q_f = query.reshape(chunk, QH, HD).permute(1, 0, 2).float().contiguous()
+            k_filled = kv_k[gi, 0].reshape(-1, HD)
+            v_filled = kv_v[gi, 0].reshape(-1, HD)
+            qb = torch.full((1, 1), float(q_base), dtype=torch.float32, device=x.device)
 
-        if USE_GQA_FLASH_PREFILL:
+        if USE_GQA_CTE_PREFILL:
+            attn_out = torch.ops.gqa35b.cte_prefill(
+                (q_f * (1.0 / math.sqrt(HD))).to(torch.bfloat16),
+                k_active.transpose(0, 1).unsqueeze(0),
+                value[:, 0].to(torch.bfloat16).unsqueeze(0),
+                k_filled.transpose(0, 1).unsqueeze(0),
+                v_filled.unsqueeze(0),
+                q_base.reshape(1),
+            )
+            attn_out = attn_out.permute(1, 0, 2).reshape(chunk, QH * HD)
+        elif USE_GQA_FLASH_PREFILL:
             # Kernel computes in f32 (dma_transpose dst is f32) — cast the (bf16) KV
             # buffer + query to f32 so the kernel's dma_transpose src/dst dtypes match.
-            q_f = query.reshape(chunk, QH, HD).permute(1, 0, 2).float().contiguous()  # [QH,chunk,HD]
-            k_f = kv_k[gi, 0].reshape(-1, HD).float()                          # [KMAX,HD] (NKV=1)
-            v_f = kv_v[gi, 0].reshape(-1, HD).float()
-            qb = torch.full((1, 1), float(q_base), dtype=torch.float32, device=x.device)
+            k_f = k_filled.float()
+            v_f = v_filled.float()
             attn_out = torch.ops.gqa35b.flash_prefill_chunk(q_f, k_f, v_f, qb)  # [QH,chunk,HD]
             attn_out = attn_out.permute(1, 0, 2).reshape(chunk, QH * HD)
         else:
@@ -942,30 +1109,44 @@ class StaticDecode35B(nn.Module):
         out = functional_all_reduce(out, "sum", self.tp_group)
         return out.unsqueeze(0)
 
-    def _prefill_chunk_layers(self, chunk_ids, q_base, dn_states, cv_states, kv_k, kv_v):
-        """All 40 layers for ONE prompt chunk. Fixed shapes (chunk length, KMAX
-        KV buffer) => compiles to a single NEFF, reused for every chunk. State
-        (DeltaNet recurrence + conv + KV cache) carries across chunks via the
-        buffers. Returns the chunk's final hidden [1,chunk,H]."""
-        chunk = chunk_ids.shape[0]
-        hidden = F.embedding(chunk_ids, self.embed).unsqueeze(0).float()   # [1,chunk,H]
-        for i in range(D.NUM_LAYERS):
+    def _prefill_chunk_layer_range(
+        self, hidden, q_base, valid_len, dn_states, cv_states, kv_k, kv_v,
+        start, end
+    ):
+        """Run one fixed layer range for a prompt chunk."""
+        chunk = hidden.shape[1]
+        for i in range(start, end):
             normed = rms_norm(hidden, getattr(self, f"l{i}_input_norm"))
             if D.layer_type(i) == "deltanet":
                 # DeltaNet prefill already carries state via dn_states/cv_states.
-                hidden = hidden + self._deltanet_prefill(i, normed, dn_states, cv_states)
+                hidden = hidden + self._deltanet_prefill(
+                    i, normed, dn_states, cv_states, valid_len
+                )
             else:
                 hidden = hidden + self._gqa_prefill_chunk(i, normed, q_base, chunk, kv_k, kv_v)
             normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
             hidden = hidden + self._moe(i, normed)
         return hidden
 
+    def _prefill_chunk_layers(
+        self, chunk_ids, q_base, valid_len, dn_states, cv_states, kv_k, kv_v
+    ):
+        """All layers for one prompt chunk."""
+        hidden = F.embedding(chunk_ids, self.embed).unsqueeze(0).float()
+        return self._prefill_chunk_layer_range(
+            hidden, q_base, valid_len, dn_states, cv_states, kv_k, kv_v,
+            0, D.NUM_LAYERS,
+        )
+
     def prefill_bucketed(self, input_ids, deltanet_states, conv_states,
-                         kv_cache_k, kv_cache_v, chunk=2048, compile_chunk=True):
+                         kv_cache_k, kv_cache_v, chunk=2048, compile_chunk=True,
+                         compile_splits=1):
         """Bucketed prefill: split the prompt into fixed `chunk`-size pieces and
-        run each through ONE compiled _prefill_chunk_layers NEFF (reused), instead
-        of one giant eager 20k graph. The KV buffer must be sized >= padded length.
-        Returns last-token logits + updated states."""
+        run each through compiled _prefill_chunk_layers instead of one giant eager
+        20k graph. With GQA_DYNAMIC_ROPE_KV, q_base and valid length are runtime
+        scalars, allowing one graph set to serve every full or partial bucket.
+        The KV buffer must be sized >= padded length. Returns last-token logits
+        plus updated states."""
         S = input_ids.shape[0]
         dn_states = deltanet_states.clone()
         cv_states = conv_states.clone()
@@ -974,13 +1155,74 @@ class StaticDecode35B(nn.Module):
         n_chunks = (S + chunk - 1) // chunk
         dev = input_ids.device
 
+        if compile_splits < 1 or compile_splits > D.NUM_LAYERS:
+            raise ValueError("compile_splits must be in [1, NUM_LAYERS]")
+        if compile_chunk and DN_CAPTURE_DIR:
+            raise ValueError("DN_CAPTURE_DIR is supported only with --bucket-compile 0")
+
+        segment_fns = None
         fn = self._prefill_chunk_layers
-        if compile_chunk:
+        if compile_chunk and compile_splits == 1:
             fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        elif compile_chunk:
+            step = math.ceil(D.NUM_LAYERS / compile_splits)
+            segment_fns = []
+            for start in range(0, D.NUM_LAYERS, step):
+                end = min(start + step, D.NUM_LAYERS)
+
+                def segment(
+                    hidden, q_base, valid_len, dn, cv, kk, vv, s=start, e=end
+                ):
+                    return self._prefill_chunk_layer_range(
+                        hidden, q_base, valid_len, dn, cv, kk, vv, s, e
+                    )
+
+                segment_fns.append(torch.compile(
+                    segment, backend="neuron", fullgraph=True, dynamic=False
+                ))
+        elif compile_splits > 1:
+            step = math.ceil(D.NUM_LAYERS / compile_splits)
+            segment_fns = []
+            for start in range(0, D.NUM_LAYERS, step):
+                end = min(start + step, D.NUM_LAYERS)
+
+                def segment(
+                    hidden, q_base, valid_len, dn, cv, kk, vv, s=start, e=end
+                ):
+                    return self._prefill_chunk_layer_range(
+                        hidden, q_base, valid_len, dn, cv, kk, vv, s, e
+                    )
+
+                segment_fns.append(segment)
 
         last_hidden = None
         last_valid = 0
+        trace_finite = os.environ.get("PREFILL_TRACE_FINITE", "0") == "1"
+
+        def report_finite(chunk_idx, segment_idx):
+            if not trace_finite or self.rank != 0:
+                return
+            tensors = {
+                "hidden": last_hidden,
+                "dn": dn_states,
+                "conv": cv_states,
+            }
+            status = []
+            for name, tensor in tensors.items():
+                host = tensor.detach().cpu().float()
+                finite = torch.isfinite(host)
+                status.append(
+                    f"{name}={bool(finite.all())}"
+                    f"/max={float(host[finite].abs().max()) if bool(finite.any()) else float('nan'):.4e}"
+                )
+            print(
+                f"  PREFILL finite chunk={chunk_idx} segment={segment_idx}: "
+                + " ".join(status),
+                flush=True,
+            )
+
         for c in range(n_chunks):
+            self._prefill_chunk_index = c
             cs = c * chunk
             ce = min(cs + chunk, S)
             csz = ce - cs
@@ -990,14 +1232,36 @@ class StaticDecode35B(nn.Module):
             ids[:csz] = input_ids[cs:ce]
             # Tell DeltaNet how many rows are real so it zeros beta/g for the pad
             # tail (only the final chunk is padded). Prevents pad tokens corrupting
-            # the recurrent state that decode inherits. None on full chunks.
-            self._dn_valid_len = csz if csz < chunk else None
-            # q_base as a plain int: rope/KV indexing use `cs + arange` (static-shape,
-            # avoids the dynamic-tensor index_select that NRT-errored); the kernel's
-            # [1,1] q_base tensor is built inside _gqa_prefill_chunk from this int.
-            last_hidden = fn(ids, cs, dn_states, cv_states, kv_k, kv_v)
+            # the recurrent state that decode inherits.
+            if USE_GQA_DYNAMIC_ROPE_KV:
+                self._dn_valid_len = None
+                q_base_arg = torch.full(
+                    (1, 1), cs, dtype=torch.int32, device=dev
+                )
+                valid_len_arg = torch.full(
+                    (1, 1), csz, dtype=torch.int32, device=dev
+                )
+            else:
+                self._dn_valid_len = csz if csz < chunk else None
+                q_base_arg = cs
+                valid_len_arg = None
+            if segment_fns is None:
+                last_hidden = fn(
+                    ids, q_base_arg, valid_len_arg,
+                    dn_states, cv_states, kv_k, kv_v
+                )
+                report_finite(c, 0)
+            else:
+                last_hidden = F.embedding(ids, self.embed).unsqueeze(0).float()
+                for segment_idx, segment_fn in enumerate(segment_fns):
+                    last_hidden = segment_fn(
+                        last_hidden, q_base_arg, valid_len_arg,
+                        dn_states, cv_states, kv_k, kv_v
+                    )
+                    report_finite(c, segment_idx)
             last_valid = csz
         self._dn_valid_len = None
+        self._prefill_chunk_index = -1
 
         hidden = rms_norm(last_hidden, self.final_norm)
         logits = self._lin("lm_head_w", hidden[:, last_valid - 1:last_valid, :])
@@ -1171,7 +1435,7 @@ def main():
     ap.add_argument("--num-tokens", type=int, default=16)
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--num-layers", type=int, default=None,
-                    help="Override layer count for fast bring-up (multiple of 4).")
+                    help="Override layer count with a model prefix for fast bring-up.")
     ap.add_argument("--skip-compile", action="store_true")
     ap.add_argument("--skip-prefill", action="store_true")
     ap.add_argument("--cpu", action="store_true",
@@ -1190,12 +1454,17 @@ def main():
                     help="If >0, time a prefill of a synthetic N-token prompt "
                          "(prompt-ingest throughput) and exit. Reports tok/s.")
     ap.add_argument("--bucket-chunk", type=int, default=0,
-                    help="If >0, use bucketed prefill with this chunk size (one "
-                         "compiled NEFF reused per chunk). 0 = eager whole-prompt.")
+                    help="If >0, use bucketed prefill with this chunk size. "
+                         "GQA_DYNAMIC_ROPE_KV=1 reuses compiled segments across "
+                         "runtime offsets and partial final buckets.")
     ap.add_argument("--bucket-compile", type=int, default=1,
-                    help="1 = torch.compile the per-chunk fn (one NEFF); 0 = run the "
-                         "chunk loop EAGERLY (bit-exact vs eager prefill, avoids the "
+                    help="1 = compile the per-chunk fn; 0 = run the chunk loop "
+                         "EAGERLY (bit-exact vs eager prefill, avoids the "
                          "giant-graph compile without the compiled-kernel numerics drift).")
+    ap.add_argument("--prefill-splits", type=int, default=1,
+                    help="Number of coarse compiled layer segments per bucket. "
+                         "Use 4 for 40 layers to stay below the compiler's "
+                         "5-million-instruction graph limit.")
     ap.add_argument("--bench", action="store_true",
                     help="After decode, run a synced-TPOT benchmark window.")
     ap.add_argument("--bench-iters", type=int, default=50,
@@ -1210,7 +1479,8 @@ def main():
         D.load_from_config(cfg_path)
 
     if args.num_layers is not None:
-        assert args.num_layers % D.FULL_ATTN_INTERVAL == 0
+        if not 1 <= args.num_layers <= D.NUM_LAYERS:
+            ap.error(f"--num-layers must be in [1, {D.NUM_LAYERS}]")
         D.NUM_LAYERS = args.num_layers
         D.NUM_GQA = sum(1 for i in range(D.NUM_LAYERS) if D.layer_type(i) == "gqa")
         D.NUM_DELTANET = D.NUM_LAYERS - D.NUM_GQA
@@ -1284,7 +1554,8 @@ def main():
             if use_bucket:
                 logits, *_ = mod.prefill_bucketed(pid, dn_states, conv_states, kv_k, kv_v,
                                                   chunk=bchunk,
-                                                  compile_chunk=(args.bucket_compile == 1))
+                                                  compile_chunk=(args.bucket_compile == 1),
+                                                  compile_splits=args.prefill_splits)
             else:
                 logits, *_ = mod.prefill(pid, dn_states, conv_states, kv_k, kv_v)
             _ = int(logits[0].argmax())   # force materialization
@@ -1297,6 +1568,15 @@ def main():
                 tag = "warmup" if w == 0 else "TIMED "
                 print(f"  PREFILL {tag} N={N} ({mode}): {dt*1000:.1f} ms  |  {N/dt:.1f} prompt tok/s"
                       f"{' (incl compile)' if w == 0 else ''}")
+                if os.environ.get("PREFILL_FINGERPRINT", "0") == "1":
+                    lf = logits.float()
+                    top = torch.topk(lf[0], 5).indices
+                    print(
+                        "  PREFILL fingerprint:"
+                        f" sum={float(lf.sum()):.8e}"
+                        f" norm={float(torch.linalg.vector_norm(lf)):.8e}"
+                        f" top5={[int(v) for v in top]}"
+                    )
         return
 
     # Optional real-prompt prefill: --prompt-ids "760,6511,..." runs the (eager)
@@ -1309,7 +1589,8 @@ def main():
         if args.bucket_chunk > 0:
             logits, dn_states, conv_states, kv_k, kv_v = mod.prefill_bucketed(
                 in_t, dn_states, conv_states, kv_k, kv_v,
-                chunk=args.bucket_chunk, compile_chunk=(args.bucket_compile == 1))
+                chunk=args.bucket_chunk, compile_chunk=(args.bucket_compile == 1),
+                compile_splits=args.prefill_splits)
         else:
             logits, dn_states, conv_states, kv_k, kv_v = mod.prefill(
                 in_t, dn_states, conv_states, kv_k, kv_v)
