@@ -68,6 +68,21 @@ def main():
     torch.manual_seed(0)
     random_routes = torch.stack([torch.randperm(256)[:8] for _ in range(2048)]).to(torch.int32)
     check_case(random_routes, expert_lo=64, num_local_experts=64, block_size=512)
+
+    # Exact block boundaries and duplicate assignments are important because the
+    # NKI packer uses this implementation as its byte-for-byte oracle.
+    boundary_routes = torch.full((1024, 8), 255, dtype=torch.int32)
+    boundary_flat = boundary_routes.reshape(-1)
+    cursor = 0
+    for expert, count in enumerate((255, 256, 257, 511, 512, 513)):
+        boundary_flat[cursor : cursor + count] = 64 + expert
+        cursor += count
+    check_case(boundary_routes, expert_lo=64, num_local_experts=64, block_size=256)
+    check_case(boundary_routes, expert_lo=64, num_local_experts=64, block_size=512)
+
+    duplicate_routes = torch.full((1024, 8), 127, dtype=torch.int32)
+    duplicate_routes[:, :] = 73
+    check_case(duplicate_routes, expert_lo=64, num_local_experts=64, block_size=256)
     print("moe_cte routing adapter: all CPU checks passed")
 
 

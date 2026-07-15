@@ -139,13 +139,18 @@ if USE_MOE_NKILIB:
 # long token dimensions and computes expert work in routed blocks. Routing
 # metadata is built at runtime with fixed tensor shapes by moe_cte_adapter.py.
 USE_MOE_CTE = os.environ.get("MOE_CTE", "0") == "1"
+USE_MOE_CTE_NKI_PACK = os.environ.get("MOE_CTE_NKI_PACK", "0") == "1"
 if USE_MOE_CTE:
     if USE_MOE_NKILIB:
         raise RuntimeError("MOE_CTE and MOE_NKILIB are mutually exclusive")
     from torch_neuronx import wrap_nki
-    from moe_cte_adapter import pack_local_routes
-    from moe_cte_35b import nki_moe_cte_35b
-    _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_35b)[2]
+    if USE_MOE_CTE_NKI_PACK:
+        from moe_cte_35b import nki_moe_cte_routed_35b
+        _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_routed_35b)[2]
+    else:
+        from moe_cte_adapter import pack_local_routes
+        from moe_cte_35b import nki_moe_cte_35b
+        _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_35b)[2]
 
 
 def rw_to_global(rw_top, sel, device):
@@ -505,6 +510,8 @@ class StaticDecode35B(nn.Module):
         block_size = int(os.environ.get("MOE_CTE_BLOCK", "512"))
         if block_size % 256:
             raise ValueError("MOE_CTE_BLOCK must be a multiple of 256")
+        if USE_MOE_CTE_NKI_PACK and block_size not in (256, 512):
+            raise ValueError("MOE_CTE_NKI_PACK supports MOE_CTE_BLOCK=256 or 512")
 
         xf = x2d.float()
         logits = F.linear(xf, getattr(self, f"l{i}_router").float())
@@ -526,19 +533,30 @@ class StaticDecode35B(nn.Module):
         hidden = torch.cat(
             [x2d.to(torch.bfloat16), torch.zeros(1, D.HIDDEN, dtype=torch.bfloat16, device=x2d.device)]
         )
-        token_position_to_id, block_to_expert, conditions = pack_local_routes(
-            sel.to(torch.int32), self.e_lo, E, block_size
-        )
-        routed = _nkilib_moe_cte_hop(
-            hidden,
-            affinities.reshape(-1, 1),
-            getattr(self, f"l{i}_k_gate_up"),
-            getattr(self, f"l{i}_k_down"),
-            token_position_to_id,
-            block_to_expert,
-            conditions,
-            block_size,
-        )
+        if USE_MOE_CTE_NKI_PACK:
+            routed = _nkilib_moe_cte_hop(
+                hidden,
+                affinities.reshape(-1, 1),
+                getattr(self, f"l{i}_k_gate_up"),
+                getattr(self, f"l{i}_k_down"),
+                sel.to(torch.int32),
+                self.e_lo,
+                block_size,
+            )
+        else:
+            token_position_to_id, block_to_expert, conditions = pack_local_routes(
+                sel.to(torch.int32), self.e_lo, E, block_size
+            )
+            routed = _nkilib_moe_cte_hop(
+                hidden,
+                affinities.reshape(-1, 1),
+                getattr(self, f"l{i}_k_gate_up"),
+                getattr(self, f"l{i}_k_down"),
+                token_position_to_id,
+                block_to_expert,
+                conditions,
+                block_size,
+            )
         routed = routed[:T]
         routed = functional_all_reduce(routed.float(), "sum", self.tp_group)
 

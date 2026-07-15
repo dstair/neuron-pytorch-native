@@ -207,7 +207,9 @@ default-off; **bf16 is the recommended decode default.**
 
 | Test | Framework | Config | Latency | Prompt tok/s |
 |---|---|---|---|---|
-| **Compiled CTE-GQA + CTE-MoE + DeltaNet C16** | PyTorch Native | N=20000, bucket=1024 | **17.374 s** | **1151.1** |
+| **Compiled CTE-GQA + fused NKI-routed CTE-MoE + DeltaNet C16** | PyTorch Native | BS=1, N=20000, bucket=1024 | **13.488 s** | **1482.8** |
+| Compiled CTE-GQA + Torch-routed CTE-MoE + DeltaNet C16 | PyTorch Native | BS=1, N=20000, bucket=1024 | 17.374 s | 1151.1 |
+| Batched compiled CTE-GQA + Torch-routed CTE-MoE + DeltaNet C16 | PyTorch Native | BS=2, N=20000 each, bucket=1024 | 41.069 s | 974.0 aggregate |
 | Compiled CTE-GQA + CTE-MoE + DeltaNet C16 | PyTorch Native | N=20000, bucket=512 | 17.855 s | 1120.1 |
 | Compiled CTE-GQA + CTE-MoE + DeltaNet C16 | PyTorch Native | N=20000, bucket=2048 | 20.632 s | 969.4 |
 | Compiled flash-GQA + CTE-MoE + DeltaNet C16 | PyTorch Native | N=20000, bucket=512 | 20.886 s | 957.6 |
@@ -215,8 +217,9 @@ default-off; **bf16 is the recommended decode default.**
 | Eager prefill (pre-kernelization) | PyTorch Native | N=4000 | 146.7 s | 27.3 |
 | Eager prefill (pre-kernelization) | PyTorch Native | N=2000 | 68.4 s | 29.3 |
 
-The current 20k path uses 1024-token buckets, four compiled 10-layer segments,
-runtime bucket offsets/valid lengths, the CTE MoE kernel, and `CHUNK_SIZE=16`.
+The fastest validated 20k path uses 1024-token buckets, four compiled 10-layer
+segments, runtime bucket offsets/valid lengths, the fused NKI-routed CTE MoE
+kernel (`MOE_CTE_NKI_PACK=1`), and `CHUNK_SIZE=16`.
 The nkilib CTE attention kernel only visits the used KV prefix; it measured
 0.77-0.81 ms per production-shape GQA call versus 11.66-11.69 ms for the local
 fixed-KMAX flash kernel. At full depth this improves 957.6 to 1120.1 tok/s and
@@ -227,8 +230,51 @@ CTE also removes the descriptor ceiling at bucket 2048: all four segments
 compiled and loaded. That configuration is nevertheless slower (969.4 tok/s).
 The CTE attention kernel itself scales efficiently from active-query sizes 512
 to 1024 to 2048 (about 0.79, 1.28, and 2.11 ms), so the regression is in the
-larger surrounding compiled graph. The matched bucket-1024 run measured 1151.1
-tok/s and is the current optimum.
+larger surrounding compiled graph. The matched bucket-1024 Torch-route run
+measured 1151.1 tok/s.
+
+The fused route path replaces the compiled `one_hot().cumsum()` metadata packer
+with an NKI stable compaction inside the existing CTE custom call. It passed 96
+exact metadata cases across both production token counts, both block sizes, and
+all four TP expert ranges. Distributed fused CTE output matched the
+precomputed-metadata path exactly, and the four-layer BS=2 isolation test still
+matched independent BS=1 executions.
+
+Three synchronized cache-hot BS=1 runs measured 13.4834, 13.4967, and
+13.4878 seconds; the 13.4878-second median is 1482.8 tok/s. A matched
+8-DeltaNet/2-GQA segment improved from 188.89 to 122.26 ms, total HBM traffic
+fell from 31.96 to 3.30 GB, route HBM traffic fell from 24.94 GB to 45.9 MB,
+and the old `reduce-window` instruction disappeared. Standalone route packing
+measured 2.420 ms for 8,192 assignments and 3.777 ms for 16,384 assignments
+(1.56x scaling). The fallback remains available with
+`MOE_CTE_NKI_PACK=0`; default-on status is pending the full BS=2 measurement.
+
+Homogeneous batching is implemented with independent DeltaNet, convolution, and
+KV state per prompt while retaining one custom call per layer. A four-layer
+BS=2 isolation test with distinct prompts and a partial final bucket matched
+independent BS=1 runs with cosine >=0.999936 across logits and all carried
+states. Full S=20000 BS=2 loaded successfully and all returned states were
+finite on the Torch-route baseline, but latency increased 2.36x for 2x the
+tokens: 41.069 s / 974.0 aggregate tok/s. This is 15.4% below its matched
+BS=1 baseline, so BS=4 was not compiled.
+
+Isolated production-shape profiles explain part of the scaling limit. The C16
+DeltaNet call increased from 11.57-11.93 ms at B=1 to 22.58-22.92 ms at B=2
+because its independent recurrent streams execute sequentially. The opaque CTE
+expert kernel itself stayed near 6.7-7.0 ms for 1024 versus 2048 flattened
+tokens.
+
+Full 10-layer segment traces locate the superlinear regression in the routing
+wrapper around that expert kernel. For the matched 8-DeltaNet/2-GQA segment,
+BS=1 to BS=2 increased from 188.9 to 471.0 ms. The
+`pack_local_routes()` prefix scan at `moe_cte_adapter.py:50` increased from
+61.3 to 258.3 ms and its attributed HBM traffic increased from 24.9 to
+105.7 GB. Neuron lowers the `group_hot.cumsum(dim=0)` to HLO
+`reduce-window` backed by TensorE MATMUL/LDWEIGHTS. DeltaNet increased from
+82.4 to 165.6 ms. Those two changes explain 99% of the matched segment
+regression. The alternating 7-DeltaNet/3-GQA segment showed the same result:
+485.7 ms total, 263.7 ms in the route scan, and 145.6 ms in DeltaNet.
+The fused NKI route path removes this scan; its full BS=2 throughput is pending.
 
 `GQA_CTE_PREFILL=1` needs a recent nkilib with `attention_cte` support for
 head-dim 256 and runtime `prior_used_len`; the nkilib bundled in the current DLC
@@ -242,7 +288,8 @@ pad-token DeltaNet-state corruption and an L2-norm epsilon-semantics mismatch on
 near-zero rows (see `kernels/tests/`). DeltaNet C32 is faster but becomes
 non-finite at long context, so C16 remains a correctness requirement.
 
-**20k context:** memory fits at ~19.1 GB/core. Preserve
+**20k context:** BS=1 memory fits at ~19.1 GB/core; BS=2 prefill also loads,
+with about 0.42 GB/core of persistent K/V cache. Preserve
 `NEURON_COMPILE_CACHE_URL` on NVMe: the first CTE-GQA run, including four segment
 compiles and the 20k warm pass, took 861.6 seconds; cached execution is 17.9
 seconds.

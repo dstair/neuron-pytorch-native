@@ -62,6 +62,11 @@ harness for a 35B sparse-MoE hybrid model: 40 layers = [DeltaNet ×3, GQA ×1] �
   the same model but `st_reader.py` / `model_dims.py` expect the packing they were
   written for. If loading a differently-packed copy, update the reader accordingly
   (dims/routing/RoPE are unchanged — no perf difference).
+- **CTE GQA needs a newer nkilib than the current DLC bundle.** The bundled
+  `attention_cte` rejects head-dim 256. The validated source is nki-library commit
+  `1ee625782cb1bf91b40bccab741a82c726445080`, exposed with
+  `PYTHONPATH=<nki-library>/src/nkilib_src`. Any replacement must support
+  head-dim 256, prefix K/V, and runtime `prior_used_len`.
 
 ## Run recipes (validated)
 
@@ -78,6 +83,17 @@ expect it to echo the prompt back (the documented greedy loop).
 
 CPU correctness (no device): `python3 kernels/tests/test_moe_oracle_cpu.py --tokens 8`.
 
+Compiled long-context prefill, N=20000, BS=1:
+```
+PYTHONPATH=<nki-library>/src/nkilib_src \
+MOE_CTE=1 MOE_CTE_NKI_PACK=1 GQA_CTE_PREFILL=1 GQA_DYNAMIC_ROPE_KV=1 \
+DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
+  torchrun --nproc-per-node=4 static_decode_35b.py \
+    --model-path <weights> --max-seq-len 20480 --num-layers 40 \
+    --prefill-bench 20000 --bucket-chunk 1024 --bucket-compile 1 \
+    --prefill-splits 4 --skip-compile
+```
+
 ### Flags that matter
 
 | Flag | Effect |
@@ -88,6 +104,8 @@ CPU correctness (no device): `python3 kernels/tests/test_moe_oracle_cpu.py --tok
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
 | `MOE_FP8=1` | FP8 experts — memory lever only (see FP8 gotcha) |
 | `GQA_FLASH_PREFILL=1`, `DN_CHUNK_NKI=1` | Prefill kernels (see prefill recipe) |
+| `GQA_CTE_PREFILL=1`, `GQA_DYNAMIC_ROPE_KV=1` | Prefix-aware compiled GQA prefill |
+| `MOE_CTE_NKI_PACK=1` | Fuse stable NKI route packing into the CTE MoE call |
 
 ## Hard-won gotchas (each cost real time)
 
@@ -113,7 +131,7 @@ CPU correctness (no device): `python3 kernels/tests/test_moe_oracle_cpu.py --tok
 - **Sparse MoE does not scale to BS≥16.** `MOE_SPARSE=1` gathers `T·K` experts;
   the gathered graph explodes the *host* compiler memory at BS≥16 (F137 / OOM /
   host wedge). Use masked-dense MoE for BS≥16; sparse only wins BS≤4.
-- **Prefill: eager sequence-bucketing is the working long-context path.**
+- **Historical prefill baseline: eager sequence bucketing.**
   `--bucket-chunk 2048 --bucket-compile 0` with `GQA_FLASH_PREFILL=1 DN_CHUNK_NKI=1`
   plus pad-token masking gives coherent 20k prefill with no OOM and ~9 min compile
   (~259 prompt tok/s). Two kernel bugs had to be fixed for correctness: (1) pad
@@ -121,6 +139,170 @@ CPU correctness (no device): `python3 kernels/tests/test_moe_oracle_cpu.py --tok
   chunked-DeltaNet L2-norm used `x·rsqrt(‖x‖²+eps)` but must match
   `x/max(‖x‖,eps)` for near-zero rows. Random-input kernel tests missed both — test
   on real post-conv/proj distributions.
+- **Use `MOE_CTE=1`, not `MOE_NKILIB=1`, for prefill.** `moe_tkg` maps tokens
+  to the NKI partition dimension and requires 128-token calls. The
+  `nkilib.core.moe.moe_cte` adapter in this directory routes long-token inputs
+  into expert blocks and keeps the MoE opaque to Dynamo. At S=2048, TP=4,
+  B=512 it measured 71-73 ms for one eager layer and 266.5 ms for four eager
+  layers, versus 193.5 ms and 793.3 ms for pure Torch. Four compiled CTE layers
+  measured 198.2 ms / 10,334 tok/s and loaded without the old descriptor failure.
+- **DeltaNet prefill currently needs `CHUNK_SIZE=16` at 20k context.** C=64 passes random
+  tests but its conditionally stable doubling inverse returns an inaccurate
+  recurrent state on real layer-0 inputs (state max error 1.69) and produces
+  NaNs by layer 5 at S=2048. C=32 made all 40 layers finite at S=2048, but a
+  full S=20000 run with 512-token buckets deterministically became non-finite
+  at bucket 21, layer 18. The layer-17 hidden and all incoming recurrent states
+  were finite; layer 18 emitted non-finite hidden values while its returned
+  state stayed finite. This reproduced in eager mode, so it is not compiler
+  drift. C=16 remained finite through all 40 layers and all 40 buckets in two
+  S=20000 eager passes, measuring 71391.7 ms / 280.1 tok/s with a stable
+  fingerprint. The matched compiled run measured 20886.0 ms / 957.6 tok/s and
+  retained the eager top-5 set. Do not increase chunk size without a real-weight,
+  full-context finite/coherence test.
+- **Old C32 can be catastrophically wrong while still finite.** Immutable
+  layer-18/bucket-21 replay agrees with the CPU reference near 1e-6 on TP ranks
+  0/1/3, but rank 2 has output error 2.96e34 and state error 3.06e36.
+  RMSNorm masked the raw output scale, so final finiteness alone is not a
+  sufficient gate. A block-factorized C32 inverse reduced a CPU stability test
+  from roughly 1.0 error to 1.2e-4, but its first Trn2 compile hit an SBUF
+  allocation/scheduling conflict involving a `32x128` tile. Resolve allocation,
+  then require all-rank capture replay before a full 20k benchmark.
+- **Split compiled prefill into coarse 10-layer NEFFs.** A monolithic 20-layer
+  CTE graph generated 5,440,131 instructions and failed the compiler's 5,000,000
+  limit. `--prefill-splits 2` compiled and loaded two 10-layer segments; use
+  `--prefill-splits 4` for 40 layers. The segment linkers used about 10-12 GiB
+  each, far below the old pure-Torch-MoE linker blow-up.
+  Full 40-layer S=2048 measured 2017.5 ms / 1015 tok/s, versus 2702.9 ms /
+  757.7 tok/s eager CTE. The compiled and eager top-5 sets were identical.
+- **Compiled/eager fingerprint drift comes from fused bf16 round points.** The
+  DeltaNet NKI call itself is bit-exact eager versus compiled. Separate qkv
+  projection and conv graphs are also exact, but the combined compiled graph
+  carries f32 accumulator values through `.float()` consumers instead of
+  materializing eager bf16 intermediates. This changes q/k by about 1.5e-2, v
+  by 3.1e-2, and g by 5.0e-2. Treat full-model token coherence as the acceptance
+  test; do not attribute this drift to the CTE router or DeltaNet custom call.
+- **Real-prompt C=32 coherence is validated in eager mode.** With
+  `"The capital of France is"` (IDs `760,6511,314,9338,369`), full 40-layer
+  eager CTE prefill generated IDs `11751,369,264,3177,314`, corresponding to
+  a coherent continuation about Paris. A compiled short-prompt check is not a
+  cache hit: `_dn_valid_len=5` specializes a different pad-mask graph and would
+  require another full compile.
+- **Use `GQA_DYNAMIC_ROPE_KV=1` to reuse compiled prefill across offsets.** Plain
+  tensor indexing for dynamic RoPE/KV positions failed in NRT, while a Python
+  `q_base` specialized one graph per bucket. The fused `gqa_rope_kv_dynamic` NKI
+  op instead consumes a runtime int32 offset, applies RoPE, and performs aliased
+  KV writes. A four-layer S=4096 run compiled once and processed both 2048-token
+  offsets, then measured 390.5 ms / 10,488.9 tok/s with identical warm/timed
+  fingerprints. At full 40-layer depth with four 10-layer segments, the same
+  two-bucket test compiled in 39.3 minutes and measured 3646.2 ms /
+  1123.4 tok/s; no second-offset compilation occurred. Its S=2048 eager output
+  was exactly equal to the old static indexing path. Keep the static path as a
+  control, but use the dynamic path for compiled long-context prefill.
+- **Pass DeltaNet valid length as runtime metadata too.** A Python
+  `_dn_valid_len` would specialize a second graph set for the padded final
+  bucket at S=20000. With the dynamic GQA path enabled, the harness now passes
+  runtime int32 `q_base` and `valid_len` tensors. At S=2304, the dynamic eager
+  path was exactly equal to the static eager pad mask, and one four-layer cold
+  compile served both a 2048-token full bucket and a 256-token partial bucket.
+  The timed compiled pass measured 391.5 ms / 5884.6 tok/s and retained the
+  eager top-5 set.
+- **Prefill compilation has two independent resource ceilings.** Four concurrent
+  TP linkers exhausted 128 GB host RAM for 20/40-layer pure-torch MoE graphs.
+  NVMe-backed `/tmp` plus 128 GB swap allowed a four-layer nkilib graph to compile,
+  peaking around 31-34 GB RSS per linker and 26 GB swap. Separately, pure-torch
+  four-layer NEFF load hit the hard DMA vring ceiling at 16,777,200 descriptors.
+  Disabling compilation around MoE reduced linker memory but produced 81 resident
+  NEFF fragments and hit the same cumulative descriptor ceiling.
+- **S=20480 with 2048-token compiled buckets still exceeds the descriptor
+  ceiling.** Dynamic offset/valid-length metadata removes graph specialization,
+  but the long-KV flash-attention expansion makes each 10-layer segment much
+  larger than at max_seq=4096. The first segment loaded; loading the second hit
+  the cumulative `16,777,200` vring descriptor limit. Linkers reached 25-32 GiB
+  RSS/rank and used about 50 GiB swap. More host RAM cannot fix this runtime
+  limit; reduce query bucket size or reduce descriptors inside the GQA kernel.
+- **A 512-token bucket clears the long-context descriptor ceiling.** The full
+  40-layer C=32 graph compiled and loaded at max_seq=20480, then measured
+  16014.0 ms / 1248.9 tok/s at N=20000. That run was numerically invalid due
+  to the independent C=32 DeltaNet failure above. Linker RSS was only about
+  3 GiB/rank. The corrected C=16 run measured 20886.0 ms / 957.6 tok/s with a
+  finite, repeatable fingerprint and the same top-5 as eager C=16. This is the
+  validated local-flash control: 3.70x the original 259 tok/s baseline.
+- **Use nkilib CTE attention instead of fixed-KMAX flash at 20k.** The local
+  flash kernel always scans all 20,480 KV rows and measured 11.66-11.69 ms per
+  production-shape GQA call, independent of the used prefix. Prefix-aware
+  `attention_cte` measured 0.77-0.81 ms at prior lengths 0, 10,240, and 19,968
+  (14.5-15.1x faster), with cosine >=0.999975 against local flash. A matched
+  four-layer eager control improved 694.2 to 651.6 ms and retained the same
+  top-5. The full 40-layer compiled C16 run measured 17854.9 ms / 1120.1 tok/s,
+  1.17x over the 957.6 tok/s flash control and 4.32x over the original baseline.
+  Warm/timed fingerprints were identical and finite. The real prompt
+  `"The capital of France is"` generated
+  `[11751,369,264,3177,314,1880]`; its first five IDs exactly match the prior
+  validated continuation. Use `GQA_CTE_PREFILL=1` instead of
+  `GQA_FLASH_PREFILL=1`; the flags are mutually exclusive.
+- **CTE makes bucket 2048 loadable, but bucket 1024 is faster.** Replacing the
+  expanded local flash kernel removed the descriptor ceiling: all four
+  10-layer bucket-2048 segments compiled and loaded at max_seq=20480. The
+  result was finite/repeatable but measured 20631.9 ms / 969.4 tok/s, slower
+  than bucket 512 at 17854.9 ms / 1120.1 tok/s. Cold warmup took 3471 seconds
+  and linkers reached roughly 15-18 GiB/rank. Isolated CTE attention remained
+  efficient at active sizes 512/1024/2048 (0.79/1.28/2.11 ms), so the
+  regression comes from the larger surrounding compiled graph, not attention.
+  The matched bucket-1024 run measured 17374.1 ms / 1151.1 tok/s, versus
+  17854.9 ms / 1120.1 tok/s at bucket 512. Use bucket 1024; do not assume still
+  fewer buckets are faster.
+- **The Torch-routed batched prefill baseline does not improve throughput.**
+  Homogeneous BS=2
+  with independent DeltaNet, convolution, and KV state passed a four-layer
+  partial-bucket isolation test against two independent BS=1 executions
+  (cosine >=0.999936 for logits and every carried state). Full S=20000 loaded
+  and returned finite state, but measured 41069.0 ms / 974.0 aggregate tok/s,
+  versus 17374.1 ms / 1151.1 tok/s at BS=1. Batch latency grew 2.36x for 2x
+  tokens, so BS=4 was gated off. The C16 DeltaNet kernel is explicitly
+  sequential over `B*V_HEADS`; an isolated 1024-token call scaled
+  11.57-11.93 to 22.58-22.92 ms. Isolated CTE expert compute stayed near
+  6.7-7.0 ms from 1024 to 2048 flattened tokens.
+- **The BS=2 regression is the MoE route prefix scan, then DeltaNet.** A matched
+  full-segment trace measured 188.9 ms at BS=1 and 471.0 ms at BS=2. The ten
+  `pack_local_routes()` scans at `moe_cte_adapter.py:50` grew from 61.3 to
+  258.3 ms and from 24.9 to 105.7 GB of attributed HBM traffic. The compiler
+  lowers `group_hot.cumsum(dim=0)` to HLO `reduce-window` using TensorE
+  MATMUL/LDWEIGHTS. DeltaNet grew from 82.4 to 165.6 ms; together these explain
+  99% of the matched segment increase. The other segment shape measured
+  485.7 ms, with 263.7 ms in the same scan and 145.6 ms in its seven DeltaNet
+  calls. DMA is the slowest engine (261-281 ms active per segment);
+  collectives are only about 3 ms. Replace/fuse the route scan before any BS=4
+  attempt, and do not pursue a larger batch until BS=2 exceeds the BS=1
+  aggregate rate.
+- **The fused NKI route packer is the validated BS=1 optimum.**
+  `MOE_CTE_NKI_PACK=1` keeps route metadata private to the existing CTE custom
+  call and uses stable four-lane `nonzero_with_count` compaction plus direct
+  DMA. It passed 96 exact metadata cases, distributed fused/precomputed CTE
+  equivalence, and four-layer BS=2 isolation. Standalone 8,192/16,384-route
+  packing measured 2.420/3.777 ms (1.56x). Three hot BS=1 S=20000 runs measured
+  13.4834/13.4967/13.4878 seconds: **13.4878 s / 1482.8 tok/s median**. A
+  matched segment fell from 188.89 to 122.26 ms, total HBM from 31.96 to
+  3.30 GB, and route HBM from 24.94 GB to 45.9 MB, with no `reduce-window`.
+  Keep the Torch fallback; default-on and BS=4 decisions wait for full BS=2
+  throughput and profile results.
+- **DeltaNet C16 is scheduling-bound, not HBM-bound.** At S=512 it measured
+  5.284 ms with model MFU 0.145%, instruction MFU 0.478%, and MBU 0.497%.
+  ScalarE/VectorE/TensorE occupancy was 74.3/73.2/65.7%, DMA occupancy 15.8%,
+  and transposes represented 9.34% of hardware FLOPs. Optimize overlap,
+  transpose placement, and live ranges before pursuing HBM bandwidth changes.
+- **CTE block-size/static-loop experiments did not help.** B=256 with a reserved
+  static expert block measured 74.7 ms for one eager layer; B=512 static measured
+  73.4 ms, both slightly slower than the original dynamic B=512 path (~72 ms).
+  Keep `MOE_CTE_BLOCK=512` and dynamic routing unless a profile shows a new reason
+  to revisit it.
+- **Fresh multi-segment compiles can stall on local-cache locks.** The first
+  40-layer/split-4 run spent repeated 1200-second intervals waiting on stale
+  `/tmp/local_cache/locks/*.lock` files before breaking them. Total warmup was
+  3137 seconds, dominated by lock waits rather than compilation. Preserve the
+  completed NVMe `/tmp` cache and clean stale locks before a deliberate cold run.
+- **Local detailed record:** when present, see
+  `experiments/compiled_prefill_2026-07-14.md`. The directory is intentionally
+  gitignored because it contains operational instance paths and log locations.
 - **Measure synced TPOT, not enqueue time.** The Neuron eager backend dispatches
   async; a timing loop without `torch.neuron` synchronize measures enqueue, not
   execution (this produced bogus ~1 ms "TPOT" figures historically that were really
