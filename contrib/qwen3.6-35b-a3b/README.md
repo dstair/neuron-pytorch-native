@@ -65,9 +65,18 @@ kernels/                NKI kernels + torch.ops registrations (*_ops.py)
   gqa_tail_35b*, gqa_flash_prefill_35b*  fused GQA decode tail + local flash prefill
   gqa_cte_35b*, gqa_rope_kv_35b*  nkilib CTE attention + dynamic RoPE/KV update
   fp8_group_matvec*    FP8 grouped matvec for MoE experts
-  tests/               CPU MoE oracle (vs canonical Qwen3Moe), device smoke tests
+  tests/               repeatable CPU/device checks with pass/fail assertions
+debug/                  reusable isolation, capture, and numerical diagnostics
 deploy/profile/         device-profiling capture + neuron-explorer UI scripts
+experiments/            ignored local journals, resume notes, and benchmark tools
 ```
+
+Keep active runtime implementations in `kernels/`. A script belongs in
+`kernels/tests/` when it is a repeatable regression with an explicit pass/fail
+result; diagnostics that print intermediate evidence for manual interpretation
+belong in `debug/`. The ignored `experiments/` directory is for machine-specific
+records and temporary investigation tooling. Superseded code should normally
+remain in Git history rather than accumulating in a `legacy/` directory.
 
 ## De-risking: the MoE CPU oracle
 
