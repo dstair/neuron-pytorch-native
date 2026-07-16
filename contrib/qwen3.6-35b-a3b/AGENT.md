@@ -67,6 +67,17 @@ harness for a 35B sparse-MoE hybrid model: 40 layers = [DeltaNet ×3, GQA ×1] �
   `1ee625782cb1bf91b40bccab741a82c726445080`, exposed with
   `PYTHONPATH=<nki-library>/src/nkilib_src`. Any replacement must support
   head-dim 256, prefix K/V, and runtime `prior_used_len`.
+- **Preserve complete compiler cache roots.** Native prefill compile products land
+  under the host directory mounted as container `/tmp`, notably `hlo_cache`,
+  `neff_cache`, and NKI compiler subtrees. Use `deploy/cache/push.sh` and
+  `pull.sh` to stage/restore the full tree through S3; a bare `.neff` is not a
+  reusable cache entry. Restore before starting the container, keep the `/tmp`
+  mount and image/compiler flags/graph/shapes/TP/LNC topology identical, then use
+  `inspect.sh <cache-dir> <run-log>` plus process monitoring to diagnose misses.
+  In this Native stack the completed NEFFs are under `neff_cache`, not just the
+  configured `NEURON_COMPILE_CACHE_URL`; a log can lack explicit hit markers, so
+  no active `neuronx-cc`/`walrus_driver` work during the matching run is required
+  corroboration.
 
 ## Run recipes (validated)
 

@@ -112,6 +112,48 @@ python3 static_decode_35b.py --cpu --num-layers 40
 
 Set `QWEN35_MODEL_PATH` (or `--model-path`) to the weights directory.
 
+### Reusable compiler cache
+
+The Native compiler stores the reusable prefill artifacts beneath the complete
+host directory mounted as `/tmp` in the container. That directory contains
+`hlo_cache`, `neff_cache`, and NKI compiler subtrees. Do not archive or restore
+only a `.neff` file, and do not point the runtime at an arbitrary one.
+
+Set these ignored `.env` values on the compile and reuse hosts:
+
+```bash
+export QWEN35_COMPILER_CACHE_DIR=/mnt/nvme/qwen35-prefill-cache
+export QWEN35_COMPILER_CACHE_S3_URI=s3://YOUR-BUCKET/neuron-compile-cache/qwen35
+```
+
+After a successful cold compile, stage an immutable cache key:
+
+```bash
+deploy/cache/push.sh bs4-c16-s20000-direct512
+```
+
+On a future host, restore it before starting the Native container:
+
+```bash
+deploy/cache/pull.sh bs4-c16-s20000-direct512
+deploy/cache/inspect.sh
+```
+
+Mount `QWEN35_COMPILER_CACHE_DIR` at `/tmp` inside the container exactly as in
+the producing run. A persistent-cache hit requires the same captured graph,
+input shapes, compiler/image version, compiler flags, Neuron generation, and
+TP/LNC topology. The scripts refuse to mix cache contents by default; use
+`--replace` only to discard an existing target or deliberately refresh a key.
+The optional second argument to `inspect.sh` scans a run log for cache-hit,
+cache-miss, and backend-compiler markers. Native logs are sometimes
+inconclusive; corroborate a cache hit by confirming no active `neuronx-cc` or
+`walrus_driver` process appears during the run.
+
+The `trn2-3xl-bs4-c16-s20000-tp4-b512-fused-direct512` artifact was validated
+as a complete 3.4 GiB cache root (664 files, 66 NEFFs). A separately restored
+copy ran the matching BS=4 S=20,000 graph without backend codegen, retained the
+same finite fingerprint, and measured 39,788.3 ms / 2,010.6 aggregate prompt
+tok/s.
 ### Optimization levers (environment flags)
 
 | Flag | Effect |
