@@ -88,13 +88,15 @@ numerically identical (to ~3e-9) to a HF-sparse reference, to the canonical
 
 ```bash
 python3 kernels/tests/test_moe_oracle_cpu.py --tokens 8
+python3 kernels/tests/test_moe_sparse_eq.py
+python3 kernels/tests/test_moe_decode_tp_cpu.py
 ```
 
 ## Running
 
 ```bash
 # Full 40-layer decode benchmark, BS=1, recommended decode flags
-DN_NKI=1 MOE_SPARSE=1 GQATAIL=1 DNBATCHED_V2=1 \
+DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
   torchrun --nproc-per-node=4 static_decode_35b.py \
     --num-layers 40 --max-seq-len 2048 --batch-size 1 --bench
 
@@ -154,12 +156,14 @@ as a complete 3.4 GiB cache root (664 files, 66 NEFFs). A separately restored
 copy ran the matching BS=4 S=20,000 graph without backend codegen, retained the
 same finite fingerprint, and measured 39,788.3 ms / 2,010.6 aggregate prompt
 tok/s.
+
 ### Optimization levers (environment flags)
 
 | Flag | Effect |
 |---|---|
 | `DN_NKI=1` | DeltaNet NKI kernel — **required past ~20 layers** (the pure-torch recurrence trips a compiler tiling assertion) |
 | `MOE_SPARSE=1` | True-sparse MoE dispatch (gathers only the top-8 experts) — ~2× at BS=1 |
+| `MOE_DECODE_TP=1` | BF16 BS=1 decode only: shard each expert's intermediate width across TP ranks, avoiding dummy non-local expert reads |
 | `GQATAIL=1` | Fused GQA attention-tail kernel |
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
 | `MOE_CTE=1` | Long-token nkilib context-encoding MoE kernel for prefill |
@@ -171,7 +175,7 @@ tok/s.
 ## Performance summary
 
 All numbers are `trn2.3xlarge`, TP=4, LNC=2, measured with a `torch.neuron`-
-synchronized 50-iter timer. "PyTorch Native" = this repo's `static_decode_35b.py`
+synchronized 30-50-iter timer. "PyTorch Native" = this repo's `static_decode_35b.py`
 (one compiled decode NEFF or four coarse prefill NEFFs). The "XLA" reference is the
 [NxDI](https://github.com/aws-neuron/neuronx-distributed-inference) implementation
 of the same model (PR #60) on the torch-xla stack.
@@ -184,14 +188,30 @@ of the same model (PR #60) on the torch-xla stack.
 | + true-sparse MoE (`MOE_SPARSE=1`) | PyTorch Native | 33.4 | 30.0 |
 | + DeltaNet micro-opt | PyTorch Native | 32.8 | 30.5 |
 | + `GQATAIL=1` | PyTorch Native | 24.4 | 40.9 |
-| **+ `DNBATCHED_V2=1`** | PyTorch Native | **23.2** | **43.2** |
+| + `DNBATCHED_V2=1` | PyTorch Native | 23.2 | 43.2 |
+| **+ TP within routed experts (`MOE_DECODE_TP=1`)** | PyTorch Native | **20.46** | **48.9** |
 | NxDI reference (PR #60) | XLA | 18.4 | 54.3 |
 
-2.86× total from these levers. True-sparse MoE gives ~2× (not ~8×) because the MoE
+3.24× total from these levers. True-sparse MoE gives ~2× (not ~8×) because the MoE
 expert GEMMs are only about half the step — DeltaNet / GQA / projections / norms /
 all-reduces are the rest. The NxDI (XLA) reference is faster at BS=1; it is the
 validated oracle (100% token-match vs CPU) but its MoE uses a non-portable NxDI
 library module.
+
+The TP-expert layout keeps all 256 expert ids on every rank but stores one quarter
+of each expert's intermediate width. Resident weights remain 19.09 GB/core, while
+each rank gathers eight quarter-experts instead of eight full experts with roughly
+six clamped dummy routes. The existing TP all-reduce reconstructs the full down
+projection. A matched S=16, 10-layer Explorer replay estimated 758→380 MB HBM
+reads, 754→377 MB software-dynamic DMA, and 270k→181k dynamic DMA packets per
+rank; trace time fell from 2.95-3.14 to 2.258-2.261 ms. These traffic values are
+directional because the profile has missing dynamic-DMA metadata. A production
+S=2048, 40-layer replay was consistent across ranks at about 1.77 GB estimated
+HBM reads.
+
+`MOE_DECODE_TP` is deliberately restricted to BF16 and one decode token. For
+higher batches, leave it disabled and use masked-dense MoE: once many experts
+are active, dense grouped GEMMs amortize better than per-route gathers.
 
 ### Decode — batch sweep (seq=256, masked-dense MoE + `DN_NKI+GQATAIL+DNBATCHED_V2`)
 

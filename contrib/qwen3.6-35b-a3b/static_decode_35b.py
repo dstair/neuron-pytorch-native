@@ -53,6 +53,13 @@ if USE_DN_NKI:
 # masked-dense (the CPU-validated oracle). Numerically identical (validated).
 USE_MOE_SPARSE = os.environ.get("MOE_SPARSE", "0") == "1"
 
+# BS=1 decode-only tensor parallelism within every routed expert. Each rank
+# stores all expert IDs but only one world_size shard of the intermediate
+# width, so the fixed top-8 gather reads one quarter of each expert at TP=4.
+USE_MOE_DECODE_TP = os.environ.get("MOE_DECODE_TP", "0") == "1"
+if USE_MOE_DECODE_TP and not USE_MOE_SPARSE:
+    raise RuntimeError("MOE_DECODE_TP=1 requires MOE_SPARSE=1")
+
 # GQA-tail mega-kernel (env GQATAIL=1). ONE custom call/layer folds q RMSNorm +
 # partial-64 RoPE + scaled scores + masked softmax + weighted-V + output-gate,
 # collapsing ~12 inter-op barriers. k-side norm/rope + KV write stay torch; o_proj
@@ -122,6 +129,8 @@ DN_CAPTURE_CHUNK = int(os.environ.get("DN_CAPTURE_CHUNK", "-1"))
 USE_MOE_FP8 = os.environ.get("MOE_FP8", "0") == "1"
 if USE_MOE_FP8:
     import fp8_group_matvec_ops  # registers torch.ops.fp8moe.group_matvec
+if USE_MOE_DECODE_TP and USE_MOE_FP8:
+    raise RuntimeError("MOE_DECODE_TP supports bf16 expert weights only")
 FP8_E4M3_MAX = 240.0  # legacy e4m3 max (Trn2 nc_matmul format); OCP fn extends to 448
 
 # Production nkilib MoE TKG kernel (env MOE_NKILIB=1). ONE fused @nki.jit call:
@@ -225,11 +234,10 @@ def moe_forward(x, router_w, gate_up, down, e_lo, e_hi,
     Validated equivalent to HF sparse routing in test_moe_oracle_cpu.py.
     Router runs full top-8 (replicated); only this rank's experts contribute.
 
-    `gate_up`/`down` are this rank's PRE-SLICED local experts (rows 0..E-1).
-    `e_lo`/`e_hi` are the GLOBAL expert id range this rank owns (e.g. 64..128 on
-    rank 1 at TP=4) — used to map a token's global top-k id to a local row
-    (`local = sel - e_lo`) and to mask out experts this rank doesn't own. Weight
-    access is always local (rows 0..E-1); routing math is always global.
+    By default, `gate_up`/`down` contain this rank's expert-parallel rows and
+    `e_lo`/`e_hi` map global top-k ids to them. MOE_DECODE_TP instead stores all
+    expert ids with a rank-local intermediate-width shard and uses global ids
+    directly. Routing math is global in both layouts.
 
     Returns (routed_partial, shared): routed_partial holds only this rank's
     experts (the caller all-reduces it across ranks), and shared is the
@@ -262,6 +270,29 @@ def moe_forward(x, router_w, gate_up, down, e_lo, e_hi,
         # DIAGNOSTIC: skip the expert bmm entirely (routed=0). Isolates whether
         # the masked-dense grouped bmm is the neuronx-cc PGTiling trigger.
         routed = torch.zeros(T, H, dtype=torch.float, device=x.device)
+    elif USE_MOE_DECODE_TP:
+        if T != 1:
+            raise RuntimeError(
+                f"MOE_DECODE_TP is decode-only and requires one token, found {T}"
+            )
+        # Every rank owns the same global expert IDs and a disjoint shard of
+        # their intermediate width. The selected expert gather is therefore
+        # balanced and reads TOP_K/world_size of the old per-rank weight bytes.
+        idx = sel.reshape(-1)
+        x_sel = xf.unsqueeze(1).expand(T, D.TOP_K, H).reshape(-1, H)
+        local_i = gate_up.shape[1] // 2
+        gup_g = gate_up.index_select(0, idx).float()
+        dn_g = down.index_select(0, idx).float()
+        gu = torch.bmm(
+            x_sel.unsqueeze(1), gup_g.transpose(1, 2)
+        ).squeeze(1)
+        hh = F.silu(gu[:, :local_i]) * gu[:, local_i:]
+        y = torch.bmm(
+            hh.unsqueeze(1), dn_g.transpose(1, 2)
+        ).squeeze(1)
+        routed = (
+            y * rw_top.reshape(-1, 1)
+        ).reshape(T, D.TOP_K, H).sum(dim=1)
     elif USE_MOE_SPARSE:
         # TRUE SPARSE dispatch: gather ONLY the selected experts' weights per
         # (token, slot), instead of reading all E local experts. At BS=1 decode
@@ -332,9 +363,9 @@ class StaticDecode35B(nn.Module):
         self.batch_size = batch_size
         td = D.tp_dims(world_size)
         self.td = td
-        # GLOBAL expert id range this rank owns (weights are pre-sliced to local
-        # rows 0..experts_per_core-1, but routing maps the token's global top-k
-        # id via `local = sel - e_lo`, so e_lo MUST be the global offset).
+        # Global expert range for the default expert-parallel layout. The
+        # decode-only TP-within-expert path stores every expert id and ignores
+        # this range when gathering routed weights.
         self.rank = rank
         self.e_lo = rank * td["experts_per_core"]
         self.e_hi = self.e_lo + td["experts_per_core"]
@@ -1297,9 +1328,9 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
       - GQA q_proj colwise by Q heads (each head = 2*HD: query|gate). k/v_proj:
         2 KV heads REPLICATED across world_size cores -> each core gets the KV
         head assigned to rank // (world_size//2). o_proj rowwise.
-      - MoE experts EXPERT-PARALLEL: each rank gets NUM_EXPERTS//world_size
-        experts (packed gate_up/down sliced on dim 0). router + shared expert
-        REPLICATED.
+      - MoE experts are expert-parallel by default. MOE_DECODE_TP instead keeps
+        all expert IDs and shards each expert's intermediate width. Router and
+        shared expert are replicated in both layouts.
     """
     import json, glob
     from st_reader import SafeReader, build_weight_map
@@ -1361,8 +1392,33 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
         return w[:, r * s:(r + 1) * s].clone()
 
     def load_experts(lp):
-        """Return (gate_up [Ec,2I,H], down [Ec,H,I]) for this rank's experts,
-        from either the packed (real 35B) or unpacked (tiny) checkpoint layout."""
+        """Load this rank's expert-parallel rows or intermediate-width shards."""
+        if USE_MOE_DECODE_TP:
+            if D.MOE_INTER % world_size:
+                raise RuntimeError(
+                    "MOE_DECODE_TP requires moe_intermediate_size divisible by TP"
+                )
+            width = D.MOE_INTER // world_size
+            i0 = rank * width
+            i1 = i0 + width
+            if EXPERTS_PACKED:
+                gu_full = get(lp + "mlp.experts.gate_up_proj")
+                gate = gu_full[:, i0:i1]
+                up = gu_full[:, D.MOE_INTER + i0:D.MOE_INTER + i1]
+                gu = torch.cat([gate, up], dim=1).clone()
+                dn = get(lp + "mlp.experts.down_proj")[:, :, i0:i1].clone()
+                return gu, dn
+            gus, dns = [], []
+            for e in range(D.NUM_EXPERTS):
+                ep = lp + f"mlp.experts.{e}."
+                gate = get(ep + "gate_proj.weight")[i0:i1]
+                up = get(ep + "up_proj.weight")[i0:i1]
+                gus.append(torch.cat([gate, up], dim=0))
+                dns.append(get(ep + "down_proj.weight")[:, i0:i1])
+            return (
+                torch.stack(gus, 0).clone(),
+                torch.stack(dns, 0).clone(),
+            )
         if EXPERTS_PACKED:
             gu = get(lp + "mlp.experts.gate_up_proj")[e_lo:e_hi].clone()   # [Ec,2I,H]
             dn = get(lp + "mlp.experts.down_proj")[e_lo:e_hi].clone()      # [Ec,H,I]

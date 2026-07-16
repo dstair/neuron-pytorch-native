@@ -32,6 +32,7 @@ Run:
 import argparse
 import json
 import os
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -54,8 +55,6 @@ def load_layer_moe_weights(ckpt: str, layer: int) -> dict:
       router        [E, H]
       sh_gate/sh_up [I, H], sh_down [H, I], sh_sigmoid_gate [1, H]
     """
-    from safetensors import safe_open
-
     idx = json.load(open(os.path.join(ckpt, "model.safetensors.index.json")))
     wm = idx["weight_map"]
     pfx = f"model.language_model.layers.{layer}.mlp."
@@ -68,6 +67,25 @@ def load_layer_moe_weights(ckpt: str, layer: int) -> dict:
         "sh_down": pfx + "shared_expert.down_proj.weight",
         "sh_sigmoid_gate": pfx + "shared_expert_gate.weight",
     }
+    try:
+        from safetensors import safe_open
+    except ModuleNotFoundError:
+        root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from st_reader import SafeReader
+
+        handles = {}
+        out = {}
+        for name, key in keys.items():
+            filename = wm[key]
+            if filename not in handles:
+                handles[filename] = SafeReader(os.path.join(ckpt, filename))
+            out[name] = handles[filename].get_tensor(key)
+        return out
+
     # group keys by shard file to open each file once
     out = {}
     by_file: dict[str, list[str]] = {}

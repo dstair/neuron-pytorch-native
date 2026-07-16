@@ -26,6 +26,7 @@ def run_moe(x, w, e_lo, e_hi, sparse):
     global top-k ids via local = sel - e_lo)."""
     import importlib
     os.environ["MOE_SPARSE"] = "1" if sparse else "0"
+    os.environ["MOE_DECODE_TP"] = "0"
     import static_decode_35b as S
     importlib.reload(S)              # pick up the env flag at import time
     gup = w["gate_up"][e_lo:e_hi]    # local rows for this rank
@@ -34,6 +35,40 @@ def run_moe(x, w, e_lo, e_hi, sparse):
         x, w["router"], gup, dn, e_lo, e_hi,
         w["sh_gate"], w["sh_up"], w["sh_down"], w["sh_sigmoid"])
     return routed, shared
+
+
+def run_moe_tp(x, w, rank, world_size):
+    """Run the decode-only TP-within-expert shard and return its partial."""
+    import importlib
+
+    os.environ["MOE_SPARSE"] = "1"
+    os.environ["MOE_DECODE_TP"] = "1"
+    import static_decode_35b as S
+    importlib.reload(S)
+
+    width = D.MOE_INTER // world_size
+    i0 = rank * width
+    i1 = i0 + width
+    gate = w["gate_up"][:, i0:i1]
+    up = w["gate_up"][:, D.MOE_INTER + i0:D.MOE_INTER + i1]
+    gate_up = torch.cat([gate, up], dim=1)
+    down = w["down"][:, :, i0:i1]
+    partials = []
+    for token in x.split(1, dim=0):
+        routed, _ = S.moe_forward(
+            token,
+            w["router"],
+            gate_up,
+            down,
+            0,
+            D.NUM_EXPERTS,
+            w["sh_gate"],
+            w["sh_up"],
+            w["sh_down"],
+            w["sh_sigmoid"],
+        )
+        partials.append(routed)
+    return torch.cat(partials, dim=0)
 
 
 def main():
@@ -66,6 +101,15 @@ def main():
         rel = d / (md.abs().max().item() + 1e-9)
         print(f"world_size={W}: routed max_abs_diff={d:.3e} rel={rel:.3e}  "
               f"{'PASS' if rel < 1e-5 else 'FAIL'}")
+
+        tp = sum(run_moe_tp(x, w, rank, W) for rank in range(W))
+        tp_diff = (md - tp).abs().max().item()
+        tp_rel = tp_diff / (md.abs().max().item() + 1e-9)
+        print(
+            f"world_size={W}: TP-expert max_abs_diff={tp_diff:.3e} "
+            f"rel={tp_rel:.3e}  {'PASS' if tp_rel < 1e-5 else 'FAIL'}"
+        )
+        assert tp_rel < 1e-5
 
     print("done")
 

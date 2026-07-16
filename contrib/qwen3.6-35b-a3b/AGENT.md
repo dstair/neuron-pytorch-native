@@ -81,18 +81,21 @@ harness for a 35B sparse-MoE hybrid model: 40 layers = [DeltaNet ×3, GQA ×1] �
 
 ## Run recipes (validated)
 
-Decode benchmark, full 40 layers, TP=4, recommended flags:
+Decode benchmark, full 40 layers, TP=4, recommended BS=1 flags:
 ```
-DN_NKI=1 GQATAIL=1 \
+DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
   torchrun --nproc-per-node=4 static_decode_35b.py \
     --model-path <weights> --max-seq-len <S> --num-layers 40 \
-    --graph-splits 1 --batch-size <BS> --bench --bench-iters 30
+    --graph-splits 1 --batch-size 1 --bench --bench-iters 30
 ```
 Coherence check (real prompt, greedy): add `--num-tokens 16 --prompt-ids
 "760,6511,314,9338,369"` ("The capital of France is") and drop `--skip-prefill`;
 expect it to echo the prompt back (the documented greedy loop).
 
-CPU correctness (no device): `python3 kernels/tests/test_moe_oracle_cpu.py --tokens 8`.
+CPU correctness (no device):
+`python3 kernels/tests/test_moe_oracle_cpu.py --tokens 8`,
+`python3 kernels/tests/test_moe_sparse_eq.py`, and
+`python3 kernels/tests/test_moe_decode_tp_cpu.py`.
 
 Compiled long-context prefill, N=20000, BS=1:
 ```
@@ -112,6 +115,7 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
 | `DN_NKI=1` | DeltaNet NKI kernel — **required past ~20 layers** (see gotcha) |
 | `GQATAIL=1` | Fused GQA attention-tail kernel — also collapses long-context compile |
 | `MOE_SPARSE=1` | True-sparse MoE dispatch — ~2× at BS=1; do NOT use at BS≥16 (see gotcha) |
+| `MOE_DECODE_TP=1` | BF16, one-token decode: TP within each routed expert to avoid dummy non-local weight reads |
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
 | `MOE_FP8=1` | FP8 experts — memory lever only (see FP8 gotcha) |
 | `GQA_FLASH_PREFILL=1`, `DN_CHUNK_NKI=1` | Prefill kernels (see prefill recipe) |
@@ -142,6 +146,18 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
 - **Sparse MoE does not scale to BS≥16.** `MOE_SPARSE=1` gathers `T·K` experts;
   the gathered graph explodes the *host* compiler memory at BS≥16 (F137 / OOM /
   host wedge). Use masked-dense MoE for BS≥16; sparse only wins BS≤4.
+- **Use TP within experts only for BS=1 decode.** With `MOE_DECODE_TP=1`, each
+  rank stores all 256 expert ids and one quarter of every expert's intermediate
+  width. Resident bytes stay at 19.09 GB/core, but every rank gathers eight
+  quarter-experts instead of eight full experts with non-local routes clamped
+  to dummy rows. The existing all-reduce combines the rank-local down-projection
+  partials, preserving exact top-8 routing. The full 40-layer, one-NEFF S=2048
+  run measured **20.46 ms/token / 48.9 tok/s**, versus 23.2 ms / 43.2 tok/s.
+  A matched S=16 10-layer replay estimated 758→380 MB HBM reads, 754→377 MB
+  software-dynamic DMA, and 270k→181k dynamic packets per rank, with the usual
+  missing-dynamic-DMA-metadata caveat. The path is BF16-only and requires
+  `T == 1`; higher batches should retain masked-dense MoE because most experts
+  become active and grouped GEMMs amortize better.
 - **Historical prefill baseline: eager sequence bucketing.**
   `--bucket-chunk 2048 --bucket-compile 0` with `GQA_FLASH_PREFILL=1 DN_CHUNK_NKI=1`
   plus pad-token masking gives coherent 20k prefill with no OOM and ~9 min compile
