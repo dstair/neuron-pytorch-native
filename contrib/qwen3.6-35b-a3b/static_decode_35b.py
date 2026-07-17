@@ -72,6 +72,9 @@ if USE_MOE_DECODE_TP and not USE_MOE_SPARSE:
 USE_GQA_TAIL = os.environ.get("GQATAIL", "0") == "1"
 if USE_GQA_TAIL:
     import gqa_tail_35b_ops  # registers torch.ops.gqa35b.tail
+USE_GQA_STATEFUL_KV = os.environ.get("GQA_STATEFUL_KV", "0") == "1"
+if USE_GQA_STATEFUL_KV and not USE_GQA_TAIL:
+    raise RuntimeError("GQA_STATEFUL_KV=1 requires GQATAIL=1")
 
 # Flash causal-attention PREFILL kernel (env GQA_FLASH_PREFILL=1). Replaces the
 # pure-torch full [S,S] causal attention in _gqa_prefill (which OOMs at S>~2k)
@@ -200,6 +203,8 @@ USE_DECODE_SHARDED_LM_HEAD = (
 )
 if USE_DN_DIRECT_STATE_OUT and not USE_DECODE_FULLGRAPH:
     raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DECODE_FULLGRAPH=1")
+if USE_GQA_STATEFUL_KV and not USE_DECODE_FULLGRAPH:
+    raise RuntimeError("GQA_STATEFUL_KV=1 requires DECODE_FULLGRAPH=1")
 
 
 def functional_all_reduce(x, op, group):
@@ -385,6 +390,28 @@ class StaticDecode35B(nn.Module):
         self.e_lo = rank * td["experts_per_core"]
         self.e_hi = self.e_lo + td["experts_per_core"]
         self.nkv = max(1, D.GQA_KV_HEADS // world_size)   # KV heads per core
+        if USE_GQA_STATEFUL_KV:
+            if self.nkv != 1:
+                raise RuntimeError(
+                    "GQA_STATEFUL_KV requires one local KV head per rank"
+                )
+            cache_shape = (
+                D.NUM_GQA,
+                batch_size,
+                self.nkv,
+                max_seq_len,
+                D.GQA_HEAD_DIM,
+            )
+            self.register_buffer(
+                "decode_kv_k",
+                torch.zeros(cache_shape, dtype=torch.bfloat16),
+                persistent=False,
+            )
+            self.register_buffer(
+                "decode_kv_v",
+                torch.zeros(cache_shape, dtype=torch.bfloat16),
+                persistent=False,
+            )
         # Layer segments for graph-split compile (default: single segment = whole
         # model). setup_segments() splits the layer range so each compiled NEFF
         # stays under the neuronx-cc PGTiling collective limit.
@@ -676,8 +703,12 @@ class StaticDecode35B(nn.Module):
         else:
             dn_states = deltanet_states.clone()
             cv_states = conv_states.clone()
-        kv_k = kv_cache_k.clone()
-        kv_v = kv_cache_v.clone()
+        if USE_GQA_STATEFUL_KV:
+            kv_k = self.decode_kv_k
+            kv_v = self.decode_kv_v
+        else:
+            kv_k = kv_cache_k.clone()
+            kv_v = kv_cache_v.clone()
 
         cos = self.rope_cos.squeeze(0).squeeze(0).index_select(
             0, position.unsqueeze(0)).unsqueeze(0).unsqueeze(0)    # [1,1,1,rd]
@@ -750,6 +781,22 @@ class StaticDecode35B(nn.Module):
         logits = outputs[0]
         next_id = logits.argmax(-1).to(torch.long)
         return logits, next_id, *outputs[1:]
+
+    def decode_step_stateful(self, input_id, position, deltanet_states, conv_states):
+        """Decode while carrying aliased K/V buffers outside the public result."""
+        if not USE_GQA_STATEFUL_KV:
+            raise RuntimeError(
+                "decode_step_stateful requires GQA_STATEFUL_KV=1"
+            )
+        outputs = self.decode_step(
+            input_id,
+            position,
+            deltanet_states,
+            conv_states,
+            self.decode_kv_k,
+            self.decode_kv_v,
+        )
+        return outputs[0], outputs[1], outputs[2], outputs[3]
 
     def _run_layers(self, lo, hi, hidden, cos, sin, position,
                     dn_states, cv_states, kv_k, kv_v):
@@ -946,15 +993,19 @@ class StaticDecode35B(nn.Module):
         key_b = key.squeeze(2).reshape(B, NKV, HD).to(kv_k.dtype)
         value_b = value.reshape(B, NKV, HD).to(kv_v.dtype)
 
-        # KV cache: kv_k/v[gi] = [B, NKV, max_seq, HD]. Write current position.
-        pos_idx = position.reshape(1, 1, 1, 1).expand(B, NKV, 1, HD)
-        kv_k[gi].scatter_(2, pos_idx, key_b.unsqueeze(2))
-        kv_v[gi].scatter_(2, pos_idx, value_b.unsqueeze(2))
+        # KV cache: kv_k/v[gi] = [B, NKV, max_seq, HD].
+        if not USE_GQA_STATEFUL_KV:
+            pos_idx = position.reshape(1, 1, 1, 1).expand(B, NKV, 1, HD)
+            kv_k[gi].scatter_(2, pos_idx, key_b.unsqueeze(2))
+            kv_v[gi].scatter_(2, pos_idx, value_b.unsqueeze(2))
         cached_k = kv_k[gi]                               # [B,NKV,S,HD]
         cached_v = kv_v[gi]
 
         pos_range = torch.arange(self.max_seq_len, device=x.device)
-        mask = (pos_range <= position)                   # [S]
+        if USE_GQA_STATEFUL_KV:
+            mask = pos_range < position
+        else:
+            mask = pos_range <= position
 
         if USE_GQA_TAIL:
             # ONE custom call folds q RMSNorm + partial RoPE + scaled scores +
@@ -962,16 +1013,32 @@ class StaticDecode35B(nn.Module):
             # replicated), so all QH query heads attend to the single cached
             # head — the kernel's [B*S,HD] layout. Pass PRE-NORM query, raw gate.
             S = self.max_seq_len
-            attn_flat = torch.ops.gqa35b.tail(
+            if USE_GQA_STATEFUL_KV:
+                cache_k_arg = kv_k.reshape(D.NUM_GQA * B * S, HD)
+                cache_v_arg = kv_v.reshape(D.NUM_GQA * B * S, HD)
+            else:
+                cache_k_arg = cached_k.reshape(B * S, HD).float()
+                cache_v_arg = cached_v.reshape(B * S, HD).float()
+            args = (
                 query.reshape(B * QH, HD).float(),
                 gate.reshape(B * QH, HD).float(),
                 q_norm_w.reshape(1, HD).float(),
                 cos.reshape(1, D.ROPE_DIM).float(),
                 sin.reshape(1, D.ROPE_DIM).float(),
-                cached_k.reshape(B * S, HD).float(),
-                cached_v.reshape(B * S, HD).float(),
+                cache_k_arg,
+                cache_v_arg,
                 mask.reshape(1, S).float(),
-            )                                             # [B*QH, HD]
+            )
+            if USE_GQA_STATEFUL_KV:
+                attn_flat = torch.ops.gqa35b.tail_stateful(
+                    *args,
+                    key_b.reshape(B, HD),
+                    value_b.reshape(B, HD),
+                    position.reshape(1, 1).to(torch.int32),
+                    gi,
+                )
+            else:
+                attn_flat = torch.ops.gqa35b.tail(*args)
             attn_out = attn_flat.reshape(B, QH * HD).to(x.dtype)
         else:
             # Grouped attention: GRP query heads share each KV head.
@@ -1712,8 +1779,15 @@ def main():
     dn_states = torch.zeros(D.NUM_DELTANET, B, vh * KD, VD, dtype=dtype, device=device)
     conv_states = torch.zeros(D.NUM_DELTANET, B, qkv_dim, D.DN_CONV_KERNEL - 1, dtype=dtype, device=device)
     nkv = max(1, D.GQA_KV_HEADS // world_size)
-    kv_k = torch.zeros(D.NUM_GQA, B, nkv, args.max_seq_len, D.GQA_HEAD_DIM, dtype=dtype, device=device)
-    kv_v = torch.zeros(D.NUM_GQA, B, nkv, args.max_seq_len, D.GQA_HEAD_DIM, dtype=dtype, device=device)
+    if USE_GQA_STATEFUL_KV:
+        kv_k = mod.decode_kv_k
+        kv_v = mod.decode_kv_v
+    else:
+        kv_k = torch.zeros(
+            D.NUM_GQA, B, nkv, args.max_seq_len, D.GQA_HEAD_DIM,
+            dtype=dtype, device=device,
+        )
+        kv_v = torch.zeros_like(kv_k)
 
     compiled_decode_step = None
     if not args.skip_compile and not args.cpu and args.prefill_bench == 0:
@@ -1724,8 +1798,13 @@ def main():
         # Skipped for --prefill-bench (decode graph unused there).
         if USE_DECODE_FULLGRAPH:
             segs = mod.setup_segments(1, compile_each=False)
+            decode_fn = (
+                mod.decode_step_stateful
+                if USE_GQA_STATEFUL_KV
+                else mod.decode_step
+            )
             compiled_decode_step = torch.compile(
-                mod.decode_step, backend="neuron", fullgraph=True, dynamic=False
+                decode_fn, backend="neuron", fullgraph=True, dynamic=False
             )
             if rank == 0:
                 lm_mode = "vocab-sharded LM head" if USE_DECODE_SHARDED_LM_HEAD else "replicated LM head"
@@ -1737,6 +1816,12 @@ def main():
                 print(f"  graph-split into {len(segs)} compiled segments: {segs}")
 
     def run_decode(input_id, pos, dns, cvs, keys, values):
+        if USE_GQA_STATEFUL_KV:
+            if compiled_decode_step is not None:
+                outputs = compiled_decode_step(input_id, pos, dns, cvs)
+            else:
+                outputs = mod.decode_step_stateful(input_id, pos, dns, cvs)
+            return *outputs, mod.decode_kv_k, mod.decode_kv_v
         if compiled_decode_step is not None:
             return compiled_decode_step(input_id, pos, dns, cvs, keys, values)
         outputs = mod(input_id, pos, dns, cvs, keys, values)
@@ -1803,6 +1888,11 @@ def main():
         else:
             logits, dn_states, conv_states, kv_k, kv_v = mod.prefill(
                 in_t, dn_states, conv_states, kv_k, kv_v)
+        if USE_GQA_STATEFUL_KV:
+            mod.decode_kv_k.copy_(kv_k)
+            mod.decode_kv_v.copy_(kv_v)
+            kv_k = mod.decode_kv_k
+            kv_v = mod.decode_kv_v
         nid0 = logits[0].argmax().to(torch.long)
         next_id = nid0.reshape(1).expand(B).contiguous()
         gen.append(next_id)

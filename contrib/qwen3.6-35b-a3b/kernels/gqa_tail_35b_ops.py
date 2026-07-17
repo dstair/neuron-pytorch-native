@@ -1,14 +1,12 @@
 """@nki_op registration for the 35B-A3B GQA-tail mega-kernel.
 
-Identical signature to the 27B gqa::tail, registered under a distinct op name.
-Q_HEADS=4 (TP=4) comes from gqa_tail_35b's module constant (env-overridable).
-Folds q RMSNorm + partial-64 RoPE + scaled scores + masked softmax + weighted-V
-+ sigmoid output-gate into ONE custom call/layer. k-side norm/rope + KV-cache
-write stay in torch; o_proj stays F.linear.
+Q_HEADS comes from gqa_tail_35b's module constant (env-overridable). The
+stateful variant additionally writes the current K/V rows into aliased base
+cache arguments inside the same custom call.
 """
 import torch
 from torch_neuronx import nki_op
-from gqa_tail_35b import nki_gqa_tail
+from gqa_tail_35b import nki_gqa_tail, nki_gqa_tail_stateful
 
 
 @nki_op("gqa35b::tail", mutates_args={})
@@ -24,3 +22,27 @@ def gqa35b_tail(
 ) -> torch.Tensor:
     """Returns attn_out [B*Q_HEADS, HEAD_DIM] f32 = o * sigmoid(gate), pre-o_proj."""
     return nki_gqa_tail(query, gate, q_norm, cos, sin, cached_k, cached_v, mask)
+
+
+@nki_op(
+    "gqa35b::tail_stateful",
+    mutates_args={"cached_k", "cached_v"},
+)
+def gqa35b_tail_stateful(
+    query: torch.Tensor,
+    gate: torch.Tensor,
+    q_norm: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cached_k: torch.Tensor,  # [G*B*S, HEAD_DIM] bf16, mutated
+    cached_v: torch.Tensor,  # [G*B*S, HEAD_DIM] bf16, mutated
+    mask: torch.Tensor,
+    key: torch.Tensor,       # [B, HEAD_DIM] bf16
+    value: torch.Tensor,     # [B, HEAD_DIM] bf16
+    position: torch.Tensor,  # [1, 1] int32
+    layer_index: int,
+) -> torch.Tensor:
+    return nki_gqa_tail_stateful(
+        query, gate, q_norm, cos, sin, cached_k, cached_v, mask,
+        key, value, position, layer_index,
+    )

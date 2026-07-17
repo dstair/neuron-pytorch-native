@@ -64,8 +64,9 @@ def compare(reference_dir, candidate_dir, world_size):
                 f"rank={rank} {name}: cosine={cosine:.8f} "
                 f"max_abs={diff.abs().max().item():.6e} rel_l2={rel_l2:.6e}"
             )
-            assert cosine > 0.999, (rank, name, cosine)
-            assert rel_l2 < 0.02, (rank, name, rel_l2)
+            torch.testing.assert_close(
+                candidate[name], reference[name], rtol=0, atol=0
+            )
 
     print("PASS: local logits, greedy IDs, and all carried states match")
 
@@ -109,9 +110,25 @@ def capture(args):
         assert S.USE_DECODE_FULLGRAPH
         assert S.USE_DECODE_SHARDED_LM_HEAD
         model.setup_segments(1, compile_each=False)
-        step = torch.compile(
-            model.decode_step, backend="neuron", fullgraph=True, dynamic=False
-        )
+        if S.USE_GQA_STATEFUL_KV:
+            compiled_step = torch.compile(
+                model.decode_step_stateful,
+                backend="neuron",
+                fullgraph=True,
+                dynamic=False,
+            )
+
+            def step(token, position, *state):
+                outputs = compiled_step(token, position, state[0], state[1])
+                return (
+                    *outputs,
+                    model.decode_kv_k,
+                    model.decode_kv_v,
+                )
+        else:
+            step = torch.compile(
+                model.decode_step, backend="neuron", fullgraph=True, dynamic=False
+            )
 
     td = D.tp_dims(world_size)
     vh = td["dn_v_heads"]
@@ -140,8 +157,22 @@ def capture(args):
             dtype=torch.bfloat16,
         ),
     )
-    state_cpu = (*state_cpu, torch.zeros_like(state_cpu[-1]))
+    state_cpu = (
+        state_cpu[0],
+        state_cpu[1],
+        state_cpu[2],
+        torch.zeros_like(state_cpu[2]),
+    )
     state = tuple(tensor.to(device) for tensor in state_cpu)
+    if S.USE_GQA_STATEFUL_KV:
+        model.decode_kv_k.copy_(state[2])
+        model.decode_kv_v.copy_(state[3])
+        state = (
+            state[0],
+            state[1],
+            model.decode_kv_k,
+            model.decode_kv_v,
+        )
     token = (
         torch.arange(args.batch_size, dtype=torch.long) * 7919
         + 100
@@ -150,7 +181,7 @@ def capture(args):
     with torch.no_grad():
         outputs = None
         try:
-            for position_value in (5, 6):
+            for position_value in range(5, 5 + args.capture_steps):
                 position = torch.tensor(
                     position_value, dtype=torch.long
                 ).to(device)
@@ -202,6 +233,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--max-seq-len", type=int, default=256)
+    parser.add_argument("--capture-steps", type=int, default=2)
     parser.add_argument("--compare", nargs=2, metavar=("REFERENCE", "CANDIDATE"))
     args = parser.parse_args()
     if args.compare:

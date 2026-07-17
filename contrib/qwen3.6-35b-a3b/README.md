@@ -167,6 +167,7 @@ tok/s.
 | `GQATAIL=1` | Fused GQA attention-tail kernel |
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
 | `DN_DIRECT_STATE_OUT=1` | Full-graph decode: write BF16 DeltaNet/conv state directly to disjoint output buffers |
+| `GQA_STATEFUL_KV=1` | Full-graph decode: keep BF16 K/V caches as aliased module state and append only the current rows |
 | `MOE_CTE=1` | Long-token nkilib context-encoding MoE kernel for prefill |
 | `GQA_CTE_PREFILL=1` | Prefix-aware nkilib CTE attention; requires `GQA_DYNAMIC_ROPE_KV=1` |
 | `DN_CHUNK_NKI=1`, `CHUNK_SIZE=16` | Stable long-context DeltaNet prefill kernel |
@@ -245,6 +246,7 @@ materializing full-vocabulary logits on every rank.
 | 2 | full graph, vocab-sharded LM head | **8.03** | **3,986.7** |
 | 40 | full graph, vocab-sharded LM head | 108.86 | 293.9 |
 | 40 | + direct recurrent-state output | **105.31** | **303.9** |
+| 40 | + stateful K/V cache | **99.80** | **320.6** |
 
 The 40-layer results are cache-hot, synchronized 30-iteration runs with masked-
 dense MoE. `DN_DIRECT_STATE_OUT=1` keeps recurrent inputs read-only and has the
@@ -264,12 +266,28 @@ DMA metadata. The full graph has roughly 968,000 instructions and uses about
 10.72 GB HBM per rank. A full-depth inline capture cannot allocate its trace
 buffers beside the model, so traffic was measured on the two-layer graph only.
 
+`GQA_STATEFUL_KV=1` removes K/V from the compiled step's inputs and outputs.
+Each GQA call reads the prior BF16 cache, includes the current K/V row in FP32
+attention math, then appends that row to aliased module buffers after attention.
+This avoids cloning and returning the full `batch * sequence` cache while
+preserving one graph and the established arithmetic path. It requires
+`GQATAIL=1 DECODE_FULLGRAPH=1` and one local KV head per rank.
+
+A paired 100-step four-layer run (one GQA layer) measured 12.79 to 12.68 ms.
+Two real-weight steps matched every greedy ID on all eight ranks; DeltaNet,
+convolution, K, and V state were bit-identical. A matched no-DGE replay reduced
+device execution from 10.236 to 10.096 ms, estimated HBM reads from 1079.7 to
+1046.2 MB, HBM writes from 77.5 to 44.0 MB, and combined dynamic DMA from
+1131.9 to 1094.2 MB. Treat those traffic values as directional because Explorer
+reports missing dynamic-DMA metadata. The production 40-layer run improved
+105.31 to 99.80 ms/token, or 303.9 to 320.6 aggregate tok/s.
+
 Use:
 
 ```bash
 DN_NKI=1 DN_K_HEADS=2 DN_V_HEADS=4 \
 GQATAIL=1 GQA_Q_HEADS=2 DNBATCHED_V2=1 \
-DN_DIRECT_STATE_OUT=1 \
+DN_DIRECT_STATE_OUT=1 GQA_STATEFUL_KV=1 \
 DECODE_FULLGRAPH=1 DECODE_SHARDED_LM_HEAD=1 \
 NEURON_LOGICAL_NC_CONFIG=1 NEURON_CC_FLAGS="--target trn2 --lnc 1" \
   torchrun --nproc-per-node=8 static_decode_35b.py \

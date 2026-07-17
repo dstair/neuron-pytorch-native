@@ -4,11 +4,10 @@ scaled scores + masked softmax + weighted-V + sigmoid output-gate — into a sin
 custom call, removing the ~12 inter-op EVENT_SEMAPHORE barriers/layer that the BS=8
 profile (decv4bs8) showed dominate the critical path.
 
-SCOPE (deliberate): the k-side norm+rope and the KV-cache WRITE stay in torch
-(lean-KV proved the write isn't the TPOT mover, and keeping it out avoids a
-dynamic-`position` DMA inside the kernel). The kernel receives the ALREADY-UPDATED
-cached_k/cached_v + a precomputed causal mask, so it has no dynamic offsets. o_proj
-stays F.linear (fusing dense GEMMs always regressed — see project-qwen36-native-baseline).
+The default variant receives an already-updated cache. The stateful variant
+receives the full flattened BF16 cache buffers plus a static layer index,
+performs attention over the prior cache plus current rows, then writes only
+those current rows through aliased inputs. o_proj stays F.linear.
 
 Math mirrors gqa_tail_ref.gqa_tail_ref (validated vs _gqa_layer to 3.9e-7). Per b:
   qn = (1+q_norm) * rms_norm(query[b])             [6,256]  free-axis
@@ -50,16 +49,20 @@ def _mm(stat, mov, M, N):
     return o
 
 
-@nki.jit
-def nki_gqa_tail(
+def _nki_gqa_tail_impl(
     query,      # [B*Q_HEADS, HEAD_DIM] f32  (projected, pre-norm)
     gate,       # [B*Q_HEADS, HEAD_DIM] f32  (raw)
     q_norm,     # [1, HEAD_DIM] f32
     cos,        # [1, ROPE_DIM] f32
     sin,        # [1, ROPE_DIM] f32
-    cached_k,   # [B*S, HEAD_DIM] f32  (already KV-written; row b*S+t)
-    cached_v,   # [B*S, HEAD_DIM] f32
+    cached_k,   # [G*B*S, HEAD_DIM] bf16/f32
+    cached_v,   # [G*B*S, HEAD_DIM] bf16/f32
     mask,       # [1, S] f32  (1.0 valid / 0.0 masked)
+    key=None,   # optional [B, HEAD_DIM] bf16
+    value=None, # optional [B, HEAD_DIM] bf16
+    position=None,  # optional [1, 1] int32
+    layer_index=0,
+    cache_bf16=False,
 ):
     B = query.shape[0] // Q_HEADS
     S = mask.shape[1]
@@ -93,12 +96,15 @@ def nki_gqa_tail(
     nisa.dma_copy(dst=neg_row, src=mask[0:1, 0:S])
     nisa.tensor_scalar(dst=neg_row, data=neg_row, op0=nl.subtract, operand0=1.0)   # mask-1
     nisa.tensor_scalar(dst=neg_row, data=neg_row, op0=nl.multiply, operand0=1e9)    # *(1e9) -> 0 / -1e9
+    if position is not None:
+        pos = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pos, src=position)
     # NOTE: do NOT broadcast to [6,S] in one matmul — at max_seq=2048 the moving free
     # dim exceeds the 512 matmul limit. Broadcast per-N-block (<=512) inside the loop.
 
     for b in nl.sequential_range(B):
         qrow = b * Q_HEADS
-        krow = b * S
+        krow = (layer_index * B + b) * S
 
         # ---- load q[6,256], RMSNorm over free axis, *(1+w) ----
         q_in = nl.ndarray((Q_HEADS, HEAD_DIM), dtype=nl.float32, buffer=nl.sbuf)
@@ -142,11 +148,83 @@ def nki_gqa_tail(
         nisa.nc_transpose(dst=p1, data=qr[0:Q_HEADS, DT:HEAD_DIM])
         nisa.tensor_copy(dst=qrT1, src=p1)
 
+        if position is not None:
+            current_key_b = nl.ndarray(
+                (1, HEAD_DIM), dtype=key.dtype, buffer=nl.sbuf
+            )
+            current_value_b = nl.ndarray(
+                (1, HEAD_DIM), dtype=value.dtype, buffer=nl.sbuf
+            )
+            nisa.dma_copy(
+                dst=current_key_b, src=key[b:b + 1, 0:HEAD_DIM]
+            )
+            nisa.dma_copy(
+                dst=current_value_b, src=value[b:b + 1, 0:HEAD_DIM]
+            )
+            current_key = nl.ndarray(
+                (1, HEAD_DIM), dtype=nl.float32, buffer=nl.sbuf
+            )
+            current_value = nl.ndarray(
+                (1, HEAD_DIM), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.tensor_copy(dst=current_key, src=current_key_b)
+            nisa.tensor_copy(dst=current_value, src=current_value_b)
+
+            current_kT0 = nl.ndarray(
+                (DT, 1), dtype=nl.float32, buffer=nl.sbuf
+            )
+            current_kT1 = nl.ndarray(
+                (DT, 1), dtype=nl.float32, buffer=nl.sbuf
+            )
+            current_kp0 = nl.ndarray(
+                (DT, 1), dtype=nl.float32, buffer=nl.psum
+            )
+            current_kp1 = nl.ndarray(
+                (DT, 1), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_transpose(
+                dst=current_kp0, data=current_key[0:1, 0:DT]
+            )
+            nisa.nc_transpose(
+                dst=current_kp1, data=current_key[0:1, DT:HEAD_DIM]
+            )
+            nisa.tensor_copy(dst=current_kT0, src=current_kp0)
+            nisa.tensor_copy(dst=current_kT1, src=current_kp1)
+            current_score0 = _mm(
+                qrT0, current_kT0, Q_HEADS, 1
+            )
+            current_score1 = _mm(
+                qrT1, current_kT1, Q_HEADS, 1
+            )
+            current_score = nl.ndarray(
+                (Q_HEADS, 1), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.tensor_tensor(
+                dst=current_score,
+                data1=current_score0,
+                data2=current_score1,
+                op=nl.add,
+            )
+            nisa.tensor_scalar(
+                dst=current_score,
+                data=current_score,
+                op0=nl.multiply,
+                operand0=QSCALE,
+            )
+
         # ---- cached_k[b] -> d-partition [DT,S] x2 via dma_transpose ----
         ckT0 = nl.ndarray((DT, S), dtype=nl.float32, buffer=nl.sbuf)
         ckT1 = nl.ndarray((DT, S), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_transpose(dst=ckT0, src=cached_k[krow:krow + S, 0:DT])
-        nisa.dma_transpose(dst=ckT1, src=cached_k[krow:krow + S, DT:HEAD_DIM])
+        if cache_bf16:
+            ckB0 = nl.ndarray((DT, S), dtype=cached_k.dtype, buffer=nl.sbuf)
+            ckB1 = nl.ndarray((DT, S), dtype=cached_k.dtype, buffer=nl.sbuf)
+            nisa.dma_transpose(dst=ckB0, src=cached_k[krow:krow + S, 0:DT])
+            nisa.dma_transpose(dst=ckB1, src=cached_k[krow:krow + S, DT:HEAD_DIM])
+            nisa.tensor_copy(dst=ckT0, src=ckB0)
+            nisa.tensor_copy(dst=ckT1, src=ckB1)
+        else:
+            nisa.dma_transpose(dst=ckT0, src=cached_k[krow:krow + S, 0:DT])
+            nisa.dma_transpose(dst=ckT1, src=cached_k[krow:krow + S, DT:HEAD_DIM])
 
         # ---- scores[6,S] = (qr @ ck.T) * QSCALE, in N-blocks of <=512 ----
         scores = nl.ndarray((Q_HEADS, S), dtype=nl.float32, buffer=nl.sbuf)
@@ -171,14 +249,54 @@ def nki_gqa_tail(
         # ---- masked softmax over free axis S ----
         smax = nl.ndarray((Q_HEADS, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_reduce(dst=smax, data=scores, op=nl.maximum, axis=1)
+        if position is not None:
+            softmax_max = nl.ndarray(
+                (Q_HEADS, 1), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.tensor_tensor(
+                dst=softmax_max,
+                data1=smax,
+                data2=current_score,
+                op=nl.maximum,
+            )
+        else:
+            softmax_max = smax
         nsmax = nl.ndarray((Q_HEADS, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=nsmax, data=smax, op0=nl.multiply, operand0=-1.0)
+        nisa.tensor_scalar(
+            dst=nsmax, data=softmax_max,
+            op0=nl.multiply, operand0=-1.0,
+        )
         p = nl.ndarray((Q_HEADS, S), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=p, op=nl.exp, data=scores, bias=nsmax, scale=1.0)   # exp(scores - max); masked cols already -1e9 -> exp~0
         psum_ = nl.ndarray((Q_HEADS, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_reduce(dst=psum_, data=p, op=nl.add, axis=1)
+        if position is not None:
+            current_p = nl.ndarray(
+                (Q_HEADS, 1), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.activation(
+                dst=current_p,
+                op=nl.exp,
+                data=current_score,
+                bias=nsmax,
+                scale=1.0,
+            )
+            psum_total = nl.ndarray(
+                (Q_HEADS, 1), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.tensor_tensor(
+                dst=psum_total,
+                data1=psum_,
+                data2=current_p,
+                op=nl.add,
+            )
+        else:
+            psum_total = psum_
         rsum = nl.ndarray((Q_HEADS, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(dst=rsum, op=nl.reciprocal, data=psum_, bias=z6, scale=1.0)
+        nisa.activation(
+            dst=rsum, op=nl.reciprocal,
+            data=psum_total, bias=z6, scale=1.0,
+        )
 
         # ---- weighted-V o[6,256] = p @ cv ; accumulate over S in 128-tiles ----
         o = nl.ndarray((Q_HEADS, HEAD_DIM), dtype=nl.float32, buffer=nl.sbuf)
@@ -192,9 +310,29 @@ def nki_gqa_tail(
             pT_s = nl.ndarray((DT, Q_HEADS), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=pT_s[0:ksz, 0:Q_HEADS], src=pT[0:ksz, 0:Q_HEADS])
             cv_t = nl.ndarray((DT, HEAD_DIM), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=cv_t[0:ksz, 0:HEAD_DIM], src=cached_v[krow + ks:krow + ks + ksz, 0:HEAD_DIM])
+            if cache_bf16:
+                cv_b = nl.ndarray((DT, HEAD_DIM), dtype=cached_v.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=cv_b[0:ksz, 0:HEAD_DIM], src=cached_v[krow + ks:krow + ks + ksz, 0:HEAD_DIM])
+                nisa.tensor_copy(dst=cv_t[0:ksz, 0:HEAD_DIM], src=cv_b[0:ksz, 0:HEAD_DIM])
+            else:
+                nisa.dma_copy(dst=cv_t[0:ksz, 0:HEAD_DIM], src=cached_v[krow + ks:krow + ks + ksz, 0:HEAD_DIM])
             ovk = _mm(pT_s[0:ksz, 0:Q_HEADS], cv_t[0:ksz, 0:HEAD_DIM], Q_HEADS, HEAD_DIM)  # [6,256]
             nisa.tensor_tensor(dst=o, data1=o, data2=ovk, op=nl.add)
+        if position is not None:
+            current_pT = nl.ndarray(
+                (1, Q_HEADS), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_transpose(dst=current_pT, data=current_p)
+            current_pT_s = nl.ndarray(
+                (1, Q_HEADS), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.tensor_copy(dst=current_pT_s, src=current_pT)
+            current_o = _mm(
+                current_pT_s, current_value, Q_HEADS, HEAD_DIM
+            )
+            nisa.tensor_tensor(
+                dst=o, data1=o, data2=current_o, op=nl.add
+            )
         nisa.tensor_scalar(dst=o, data=o, op0=nl.multiply, operand0=rsum)       # /sum (per-partition)
 
         # ---- output gate: o * sigmoid(gate[b]) ----
@@ -205,4 +343,43 @@ def nki_gqa_tail(
         nisa.tensor_tensor(dst=o, data1=o, data2=gs, op=nl.multiply)
         nisa.dma_copy(dst=out[qrow:qrow + Q_HEADS, 0:HEAD_DIM], src=o)
 
+        if position is not None:
+            cache_row = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=cache_row, data=pos, op0=nl.add, operand0=krow,
+            )
+            nisa.dma_copy(
+                dst=cached_k.ap(
+                    [[HEAD_DIM, 1], [1, HEAD_DIM]], scalar_offset=cache_row
+                ),
+                src=key[b:b + 1, 0:HEAD_DIM],
+            )
+            nisa.dma_copy(
+                dst=cached_v.ap(
+                    [[HEAD_DIM, 1], [1, HEAD_DIM]], scalar_offset=cache_row
+                ),
+                src=value[b:b + 1, 0:HEAD_DIM],
+            )
+
+    return out
+
+
+@nki.jit
+def nki_gqa_tail(
+    query, gate, q_norm, cos, sin, cached_k, cached_v, mask,
+):
+    return _nki_gqa_tail_impl(
+        query, gate, q_norm, cos, sin, cached_k, cached_v, mask,
+    )
+
+
+@nki.jit
+def nki_gqa_tail_stateful(
+    query, gate, q_norm, cos, sin, cached_k, cached_v, mask,
+    key, value, position, layer_index,
+):
+    out = _nki_gqa_tail_impl(
+        query, gate, q_norm, cos, sin, cached_k, cached_v, mask,
+        key, value, position, layer_index=layer_index, cache_bf16=True,
+    )
     return out
