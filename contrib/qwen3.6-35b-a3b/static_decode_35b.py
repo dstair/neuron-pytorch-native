@@ -186,6 +186,14 @@ def quantize_experts_fp8(w):
 # TP collective cost-probe (matches 27B NOREDUCE lever; default off = correct).
 NO_REDUCE = os.environ.get("NOREDUCE", "0") == "1"
 
+# Compile the entire decode step, including embedding, state handling, LM head,
+# and token selection, into one graph. The default segmented path remains useful
+# when a full-depth graph exceeds a compiler limit.
+USE_DECODE_FULLGRAPH = os.environ.get("DECODE_FULLGRAPH", "0") == "1"
+USE_DECODE_SHARDED_LM_HEAD = (
+    os.environ.get("DECODE_SHARDED_LM_HEAD", "0") == "1"
+)
+
 
 def functional_all_reduce(x, op, group):
     # No-op when probing collective cost, or when there is a single rank
@@ -652,9 +660,8 @@ class StaticDecode35B(nn.Module):
                       getattr(self, f"l{i}_sh_down").float())
         return (routed + sg * sh).reshape(*lead, D.HIDDEN)
 
-    # ── Decode forward (B tokens in, B logits out) ──
-    def forward(self, input_id, position, deltanet_states, conv_states,
-                kv_cache_k, kv_cache_v):
+    def _decode_hidden(self, input_id, position, deltanet_states, conv_states,
+                       kv_cache_k, kv_cache_v):
         hidden = F.embedding(input_id, self.embed).unsqueeze(1)   # [B,1,H]
         dn_states = deltanet_states.clone()
         cv_states = conv_states.clone()
@@ -673,8 +680,56 @@ class StaticDecode35B(nn.Module):
                         dn_states, cv_states, kv_k, kv_v)
 
         hidden = rms_norm(hidden, self.final_norm)
+        return hidden, dn_states, cv_states, kv_k, kv_v
+
+    # ── Decode forward (B tokens in, B logits out) ──
+    def forward(self, input_id, position, deltanet_states, conv_states,
+                kv_cache_k, kv_cache_v):
+        hidden, dn_states, cv_states, kv_k, kv_v = self._decode_hidden(
+            input_id, position, deltanet_states, conv_states, kv_cache_k, kv_cache_v
+        )
         logits = self._lin("lm_head_w", hidden)   # [B,1,V]
         return logits.squeeze(1), dn_states, cv_states, kv_k, kv_v
+
+    def decode_step(self, input_id, position, deltanet_states, conv_states,
+                    kv_cache_k, kv_cache_v):
+        if USE_DECODE_SHARDED_LM_HEAD:
+            hidden, dn_states, cv_states, kv_k, kv_v = self._decode_hidden(
+                input_id, position, deltanet_states, conv_states,
+                kv_cache_k, kv_cache_v
+            )
+            if D.VOCAB % self.world_size:
+                raise RuntimeError(
+                    "DECODE_SHARDED_LM_HEAD requires vocab size divisible by TP"
+                )
+            vocab_per_rank = D.VOCAB // self.world_size
+            vocab_lo = self.rank * vocab_per_rank
+            vocab_hi = vocab_lo + vocab_per_rank
+            logits = F.linear(
+                hidden, self.lm_head_w[vocab_lo:vocab_hi]
+            ).squeeze(1)
+            local_max, local_id = logits.max(dim=-1)
+            global_max = functional_all_reduce(
+                local_max, "max", self.tp_group
+            )
+            global_id = local_id.to(torch.int32) + vocab_lo
+            invalid_id = torch.full_like(global_id, -D.VOCAB)
+            neg_winner_id = torch.where(
+                local_max == global_max, -global_id, invalid_id
+            )
+            next_id = -functional_all_reduce(
+                neg_winner_id, "max", self.tp_group
+            )
+            return (
+                logits, next_id.to(torch.long),
+                dn_states, cv_states, kv_k, kv_v,
+            )
+        outputs = self.forward(
+            input_id, position, deltanet_states, conv_states, kv_cache_k, kv_cache_v
+        )
+        logits = outputs[0]
+        next_id = logits.argmax(-1).to(torch.long)
+        return logits, next_id, *outputs[1:]
 
     def _run_layers(self, lo, hi, hidden, cos, sin, position,
                     dn_states, cv_states, kv_k, kv_v):
@@ -1597,16 +1652,33 @@ def main():
     kv_k = torch.zeros(D.NUM_GQA, B, nkv, args.max_seq_len, D.GQA_HEAD_DIM, dtype=dtype, device=device)
     kv_v = torch.zeros(D.NUM_GQA, B, nkv, args.max_seq_len, D.GQA_HEAD_DIM, dtype=dtype, device=device)
 
+    compiled_decode_step = None
     if not args.skip_compile and not args.cpu and args.prefill_bench == 0:
         # Graph-split: compile each layer-segment to its own NEFF. The full
         # 40-layer graph trips a neuronx-cc PGTiling assertion (~120 collectives);
         # ceil(NL/20) segments keep each NEFF compilable. forward() (embed +
         # segment dispatch + head) stays eager — the segments hold the compute.
         # Skipped for --prefill-bench (decode graph unused there).
-        n_splits = args.graph_splits if args.graph_splits else max(1, -(-D.NUM_LAYERS // 20))
-        segs = mod.setup_segments(n_splits, compile_each=True)
-        if rank == 0:
-            print(f"  graph-split into {len(segs)} compiled segments: {segs}")
+        if USE_DECODE_FULLGRAPH:
+            segs = mod.setup_segments(1, compile_each=False)
+            compiled_decode_step = torch.compile(
+                mod.decode_step, backend="neuron", fullgraph=True, dynamic=False
+            )
+            if rank == 0:
+                lm_mode = "vocab-sharded LM head" if USE_DECODE_SHARDED_LM_HEAD else "replicated LM head"
+                print(f"  full decode step compiled as one graph ({lm_mode}): {segs}")
+        else:
+            n_splits = args.graph_splits if args.graph_splits else max(1, -(-D.NUM_LAYERS // 20))
+            segs = mod.setup_segments(n_splits, compile_each=True)
+            if rank == 0:
+                print(f"  graph-split into {len(segs)} compiled segments: {segs}")
+
+    def run_decode(input_id, pos, dns, cvs, keys, values):
+        if compiled_decode_step is not None:
+            return compiled_decode_step(input_id, pos, dns, cvs, keys, values)
+        outputs = mod(input_id, pos, dns, cvs, keys, values)
+        logits = outputs[0]
+        return logits, logits.argmax(-1).to(torch.long), *outputs[1:]
 
     one = torch.tensor(1, dtype=torch.long, device=device)
     if not args.cpu:
@@ -1689,7 +1761,7 @@ def main():
     if profile_steps > 0:
         with torch.no_grad():
             for _ in range(3):                       # warmup (not the trace of interest)
-                logits, dn_states, conv_states, kv_k, kv_v = mod(
+                logits, _, dn_states, conv_states, kv_k, kv_v = run_decode(
                     next_id, position, dn_states, conv_states, kv_k, kv_v)
             if not args.cpu:
                 torch.neuron.synchronize()
@@ -1697,7 +1769,7 @@ def main():
             dist.barrier()
         with torch.no_grad():
             for _ in range(profile_steps):           # constant token+pos → same decode NEFF
-                logits, dn_states, conv_states, kv_k, kv_v = mod(
+                logits, _, dn_states, conv_states, kv_k, kv_v = run_decode(
                     next_id, position, dn_states, conv_states, kv_k, kv_v)
             if not args.cpu:
                 torch.neuron.synchronize()
@@ -1711,9 +1783,8 @@ def main():
     with torch.no_grad():
         t0 = time.time()
         for step in range(args.num_tokens):
-            logits, dn_states, conv_states, kv_k, kv_v = mod(
+            logits, next_id, dn_states, conv_states, kv_k, kv_v = run_decode(
                 next_id, position, dn_states, conv_states, kv_k, kv_v)
-            next_id = logits.argmax(-1).to(torch.long)
             gen.append(next_id)
             position = position + one
             if step == 0 and rank == 0:
@@ -1727,15 +1798,13 @@ def main():
             iters = args.bench_iters
             # warmup (NEFF already hot from the loop above)
             for _ in range(3):
-                logits, dn_states, conv_states, kv_k, kv_v = mod(
+                logits, next_id, dn_states, conv_states, kv_k, kv_v = run_decode(
                     next_id, position, dn_states, conv_states, kv_k, kv_v)
-                next_id = logits.argmax(-1).to(torch.long)
             _ = next_id[0].item()           # sync
             tb = time.time()
             for _ in range(iters):
-                logits, dn_states, conv_states, kv_k, kv_v = mod(
+                logits, next_id, dn_states, conv_states, kv_k, kv_v = run_decode(
                     next_id, position, dn_states, conv_states, kv_k, kv_v)
-                next_id = logits.argmax(-1).to(torch.long)
             _ = next_id[0].item()           # single sync after the batch
             if rank == 0:
                 tpot_ms = (time.time() - tb) / iters * 1000.0

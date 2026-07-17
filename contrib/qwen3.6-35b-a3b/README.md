@@ -174,9 +174,10 @@ tok/s.
 
 ## Performance summary
 
-All numbers are `trn2.3xlarge`, TP=4, LNC=2, measured with a `torch.neuron`-
-synchronized 30-50-iter timer. "PyTorch Native" = this repo's `static_decode_35b.py`
-(one compiled decode NEFF or four coarse prefill NEFFs). The "XLA" reference is the
+All numbers are `trn2.3xlarge`, TP=4, LNC=2 unless stated otherwise, measured
+with a `torch.neuron`-synchronized 30-50-iter timer. "PyTorch Native" = this
+repo's `static_decode_35b.py` (one compiled decode NEFF or four coarse prefill
+NEFFs). The "XLA" reference is the
 [NxDI](https://github.com/aws-neuron/neuronx-distributed-inference) implementation
 of the same model (PR #60) on the torch-xla stack.
 
@@ -227,6 +228,42 @@ Near-linear throughput scaling to BS=32 with no OOM (weights fixed ~19 GB/core; 
 DeltaNet state are tiny at seq=256). Throughput-optimal is high-BS masked-dense;
 latency-optimal is BS=1 true-sparse (sparse only wins at BS≤4, since it gathers
 `T·K` experts and `T·K ≥ 64` once batch grows).
+
+### Decode - BS=32 full graph on TP=8, LNC=1 (seq=256)
+
+For high-batch decode, compiling embedding, all layers, state updates, the LM
+head, and exact greedy token selection into one graph removes eager boundaries.
+The LM head is vocab-sharded across the eight TP ranks; two all-reduces select
+the exact global top-1 token, including lowest-id tie breaking, without
+materializing full-vocabulary logits on every rank.
+
+| Layers | Path | TPOT (ms) | aggregate tok/s |
+|--|--|--:|--:|
+| 2 | segmented, replicated LM head | 56.01 | 571.3 |
+| 2 | full graph, replicated LM head | 10.26 | 3,119.4 |
+| 2 | full graph, vocab-sharded LM head | **8.03** | **3,986.7** |
+| 40 | full graph, vocab-sharded LM head | **108.86** | **293.9** |
+
+The 40-layer result is a cache-hot, synchronized 30-iteration run with masked-
+dense MoE. The graph has 968,370 instructions and uses about 10.75 GB HBM per
+rank. A matched two-layer DGE profile showed that sharding the LM head reduced
+HBM reads from 1500.1 to 610.1 MB, software DMA from 1507.5 to 603.6 MB, and
+device execution from 10.266 to 6.324 ms. A full-depth inline device capture
+could not allocate its profiling buffers alongside the 10.72 GB/core model, so
+these traffic reductions are measured on the two-layer graph only.
+
+Use:
+
+```bash
+DN_NKI=1 DN_K_HEADS=2 DN_V_HEADS=4 \
+GQATAIL=1 GQA_Q_HEADS=2 DNBATCHED_V2=1 \
+DECODE_FULLGRAPH=1 DECODE_SHARDED_LM_HEAD=1 \
+NEURON_LOGICAL_NC_CONFIG=1 NEURON_CC_FLAGS="--target trn2 --lnc 1" \
+  torchrun --nproc-per-node=8 static_decode_35b.py \
+    --model-path <weights> --max-seq-len 256 --num-layers 40 \
+    --graph-splits 1 --batch-size 32 --num-tokens 2 \
+    --bench --bench-iters 30
+```
 
 ### Decode — long-context batch sweep (seq=10000 and 20000, masked-dense MoE + `DN_NKI+GQATAIL`)
 

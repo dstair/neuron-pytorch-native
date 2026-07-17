@@ -158,6 +158,19 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   missing-dynamic-DMA-metadata caveat. The path is BF16-only and requires
   `T == 1`; higher batches should retain masked-dense MoE because most experts
   become active and grouped GEMMs amortize better.
+- **For BS=32, use one TP=8/LNC=1 full decode graph and shard the LM head.**
+  `DECODE_FULLGRAPH=1 DECODE_SHARDED_LM_HEAD=1` compiles embedding, all layers,
+  state updates, one eighth of the vocabulary projection, and exact greedy
+  top-1 selection into one graph. With `DN_K_HEADS=2 DN_V_HEADS=4
+  GQA_Q_HEADS=2`, the full 40-layer S=256 graph measured 108.86 ms/token and
+  293.9 aggregate tok/s. On the matched two-layer graph, segmented decode was
+  56.01 ms, full graph with a replicated head was 10.26 ms, and the sharded
+  head was 8.03 ms. A DGE profile of the last step measured 1500.1->610.1 MB
+  HBM reads, 1507.5->603.6 MB software DMA, and 10.266->6.324 ms device
+  execution. The full graph has 968,370 instructions and about 10.75 GB HBM per
+  rank. Inline device profiling at full depth fails model allocation because
+  the inspect trace reservation exhausts the remaining per-core HBM; do not
+  treat the tiny NTFFs from that failed load as decode captures.
 - **Historical prefill baseline: eager sequence bucketing.**
   `--bucket-chunk 2048 --bucket-compile 0` with `GQA_FLASH_PREFILL=1 DN_CHUNK_NKI=1`
   plus pad-token masking gives coherent 20k prefill with no OOM and ~9 min compile
