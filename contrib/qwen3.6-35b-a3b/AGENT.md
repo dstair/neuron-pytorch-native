@@ -117,6 +117,7 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
 | `MOE_SPARSE=1` | True-sparse MoE dispatch — ~2× at BS=1; do NOT use at BS≥16 (see gotcha) |
 | `MOE_DECODE_TP=1` | BF16, one-token decode: TP within each routed expert to avoid dummy non-local weight reads |
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
+| `DN_DIRECT_STATE_OUT=1` | Full-graph decode: write BF16 recurrent state directly to disjoint output buffers |
 | `MOE_FP8=1` | FP8 experts — memory lever only (see FP8 gotcha) |
 | `GQA_FLASH_PREFILL=1`, `DN_CHUNK_NKI=1` | Prefill kernels (see prefill recipe) |
 | `GQA_CTE_PREFILL=1`, `GQA_DYNAMIC_ROPE_KV=1` | Prefix-aware compiled GQA prefill |
@@ -171,6 +172,19 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   rank. Inline device profiling at full depth fails model allocation because
   the inspect trace reservation exhausts the remaining per-core HBM; do not
   treat the tiny NTFFs from that failed load as decode captures.
+- **Write BS=32 recurrent state directly to separate output buffers.**
+  Add `DN_DIRECT_STATE_OUT=1` to the full-graph configuration above. It requires
+  `DN_NKI=1 DNBATCHED_V2=1 DECODE_FULLGRAPH=1`. The DeltaNet NKI call keeps the
+  BF16 input state read-only and converts final FP32 recurrence tiles directly
+  into BF16 output state, avoiding both a graph-wide input clone and per-layer
+  FP32 state materialization/cast. Two real-weight steps matched local logits
+  and greedy IDs on all eight ranks; DeltaNet and convolution state were
+  bit-identical. A matched two-layer no-DGE profile reduced device execution
+  6.324→6.105 ms, estimated HBM read 610.1→589.2 MB, HBM write 46.3→29.5 MB,
+  and combined dynamic DMA 648.1→623.0 MB. Treat traffic as directional because
+  Explorer reports missing dynamic DMA metadata. The full 40-layer cache-hot
+  run measured **105.31 ms/token / 303.9 tok/s**, versus 108.86 ms / 293.9 tok/s;
+  an independent run measured 105.28 ms / 304.0 tok/s.
 - **Historical prefill baseline: eager sequence bucketing.**
   `--bucket-chunk 2048 --bucket-compile 0` with `GQA_FLASH_PREFILL=1 DN_CHUNK_NKI=1`
   plus pad-token masking gives coherent 20k prefill with no OOM and ~9 min compile

@@ -44,6 +44,11 @@ MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", "/mnt/nvme/Qwen3.5-35B-A3B")
 # opaque to neuronx-cc's tiler so the full 40-layer graph compiles (pure-torch
 # einsum recurrence trips a PGTiling assertion past ~20 layers).
 USE_DN_NKI = os.environ.get("DN_NKI", "0") == "1"
+USE_DN_DIRECT_STATE_OUT = os.environ.get("DN_DIRECT_STATE_OUT", "0") == "1"
+if USE_DN_DIRECT_STATE_OUT and not USE_DN_NKI:
+    raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DN_NKI=1")
+if USE_DN_DIRECT_STATE_OUT and os.environ.get("DNBATCHED_V2", "0") != "1":
+    raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DNBATCHED_V2=1")
 if USE_DN_NKI:
     import deltanet_full_batched_35b_ops  # registers torch.ops.deltanet35b.full_batched
 
@@ -193,6 +198,8 @@ USE_DECODE_FULLGRAPH = os.environ.get("DECODE_FULLGRAPH", "0") == "1"
 USE_DECODE_SHARDED_LM_HEAD = (
     os.environ.get("DECODE_SHARDED_LM_HEAD", "0") == "1"
 )
+if USE_DN_DIRECT_STATE_OUT and not USE_DECODE_FULLGRAPH:
+    raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DECODE_FULLGRAPH=1")
 
 
 def functional_all_reduce(x, op, group):
@@ -663,8 +670,12 @@ class StaticDecode35B(nn.Module):
     def _decode_hidden(self, input_id, position, deltanet_states, conv_states,
                        kv_cache_k, kv_cache_v):
         hidden = F.embedding(input_id, self.embed).unsqueeze(1)   # [B,1,H]
-        dn_states = deltanet_states.clone()
-        cv_states = conv_states.clone()
+        if USE_DN_DIRECT_STATE_OUT:
+            dn_states = torch.empty_like(deltanet_states)
+            cv_states = torch.empty_like(conv_states)
+        else:
+            dn_states = deltanet_states.clone()
+            cv_states = conv_states.clone()
         kv_k = kv_cache_k.clone()
         kv_v = kv_cache_v.clone()
 
@@ -676,8 +687,17 @@ class StaticDecode35B(nn.Module):
         # Run layer segments. Each entry in self._segments is (lo, hi, fn) where
         # fn is either the plain bound _run_layers or a torch.compile'd wrapper.
         for (lo, hi, fn) in self._segments:
-            hidden = fn(lo, hi, hidden, cos, sin, position,
-                        dn_states, cv_states, kv_k, kv_v)
+            if USE_DN_DIRECT_STATE_OUT:
+                hidden = fn(
+                    lo, hi, hidden, cos, sin, position,
+                    deltanet_states, conv_states, dn_states, cv_states,
+                    kv_k, kv_v,
+                )
+            else:
+                hidden = fn(
+                    lo, hi, hidden, cos, sin, position,
+                    dn_states, cv_states, kv_k, kv_v,
+                )
 
         hidden = rms_norm(hidden, self.final_norm)
         return hidden, dn_states, cv_states, kv_k, kv_v
@@ -747,6 +767,26 @@ class StaticDecode35B(nn.Module):
             hidden = hidden + self._moe(i, normed)
         return hidden
 
+    def _run_layers_direct_state(
+        self, lo, hi, hidden, cos, sin, position,
+        dn_states_in, cv_states_in, dn_states_out, cv_states_out, kv_k, kv_v,
+    ):
+        """Decode layers while keeping recurrent inputs and outputs disjoint."""
+        for i in range(lo, hi):
+            normed = rms_norm(hidden, getattr(self, f"l{i}_input_norm"))
+            if D.layer_type(i) == "deltanet":
+                hidden = hidden + self._deltanet_layer(
+                    i, normed, dn_states_in, cv_states_in,
+                    dn_states_out, cv_states_out,
+                )
+            else:
+                hidden = hidden + self._gqa_layer(
+                    i, normed, cos, sin, position, kv_k, kv_v
+                )
+            normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
+            hidden = hidden + self._moe(i, normed)
+        return hidden
+
     def setup_segments(self, n_splits, compile_each=True):
         """Split the layer range into n_splits contiguous segments. When
         compile_each, each segment's _run_layers is wrapped in
@@ -760,7 +800,11 @@ class StaticDecode35B(nn.Module):
             lo, hi = bounds[k], bounds[k + 1]
             if lo == hi:
                 continue
-            fn = self._run_layers
+            fn = (
+                self._run_layers_direct_state
+                if USE_DN_DIRECT_STATE_OUT
+                else self._run_layers
+            )
             if compile_each:
                 fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
             segs.append((lo, hi, fn))
@@ -768,7 +812,10 @@ class StaticDecode35B(nn.Module):
         return [(lo, hi) for (lo, hi, _) in segs]
 
     # ── DeltaNet decode layer (pure-torch recurrence, per batch row) ──
-    def _deltanet_layer(self, i, x, dn_states, cv_states):
+    def _deltanet_layer(
+        self, i, x, dn_states, cv_states,
+        dn_states_out=None, cv_states_out=None,
+    ):
         di = D.deltanet_index(i)
         B = self.batch_size
         td = self.td
@@ -797,18 +844,34 @@ class StaticDecode35B(nn.Module):
             # tiler (the pure-torch einsum recurrence below trips PGTiling at
             # >~20 layers; the kernel is what lets the 27B compile 64 layers).
             cb = torch.zeros(qkv_dim, dtype=torch.float32, device=x_2d.device)
-            state_in = dn_states[di].reshape(B * VH * KD, VD).float()    # [B*VH*KD,VD]
+            if USE_DN_DIRECT_STATE_OUT:
+                state_in = dn_states[di].reshape(B * VH * KD, VD)
+            else:
+                state_in = dn_states[di].reshape(B * VH * KD, VD).float()
             qkv_in = mixed_qkv.to(torch.bfloat16).reshape(B * qkv_dim)   # [B*qkv_dim]
             conv_in = cv_states[di].reshape(B * qkv_dim, D.DN_CONV_KERNEL - 1)
             a_in = a_out.reshape(B * VH)
             b_in = b_out.reshape(B * VH)
             z_in = z.to(torch.bfloat16).reshape(B * VH, VD)
-            new_state, new_cs, attn_flat = torch.ops.deltanet35b.full_batched(
-                state_in, qkv_in, conv_in, conv_w2, cb,
-                a_in, b_in, z_in, A_log, dt_bias, norm_w.float(),
-            )
-            dn_states[di] = new_state.reshape(B, VH * KD, VD).to(dn_states.dtype)
-            cv_states[di] = new_cs.reshape(B, qkv_dim, D.DN_CONV_KERNEL - 1).to(cv_states.dtype)
+            if USE_DN_DIRECT_STATE_OUT:
+                state_out = dn_states_out[di].reshape(B * VH * KD, VD)
+                conv_out = cv_states_out[di].reshape(
+                    B * qkv_dim, D.DN_CONV_KERNEL - 1
+                )
+                _, _, attn_flat = torch.ops.deltanet35b.full_batched_direct(
+                    state_in, qkv_in, conv_in, conv_w2, cb,
+                    a_in, b_in, z_in, A_log, dt_bias, norm_w.float(),
+                    state_out, conv_out,
+                )
+            else:
+                new_state, new_cs, attn_flat = torch.ops.deltanet35b.full_batched(
+                    state_in, qkv_in, conv_in, conv_w2, cb,
+                    a_in, b_in, z_in, A_log, dt_bias, norm_w.float(),
+                )
+                dn_states[di] = new_state.reshape(B, VH * KD, VD).to(dn_states.dtype)
+                cv_states[di] = new_cs.reshape(
+                    B, qkv_dim, D.DN_CONV_KERNEL - 1
+                ).to(cv_states.dtype)
             gated = attn_flat.reshape(B, VH * VD)                        # already gated
             out = self._lin(f"l{i}_dn_out", gated)
             out = functional_all_reduce(out, "sum", self.tp_group)

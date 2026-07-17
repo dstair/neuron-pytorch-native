@@ -31,18 +31,27 @@ def compare(reference_dir, candidate_dir, world_size):
             weights_only=True,
         )
 
-        full_logits = reference["logits"].float()
-        local_logits = candidate["logits"].float()
-        shard = full_logits.shape[-1] // world_size
-        expected_logits = full_logits[:, rank * shard:(rank + 1) * shard]
+        reference_logits = reference["logits"].float()
+        candidate_logits = candidate["logits"].float()
+        if reference_logits.shape == candidate_logits.shape:
+            expected_logits = reference_logits
+        else:
+            shard = reference_logits.shape[-1] // world_size
+            expected_logits = reference_logits[
+                :, rank * shard:(rank + 1) * shard
+            ]
         torch.testing.assert_close(
-            local_logits, expected_logits, rtol=2e-2, atol=5e-2
+            candidate_logits, expected_logits, rtol=2e-2, atol=5e-2
         )
         assert torch.equal(candidate["next_id"], reference["next_id"])
 
         for name in NAMES[2:]:
             expected = reference[name].float()
             actual = candidate[name].float()
+            if actual.numel() == 0:
+                assert actual.shape == expected.shape
+                print(f"rank={rank} {name}: empty (shape={tuple(actual.shape)})")
+                continue
             diff = actual - expected
             cosine = F.cosine_similarity(
                 actual.reshape(-1), expected.reshape(-1), dim=0

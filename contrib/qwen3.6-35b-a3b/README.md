@@ -166,6 +166,7 @@ tok/s.
 | `MOE_DECODE_TP=1` | BF16 BS=1 decode only: shard each expert's intermediate width across TP ranks, avoiding dummy non-local expert reads |
 | `GQATAIL=1` | Fused GQA attention-tail kernel |
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
+| `DN_DIRECT_STATE_OUT=1` | Full-graph decode: write BF16 DeltaNet/conv state directly to disjoint output buffers |
 | `MOE_CTE=1` | Long-token nkilib context-encoding MoE kernel for prefill |
 | `GQA_CTE_PREFILL=1` | Prefix-aware nkilib CTE attention; requires `GQA_DYNAMIC_ROPE_KV=1` |
 | `DN_CHUNK_NKI=1`, `CHUNK_SIZE=16` | Stable long-context DeltaNet prefill kernel |
@@ -242,21 +243,33 @@ materializing full-vocabulary logits on every rank.
 | 2 | segmented, replicated LM head | 56.01 | 571.3 |
 | 2 | full graph, replicated LM head | 10.26 | 3,119.4 |
 | 2 | full graph, vocab-sharded LM head | **8.03** | **3,986.7** |
-| 40 | full graph, vocab-sharded LM head | **108.86** | **293.9** |
+| 40 | full graph, vocab-sharded LM head | 108.86 | 293.9 |
+| 40 | + direct recurrent-state output | **105.31** | **303.9** |
 
-The 40-layer result is a cache-hot, synchronized 30-iteration run with masked-
-dense MoE. The graph has 968,370 instructions and uses about 10.75 GB HBM per
-rank. A matched two-layer DGE profile showed that sharding the LM head reduced
-HBM reads from 1500.1 to 610.1 MB, software DMA from 1507.5 to 603.6 MB, and
-device execution from 10.266 to 6.324 ms. A full-depth inline device capture
-could not allocate its profiling buffers alongside the 10.72 GB/core model, so
-these traffic reductions are measured on the two-layer graph only.
+The 40-layer results are cache-hot, synchronized 30-iteration runs with masked-
+dense MoE. `DN_DIRECT_STATE_OUT=1` keeps recurrent inputs read-only and has the
+DeltaNet NKI kernel convert its final FP32 tiles directly into separate BF16
+output buffers. This removes the whole-state input clone and the per-layer FP32
+state output followed by a BF16 copy. Two real-weight decode steps matched the
+control's greedy IDs and local logits on all ranks; DeltaNet and convolution
+state were bit-identical. The earlier matched DGE profile showed that sharding
+the LM head reduced HBM reads from 1500.1 to 610.1 MB, software DMA from 1507.5
+to 603.6 MB, and device execution from 10.266 to 6.324 ms.
+
+On a matched two-layer profile, direct output reduced device execution from
+6.324 to 6.105 ms, estimated HBM reads from 610.1 to 589.2 MB, HBM writes from
+46.3 to 29.5 MB, and combined dynamic DMA from 648.1 to 623.0 MB. These no-DGE
+traffic estimates are directional because the profile reports missing dynamic
+DMA metadata. The full graph has roughly 968,000 instructions and uses about
+10.72 GB HBM per rank. A full-depth inline capture cannot allocate its trace
+buffers beside the model, so traffic was measured on the two-layer graph only.
 
 Use:
 
 ```bash
 DN_NKI=1 DN_K_HEADS=2 DN_V_HEADS=4 \
 GQATAIL=1 GQA_Q_HEADS=2 DNBATCHED_V2=1 \
+DN_DIRECT_STATE_OUT=1 \
 DECODE_FULLGRAPH=1 DECODE_SHARDED_LM_HEAD=1 \
 NEURON_LOGICAL_NC_CONFIG=1 NEURON_CC_FLAGS="--target trn2 --lnc 1" \
   torchrun --nproc-per-node=8 static_decode_35b.py \

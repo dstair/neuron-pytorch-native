@@ -9,7 +9,7 @@ full fused kernel: the per-element Python loop in batch_decode (B custom-calls
 per layer) collapses to ONE call.
 
 Batch layout (B sequences, weights SHARED across batch):
-  state:        [B*V_HEADS*K_DIM, V_DIM] f32   in   (head row for (b,h) = (b*V_HEADS+h)*K_DIM)
+  state:        [B*V_HEADS*K_DIM, V_DIM] f32/bf16 in (head row for (b,h) = (b*V_HEADS+h)*K_DIM)
   mixed_qkv:    [B*QKV_DIM]              bf16  in
   conv_state:   [B*QKV_DIM, 3]           bf16  in
   conv_weight:  [QKV_DIM, 4]             f32   in   SHARED (weight)
@@ -22,9 +22,13 @@ Batch layout (B sequences, weights SHARED across batch):
   norm_weight:  [V_DIM]                  f32   in   SHARED (weight)
 
 Returns:
-  new_state:      [B*V_HEADS*K_DIM, V_DIM] f32
+  new_state:      [B*V_HEADS*K_DIM, V_DIM] f32/bf16
   new_conv_state: [B*QKV_DIM, 3]           bf16
   output:         [B*V_HEADS, V_DIM]       bf16  gated, ready for out_proj
+
+Optional state_out/conv_state_out arguments let the caller supply BF16 output
+buffers. The input state remains read-only, and the final FP32 SBUF tiles are
+converted directly into those buffers.
 """
 import math
 import os as _os
@@ -48,7 +52,7 @@ RMS_EPS = 1e-6
 
 @nki.jit
 def nki_deltanet_full_batched(
-    state,         # [B*V_HEADS*K_DIM, V_DIM] f32
+    state,         # [B*V_HEADS*K_DIM, V_DIM] f32/bf16
     mixed_qkv,     # [B*QKV_DIM] bf16
     conv_state,    # [B*QKV_DIM, 3] bf16
     conv_weight,   # [QKV_DIM, 4] f32 (shared)
@@ -59,12 +63,20 @@ def nki_deltanet_full_batched(
     A_log,         # [V_HEADS] f32 (shared)
     dt_bias,       # [V_HEADS] f32 (shared)
     norm_weight,   # [V_DIM] f32 (shared)
+    state_out=None,       # optional [B*V_HEADS*K_DIM, V_DIM] bf16
+    conv_state_out=None,  # optional [B*QKV_DIM, 3] bf16
 ):
     # Derive batch size from the state row count (static at trace time).
     B = state.shape[0] // (V_HEADS * K_DIM)
 
-    new_state = nl.ndarray((B * V_HEADS * K_DIM, V_DIM), dtype=state.dtype, buffer=nl.shared_hbm)
-    new_conv_state = nl.ndarray((B * QKV_DIM, 3), dtype=conv_state.dtype, buffer=nl.shared_hbm)
+    if state_out is None:
+        new_state = nl.ndarray((B * V_HEADS * K_DIM, V_DIM), dtype=state.dtype, buffer=nl.shared_hbm)
+    else:
+        new_state = state_out
+    if conv_state_out is None:
+        new_conv_state = nl.ndarray((B * QKV_DIM, 3), dtype=conv_state.dtype, buffer=nl.shared_hbm)
+    else:
+        new_conv_state = conv_state_out
     output = nl.ndarray((B * V_HEADS, V_DIM), dtype=z.dtype, buffer=nl.shared_hbm)
     # v2: exp_g/beta gates kept in per-b SBUF TRANSPOSED to [1,V_HEADS] (head on free dim
     # → row-h slice has partition start 0, accepted as matmul moving). silu_z stays in HBM

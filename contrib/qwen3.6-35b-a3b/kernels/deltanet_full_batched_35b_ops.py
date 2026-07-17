@@ -13,7 +13,11 @@ Variant selector (same signature):
 import os
 import torch
 from torch_neuronx import nki_op
-if os.environ.get("DNBATCHED_V2", "0") == "1":
+USE_V2 = os.environ.get("DNBATCHED_V2", "0") == "1"
+USE_DIRECT_STATE_OUT = os.environ.get("DN_DIRECT_STATE_OUT", "0") == "1"
+if USE_DIRECT_STATE_OUT and not USE_V2:
+    raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DNBATCHED_V2=1")
+if USE_V2:
     from deltanet_full_batched_v2_35b import nki_deltanet_full_batched
 else:
     from deltanet_full_batched_35b import nki_deltanet_full_batched
@@ -37,3 +41,30 @@ def deltanet35b_full_batched(
         state, mixed_qkv, conv_state, conv_weight, conv_bias,
         a_out, b_out, z, A_log, dt_bias, norm_weight,
     )
+
+
+if USE_DIRECT_STATE_OUT:
+    @nki_op(
+        "deltanet35b::full_batched_direct",
+        mutates_args={"state_out", "conv_state_out"},
+    )
+    def deltanet35b_full_batched_direct(
+        state: torch.Tensor,           # [B*V_HEADS*K_DIM, V_DIM] bf16, read-only
+        mixed_qkv: torch.Tensor,       # [B*QKV_DIM] bf16
+        conv_state: torch.Tensor,      # [B*QKV_DIM, 3] bf16, read-only
+        conv_weight: torch.Tensor,     # [QKV_DIM, 4] f32 (shared)
+        conv_bias: torch.Tensor,       # [QKV_DIM] f32 (shared)
+        a_out: torch.Tensor,           # [B*V_HEADS] f32
+        b_out: torch.Tensor,           # [B*V_HEADS] f32
+        z: torch.Tensor,               # [B*V_HEADS, V_DIM] bf16
+        A_log: torch.Tensor,           # [V_HEADS] f32 (shared)
+        dt_bias: torch.Tensor,         # [V_HEADS] f32 (shared)
+        norm_weight: torch.Tensor,     # [V_DIM] f32 (shared)
+        state_out: torch.Tensor,       # [B*V_HEADS*K_DIM, V_DIM] bf16
+        conv_state_out: torch.Tensor,  # [B*QKV_DIM, 3] bf16
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return nki_deltanet_full_batched(
+            state, mixed_qkv, conv_state, conv_weight, conv_bias,
+            a_out, b_out, z, A_log, dt_bias, norm_weight,
+            state_out, conv_state_out,
+        )
