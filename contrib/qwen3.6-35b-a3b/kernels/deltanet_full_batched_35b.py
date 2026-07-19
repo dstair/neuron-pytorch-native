@@ -263,26 +263,29 @@ def nki_deltanet_full_batched(
                 decay_vec = nl.ndarray((K_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=decay_vec, src=decay_p)
 
-                # s_dec = s * decay_vec. Plain tensor_scalar (vector engine) —
-                # drops the wasted `+ z_kv` (add-with-zero) the old
-                # scalar_tensor_tensor carried. Mirrors deltanet_chunked_v2's
-                # state-decay; matches the jburtoft kernel's engine placement.
-                s_dec = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
+                # F1: In-place state decay. s := s * decay_vec instead of
+                # allocating a fresh s_dec buffer. Bit-identical; saves 1
+                # (K_DIM, V_DIM) SBUF alloc per (b, kh, ig) per token.
+                # Pattern from HF Hub v2.0-task007.
+                # (Original v1 note: drops the wasted `+ z_kv` add-with-zero
+                # the old scalar_tensor_tensor carried.)
                 nisa.tensor_scalar(
-                    dst=s_dec, data=s, op0=nl.multiply, operand0=decay_vec,
+                    dst=s, data=s, op0=nl.multiply, operand0=decay_vec,
                 )
 
                 kv_p = nl.ndarray((V_DIM, 1), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dst=kv_p, stationary=s_dec, moving=k_colN)
-                kv_mem = nl.ndarray((V_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=kv_mem, src=kv_p)
+                nisa.nc_matmul(dst=kv_p, stationary=s, moving=k_colN)
 
                 v_slot = 2 * K_HEADS + h
                 v_col_in = nl.ndarray((V_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=v_col_in, src=qkv_act[0:V_DIM, v_slot:v_slot + 1])
 
+                # F2: PSUM read fusion. Read kv_p directly as the second
+                # operand of tensor_tensor, saving a (V_DIM, 1) SBUF alloc
+                # and a tensor_copy per (b, kh, ig) per token.
+                # Pattern from HF Hub v2.0-task007.
                 diff = nl.ndarray((V_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_tensor(dst=diff, data1=v_col_in, data2=kv_mem, op=nl.subtract)
+                nisa.tensor_tensor(dst=diff, data1=v_col_in, data2=kv_p, op=nl.subtract)
 
                 beta_p = nl.ndarray((V_DIM, 1), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(dst=beta_p, stationary=ones_v, moving=beta_s)
@@ -306,13 +309,16 @@ def nki_deltanet_full_batched(
                 outer_t = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=outer_t, src=outer_p)
 
-                s_new = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_tensor(dst=s_new, data1=s_dec, data2=outer_t, op=nl.add)
+                # F3: In-place state update. s := s + outer_t (where s is
+                # the decayed state from F1). Saves a (K_DIM, V_DIM) SBUF
+                # alloc per (b, kh, ig) per token. Pattern from HF Hub
+                # v2.0-task007.
+                nisa.tensor_tensor(dst=s, data1=s, data2=outer_t, op=nl.add)
 
-                nisa.dma_copy(dst=new_state[gh * K_DIM:(gh + 1) * K_DIM, 0:V_DIM], src=s_new)
+                nisa.dma_copy(dst=new_state[gh * K_DIM:(gh + 1) * K_DIM, 0:V_DIM], src=s)
 
                 attn_p = nl.ndarray((V_DIM, 1), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dst=attn_p, stationary=s_new, moving=q_colS)
+                nisa.nc_matmul(dst=attn_p, stationary=s, moving=q_colS)
                 attn_col = nl.ndarray((V_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=attn_col, src=attn_p)
 
