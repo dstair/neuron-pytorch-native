@@ -6,9 +6,8 @@ kernel fuses the local routed experts:
     gate/up GEMM -> SwiGLU -> down GEMM -> affinity scale -> expert sum
 
 It never materializes `[experts, batch, hidden]`. For each 128-token tile it
-keeps one expert's gate/up/activated intermediate, one expert output scratch,
-and the final routed accumulator in SBUF. Weight bytes are converted
-tile-by-tile:
+keeps one expert's gate/up/activated intermediate and the final routed
+accumulator in SBUF. Weight bytes are converted tile-by-tile:
 
 * FP8: official E4M3FN bytes are decoded tile-by-tile to BF16 because TensorE
   does not accept E4M3FN as an `nc_matmul` stationary dtype. Codes below 0x78
@@ -419,17 +418,9 @@ def _moe_fused_w8_block_coalesced(
         (tokens, hidden_size), dtype=nl.float32, buffer=nl.sbuf
     )
     nisa.memset(dst=routed, value=0.0)
-    # Down accumulator is partition-packed: the column_packing intermediate
-    # tiles land in disjoint partition blocks so the down scale-add consumes the
-    # TensorE PSUM slab in place (no rebase copy). Folded back to `tokens` rows
-    # by a selector matmul per expert (identity when column_packing == 1).
-    expert_output_packed = nl.ndarray(
-        (TILE, hidden_size), dtype=nl.float32, buffer=nl.sbuf
+    expert_output = nl.ndarray(
+        (tokens, hidden_size), dtype=nl.float32, buffer=nl.sbuf
     )
-    if column_packing > 1:
-        expert_output_reduced = nl.ndarray(
-            (tokens, hidden_size), dtype=nl.float32, buffer=nl.sbuf
-        )
 
     # Two rotating slots break load/use anti-dependencies while keeping the
     # expert scratch bounded. Gate and up need independent PSUM streams.
@@ -470,39 +461,6 @@ def _moe_fused_w8_block_coalesced(
         ),
     ]
 
-    # Block selector S[p, t] = 1 iff p % tokens == t: column_packing stacked
-    # identity(tokens) blocks. Folds the partition-packed accumulators back to
-    # `tokens` rows via one TensorE matmul. Built once (packing is static) by
-    # accumulating cp diagonal masks (E = p - t - k*tokens == 0 for block k).
-    if column_packing > 1:
-        block_selector = nl.ndarray(
-            (TILE, tokens), dtype=nl.float32, buffer=nl.sbuf
-        )
-        nisa.memset(dst=block_selector, value=0.0)
-        selector_ones = nl.ndarray(
-            (TILE, tokens), dtype=nl.float32, buffer=nl.sbuf
-        )
-        nisa.memset(dst=selector_ones, value=1.0)
-        selector_block = nl.ndarray(
-            (TILE, tokens), dtype=nl.float32, buffer=nl.sbuf
-        )
-        for packed_index in range(column_packing):
-            nisa.affine_select(
-                dst=selector_block,
-                pattern=[[-1, tokens]],
-                channel_multiplier=1,
-                offset=-packed_index * tokens,
-                cmp_op=nl.equal,
-                on_true_tile=selector_ones,
-                on_false_value=0.0,
-            )
-            nisa.tensor_tensor(
-                dst=block_selector,
-                data1=block_selector,
-                data2=selector_block,
-                op=nl.add,
-            )
-
     for expert in nl.sequential_range(experts):
         gate_scale_table = _load_coalesced_scale_table(
             gate_up_scales, expert
@@ -510,7 +468,7 @@ def _moe_fused_w8_block_coalesced(
         down_scale_table = _load_coalesced_scale_table(
             down_scales, expert
         )
-        nisa.memset(dst=expert_output_packed, value=0.0)
+        nisa.memset(dst=expert_output, value=0.0)
 
         affinity = nl.ndarray(
             (tokens, 1), dtype=affinities.dtype, buffer=nl.sbuf
@@ -529,14 +487,19 @@ def _moe_fused_w8_block_coalesced(
             scale=1.0,
         )
 
-        gate_packed = nl.ndarray(
-            (TILE, intermediate), dtype=nl.float32, buffer=nl.sbuf
+        gate = nl.ndarray(
+            (tokens, intermediate), dtype=nl.float32, buffer=nl.sbuf
         )
-        up_packed = nl.ndarray(
-            (TILE, intermediate), dtype=nl.float32, buffer=nl.sbuf
+        up = nl.ndarray(
+            (tokens, intermediate), dtype=nl.float32, buffer=nl.sbuf
         )
-        nisa.memset(dst=gate_packed, value=0.0)
-        nisa.memset(dst=up_packed, value=0.0)
+        nisa.memset(dst=gate, value=0.0)
+        nisa.memset(dst=up, value=0.0)
+        partial = nl.ndarray(
+            (tokens, COALESCED_WIDTH),
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+        )
 
         gate_groups = hidden_tiles // column_packing
         for input_group in range(gate_groups):
@@ -586,34 +549,45 @@ def _moe_fused_w8_block_coalesced(
                     input_group * column_packing + packed_index
                 )
                 packed_row = packed_index * tokens
-                # Scale-add the packed PSUM slice in place: PSUM-read base, the
-                # accumulator, and the (row-replicated) scale table all share
-                # base partition packed_row, so no rebase copy is needed.
+                nisa.activation(
+                    dst=partial,
+                    op=nl.copy,
+                    data=gate_psums[psum_slot][
+                        nl.ds(packed_row, tokens), :
+                    ],
+                    scale=1.0,
+                )
                 for output_block in range(intermediate_tiles):
                     output_start = output_block * TILE
                     scale_index = (
                         input_tile * intermediate_tiles + output_block
                     )
+                    partial_block = partial[
+                        :, nl.ds(output_start, TILE)
+                    ]
+                    gate_block = gate[
+                        :, nl.ds(output_start, TILE)
+                    ]
                     nisa.scalar_tensor_tensor(
-                        data=gate_psums[psum_slot][
-                            nl.ds(packed_row, tokens),
-                            nl.ds(output_start, TILE),
-                        ],
+                        data=partial_block,
                         op0=nl.multiply,
                         operand0=gate_scale_table[
-                            nl.ds(packed_row, tokens),
+                            :tokens,
                             scale_index : scale_index + 1,
                         ],
                         op1=nl.add,
-                        operand1=gate_packed[
-                            nl.ds(packed_row, tokens),
-                            nl.ds(output_start, TILE),
-                        ],
-                        dst=gate_packed[
-                            nl.ds(packed_row, tokens),
-                            nl.ds(output_start, TILE),
-                        ],
+                        operand1=gate_block,
+                        dst=gate_block,
                     )
+
+                nisa.activation(
+                    dst=partial,
+                    op=nl.copy,
+                    data=up_psums[psum_slot][
+                        nl.ds(packed_row, tokens), :
+                    ],
+                    scale=1.0,
+                )
                 for output_block in range(intermediate_tiles):
                     output_start = output_block * TILE
                     scale_index = (
@@ -621,54 +595,23 @@ def _moe_fused_w8_block_coalesced(
                         + input_tile * intermediate_tiles
                         + output_block
                     )
+                    partial_block = partial[
+                        :, nl.ds(output_start, TILE)
+                    ]
+                    up_block = up[
+                        :, nl.ds(output_start, TILE)
+                    ]
                     nisa.scalar_tensor_tensor(
-                        data=up_psums[psum_slot][
-                            nl.ds(packed_row, tokens),
-                            nl.ds(output_start, TILE),
-                        ],
+                        data=partial_block,
                         op0=nl.multiply,
                         operand0=gate_scale_table[
-                            nl.ds(packed_row, tokens),
+                            :tokens,
                             scale_index : scale_index + 1,
                         ],
                         op1=nl.add,
-                        operand1=up_packed[
-                            nl.ds(packed_row, tokens),
-                            nl.ds(output_start, TILE),
-                        ],
-                        dst=up_packed[
-                            nl.ds(packed_row, tokens),
-                            nl.ds(output_start, TILE),
-                        ],
+                        operand1=up_block,
+                        dst=up_block,
                     )
-
-        # Fold the column_packing partition blocks back to `tokens` rows. The
-        # selector matmul runs on TensorE; identity when column_packing == 1, so
-        # read the packed buffer directly in that case.
-        if column_packing == 1:
-            gate_reduced = gate_packed
-            up_reduced = up_packed
-        else:
-            nisa.memset(dst=gate_psums[0], value=0.0)
-            nisa.nc_matmul(
-                dst=gate_psums[0][nl.ds(0, tokens), :],
-                stationary=block_selector,
-                moving=gate_packed,
-                tile_position=(0, 0),
-                tile_size=(TILE, tokens),
-                is_stationary_onezero=True,
-            )
-            nisa.memset(dst=up_psums[0], value=0.0)
-            nisa.nc_matmul(
-                dst=up_psums[0][nl.ds(0, tokens), :],
-                stationary=block_selector,
-                moving=up_packed,
-                tile_position=(0, 0),
-                tile_size=(TILE, tokens),
-                is_stationary_onezero=True,
-            )
-            gate_reduced = gate_psums[0][nl.ds(0, tokens), :]
-            up_reduced = up_psums[0][nl.ds(0, tokens), :]
 
         zero_bias = nl.ndarray(
             (tokens, 1), dtype=nl.float32, buffer=nl.sbuf
@@ -680,7 +623,7 @@ def _moe_fused_w8_block_coalesced(
         nisa.activation(
             dst=silu_gate,
             op=nl.silu,
-            data=gate_reduced,
+            data=gate,
             bias=zero_bias,
             scale=1.0,
         )
@@ -690,7 +633,7 @@ def _moe_fused_w8_block_coalesced(
         nisa.tensor_tensor(
             dst=product,
             data1=silu_gate,
-            data2=up_reduced,
+            data2=up,
             op=nl.multiply,
         )
         activated_row = nl.ndarray(
@@ -767,6 +710,14 @@ def _moe_fused_w8_block_coalesced(
                         input_group * column_packing + packed_index
                     )
                     packed_row = packed_index * tokens
+                    nisa.activation(
+                        dst=partial,
+                        op=nl.copy,
+                        data=gate_psums[psum_slot][
+                            nl.ds(packed_row, tokens), :
+                        ],
+                        scale=1.0,
+                    )
                     for slab_block in range(
                         COALESCED_WIDTH // TILE
                     ):
@@ -779,59 +730,30 @@ def _moe_fused_w8_block_coalesced(
                             intermediate_tile * hidden_tiles
                             + output_block
                         )
+                        partial_block = partial[
+                            :, nl.ds(output_start, TILE)
+                        ]
                         expert_start = hidden_start + output_start
-                        # Packed scale-add in place at base partition packed_row.
+                        expert_block = expert_output[
+                            :, nl.ds(expert_start, TILE)
+                        ]
                         nisa.scalar_tensor_tensor(
-                            dst=expert_output_packed[
-                                nl.ds(packed_row, tokens),
-                                nl.ds(expert_start, TILE),
-                            ],
-                            data=gate_psums[psum_slot][
-                                nl.ds(packed_row, tokens),
-                                nl.ds(output_start, TILE),
-                            ],
+                            dst=expert_block,
+                            data=partial_block,
                             op0=nl.multiply,
                             operand0=down_scale_table[
-                                nl.ds(packed_row, tokens),
+                                :tokens,
                                 scale_index : scale_index + 1,
                             ],
                             op1=nl.add,
-                            operand1=expert_output_packed[
-                                nl.ds(packed_row, tokens),
-                                nl.ds(expert_start, TILE),
-                            ],
+                            operand1=expert_block,
                         )
-
-        # Fold the down accumulator's partition blocks back to `tokens` rows.
-        if column_packing == 1:
-            down_result = expert_output_packed
-        else:
-            for slab in range(hidden_slabs):
-                slab_start = slab * COALESCED_WIDTH
-                nisa.memset(dst=gate_psums[0], value=0.0)
-                nisa.nc_matmul(
-                    dst=gate_psums[0][nl.ds(0, tokens), :],
-                    stationary=block_selector,
-                    moving=expert_output_packed[
-                        :, nl.ds(slab_start, COALESCED_WIDTH)
-                    ],
-                    tile_position=(0, 0),
-                    tile_size=(TILE, tokens),
-                    is_stationary_onezero=True,
-                )
-                nisa.tensor_copy(
-                    dst=expert_output_reduced[
-                        :, nl.ds(slab_start, COALESCED_WIDTH)
-                    ],
-                    src=gate_psums[0][nl.ds(0, tokens), :],
-                )
-            down_result = expert_output_reduced
 
         for hidden_tile in nl.affine_range(hidden_tiles):
             hidden_start = hidden_tile * TILE
             routed_block = routed[:, nl.ds(hidden_start, TILE)]
             nisa.scalar_tensor_tensor(
-                data=down_result[:, nl.ds(hidden_start, TILE)],
+                data=expert_output[:, nl.ds(hidden_start, TILE)],
                 op0=nl.multiply,
                 operand0=affinity_f32[:, 0],
                 op1=nl.add,
