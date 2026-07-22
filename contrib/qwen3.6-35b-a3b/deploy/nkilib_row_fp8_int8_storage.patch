@@ -1,0 +1,128 @@
+diff --git a/src/nkilib_src/nkilib/core/mlp/mlp_parameters.py b/src/nkilib_src/nkilib/core/mlp/mlp_parameters.py
+--- a/src/nkilib_src/nkilib/core/mlp/mlp_parameters.py
++++ b/src/nkilib_src/nkilib/core/mlp/mlp_parameters.py
+@@ -54,5 +54,7 @@ SUPPORTED_QUANT_TYPES = [
+     QuantizationType.ROW_MX,
+ ]
+ 
++ROW_FP8_INT8_STORAGE_SUPPORTED = True
++
+ 
+ def get_T_from_hidden_input(hidden_input: nl.ndarray, hidden_input_scale: Optional[nl.ndarray] = None) -> int:
+@@ -800,19 +802,31 @@ def _validate_mlp_arguments_dtype(params):
+     )
+     kernel_assert(
+         resolve_dtype_to_nki(params.gate_proj_weights_tensor.dtype) in SUPPORTED_DTYPES
+-        or str(params.gate_proj_weights_tensor.dtype) in SUPPORTED_DTYPES,
++        or str(params.gate_proj_weights_tensor.dtype) in SUPPORTED_DTYPES
++        or (
++            resolve_dtype_to_nki(params.gate_proj_weights_tensor.dtype) == nl.int8
++            and params.quant_params.is_quant_row()
++        ),
+         f"Unsupported gate_proj_weights_tensor dtype: got {params.gate_proj_weights_tensor.dtype}, "
+         f"expected one of {SUPPORTED_DTYPES}.",
+     )
+     kernel_assert(
+         resolve_dtype_to_nki(params.up_proj_weights_tensor.dtype) in SUPPORTED_DTYPES
+-        or str(params.up_proj_weights_tensor.dtype) in SUPPORTED_DTYPES,
++        or str(params.up_proj_weights_tensor.dtype) in SUPPORTED_DTYPES
++        or (
++            resolve_dtype_to_nki(params.up_proj_weights_tensor.dtype) == nl.int8
++            and params.quant_params.is_quant_row()
++        ),
+         f"Unsupported up_proj_weights_tensor dtype: got {params.up_proj_weights_tensor.dtype}, "
+         f"expected one of {SUPPORTED_DTYPES}.",
+     )
+     kernel_assert(
+         resolve_dtype_to_nki(params.down_proj_weights_tensor.dtype) in SUPPORTED_DTYPES
+-        or str(params.down_proj_weights_tensor.dtype) in SUPPORTED_DTYPES,
++        or str(params.down_proj_weights_tensor.dtype) in SUPPORTED_DTYPES
++        or (
++            resolve_dtype_to_nki(params.down_proj_weights_tensor.dtype) == nl.int8
++            and params.quant_params.is_quant_row()
++        ),
+         f"Unsupported down_proj_weights_tensor dtype: got {params.down_proj_weights_tensor.dtype}, "
+         f"expected one of {SUPPORTED_DTYPES}.",
+     )
+diff --git a/src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_down_projection_lhs_rhs_swap.py b/src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_down_projection_lhs_rhs_swap.py
+--- a/src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_down_projection_lhs_rhs_swap.py
++++ b/src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_down_projection_lhs_rhs_swap.py
+@@ -116,6 +116,16 @@ def down_projection_lhs_rhs_swap(
+                 dge_mode=adaptive_dge_mode(weight),
+             )
+ 
++            stationary_tile = weight_tiles[weight_idx]
++            if stationary_tile.dtype == nl.int8 and params.quant_params.is_quant_row():
++                stationary_tile = TensorView(
++                    stationary_tile.get_view().view(nl.float8_e4m3)
++                )
++            stationary_tile = (
++                stationary_tile.slice(dim=0, start=0, end=i_tile.size)
++                .slice(dim=1, start=0, end=hidden_tiles.size)
++            )
++
+             """
+             When use_tkg_down_proj_optimized_layout is disabled, the weight-tile access pattern
+             uses a stride of H1_shard. When enabled, the framework permutes the weights so
+@@ -125,23 +135,25 @@ def down_projection_lhs_rhs_swap(
+                 for h1_tile in TiledRange(hidden_tiles.size, H0):
+                     psum_idx = (h1_offset + h1_tile.index) // perBankT
+                     psum_offset = (h1_offset + h1_tile.index) % perBankT
++                    stationary = stationary_tile.slice(
++                        dim=1, start=h1_tile.start_offset, end=h1_tile.end_offset
++                    ).get_view()
+                     nisa.nc_matmul(
+                         dst=result_psums[psum_idx][0:H0, nl.ds(psum_offset * T, T)],
+-                        stationary=weight_sb_tile_slice.slice(
+-                            dim=1, start=h1_tile.start_offset, end=h1_tile.end_offset
+-                        ).get_view(),
++                        stationary=stationary,
+                         moving=hidden_sb_tile_slice.get_view(),
+                     )
+             else:
+                 num_Htiles = div_ceil(hidden_tiles.size, H0)
+-                weight_reshaped = weight_sb_tile_slice.reshape_dim(dim=1, shape=(H0, num_Htiles)).permute(
++                weight_reshaped = stationary_tile.reshape_dim(dim=1, shape=(H0, num_Htiles)).permute(
+                     dims=(0, 2, 1)
+                 )
+                 for h1_tile in TiledRange(hidden_tiles.size, H0):
+                     psum_idx = (h1_offset + h1_tile.index) // perBankT
+                     psum_offset = (h1_offset + h1_tile.index) % perBankT
++                    stationary = weight_reshaped.select(dim=1, index=h1_tile.index).get_view()
+                     nisa.nc_matmul(
+                         dst=result_psums[psum_idx][0:H0, nl.ds(psum_offset * T, T)],
+-                        stationary=weight_reshaped.select(dim=1, index=h1_tile.index).get_view(),
++                        stationary=stationary,
+                         moving=hidden_sb_tile_slice.get_view(),
+                     )
+diff --git a/src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_gate_up_projection_lhs_rhs_swap.py b/src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_gate_up_projection_lhs_rhs_swap.py
+--- a/src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_gate_up_projection_lhs_rhs_swap.py
++++ b/src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_gate_up_projection_lhs_rhs_swap.py
+@@ -136,13 +136,24 @@ def gate_up_projection_lhs_rhs_swap(
+             dge_mode=nisa.dge_mode.hwdge,
+         )
+ 
++        stationary_tile = weight_tiles[weight_idx]
++        if stationary_tile.dtype == nl.int8 and params.quant_params.is_quant_row():
++            stationary_tile = TensorView(
++                stationary_tile.get_view().view(nl.float8_e4m3)
++            )
++
+         # Matmult
+         for h1_tile in TiledRange(hidden_tiles.size, H0):
+             for i_tile in TiledRange(I, I0):
++                stationary = (
++                    stationary_tile.slice(dim=1, start=0, end=h1_size)
++                    .slice(dim=2, start=0, end=I)
++                    .select(dim=1, index=h1_tile.index)
++                    .slice(dim=1, start=i_tile.start_offset, end=i_tile.end_offset)
++                    .get_view()
++                )
+                 nisa.nc_matmul(
+                     result_psums[i_tile.index][0 : i_tile.size, 0:T],
+-                    weight_sb_tile_slice.select(dim=1, index=h1_tile.index)
+-                    .slice(dim=1, start=i_tile.start_offset, end=i_tile.end_offset)
+-                    .get_view(),
++                    stationary,
+                     hidden.select(dim=hidden_h1_dim, index=h_start_offset + h1_tile.index).get_view(),
+                 )

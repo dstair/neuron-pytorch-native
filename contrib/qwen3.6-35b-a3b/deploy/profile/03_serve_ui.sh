@@ -5,20 +5,31 @@
 # is the actual registration step — `view`/--data-path alone leaves the list EMPTY.
 # See [[reference-neuron-explorer-ui]].
 set -u
-IMG=${ECR_REGISTRY}/concourse-release-0461d3b:latest
-OUT=/mnt/nvme/prof_bs1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/common.sh"
+
+IMG="$QWEN35_NATIVE_IMAGE"
+OUT="$QWEN35_PROFILE_ROOT/prof_bs1"
+DATA_DIR="$QWEN35_PROFILE_ROOT/ne_data"
+UI_LOG="$QWEN35_PROFILE_ROOT/ne_ui.log"
 NS=myself
 # locate device NEFF/NTFF + the system profile dir from the inspect output
 NEFF=$(find "$OUT" -name "*.neff" 2>/dev/null | head -1)
 NTFF=$(find "$OUT" -name "*.ntff" 2>/dev/null | head -1)
-SYSDIR=$(dirname "$(find "$OUT" -name "ntrace.pb" 2>/dev/null | head -1)" 2>/dev/null)
+TRACE=$(find "$OUT" -name "ntrace.pb" 2>/dev/null | head -1)
+SYSDIR=""
+if [[ -n "$TRACE" ]]; then
+  SYSDIR=$(dirname "$TRACE")
+fi
 echo "NEFF=$NEFF"; echo "NTFF=$NTFF"; echo "SYSDIR=$SYSDIR"
 
 docker rm -f q35_ne_ui 2>/dev/null
+mkdir -p "$DATA_DIR"
 # Serve UI detached (binds 127.0.0.1:3001 UI + :3002 API). Re-ingests on launch.
 docker run -d --name q35_ne_ui --network host \
-  -v /mnt/nvme:/mnt/nvme "$IMG" bash -lc \
-  "/opt/aws/neuron/bin/neuron-explorer view --data-path /mnt/nvme/ne_data --port 3001 2>&1 | tee /mnt/nvme/ne_ui.log"
+  -v "$QWEN35_PROFILE_ROOT":"$QWEN35_PROFILE_ROOT" "$IMG" bash -lc \
+  "/opt/aws/neuron/bin/neuron-explorer view --data-path '$DATA_DIR' --port 3001 2>&1 | tee '$UI_LOG'"
 echo "waiting for API on :3002..."; sleep 25
 docker exec q35_ne_ui bash -lc "curl -s -o /dev/null -w 'API %{http_code}\n' http://localhost:3002/ 2>&1" || true
 

@@ -62,6 +62,12 @@ harness for a 35B sparse-MoE hybrid model: 40 layers = [DeltaNet ×3, GQA ×1] �
   the same model but `st_reader.py` / `model_dims.py` expect the packing they were
   written for. If loading a differently-packed copy, update the reader accordingly
   (dims/routing/RoPE are unchanged — no perf difference).
+- **The fused W8 path needs both checkpoints.** Keep `QWEN35_MODEL_PATH` on the
+  BF16 model and set `QWEN35_FP8_MODEL_PATH` to the official FP8 model.
+  `MOE_FUSED_W8=fp8|int8` reads only routed-expert gate/up/down tensors and their
+  BF16 block scales from the latter. `MOE_OFFICIAL_FP8_REFERENCE=1` builds the
+  matching BF16 hybrid oracle from those same experts. Both modes are
+  high-batch, decode-only, full-graph validation paths.
 - **CTE GQA needs a newer nkilib than the current DLC bundle.** The bundled
   `attention_cte` rejects head-dim 256. The validated source is nki-library commit
   `1ee625782cb1bf91b40bccab741a82c726445080`, exposed with
@@ -119,6 +125,9 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
 | `DN_DIRECT_STATE_OUT=1` | Full-graph decode: write BF16 recurrent state directly to disjoint output buffers |
 | `GQA_STATEFUL_KV=1` | Full-graph decode: persist aliased BF16 K/V buffers and append only current rows |
+| `MOE_FUSED_W8=fp8|int8` | Experimental high-batch all-expert block-W8 kernel; requires the official FP8 checkpoint |
+| `MOE_FUSED_W8_FP8_IMPL=block_pow2_coalesced` | Exact-scale 128x512 coalesced FP8 path for BS=32/64/128; remains non-default |
+| `MOE_OFFICIAL_FP8_REFERENCE=1` | BF16 hybrid oracle made by exactly dequantizing the official FP8 expert blocks |
 | `MOE_FP8=1` | FP8 experts — memory lever only (see FP8 gotcha) |
 | `GQA_FLASH_PREFILL=1`, `DN_CHUNK_NKI=1` | Prefill kernels (see prefill recipe) |
 | `GQA_CTE_PREFILL=1`, `GQA_DYNAMIC_ROPE_KV=1` | Prefix-aware compiled GQA prefill |
@@ -145,6 +154,49 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   dispatch overhead dwarfs the bandwidth saved. Trn2's `nc_matmul` wants *legacy*
   `float8_e4m3`; torch only has `e4m3fn` — a real plumbing gap. Treat FP8 as the way
   to unlock higher batch at long context (capacity), not to speed up a single stream.
+- **Do not conflate the old row-scaled FP8 path with fused block-W8.**
+  `MOE_FUSED_W8=fp8` retains the official E4M3FN bytes and 128x128 BF16 scales,
+  then decodes each weight tile exactly to BF16 inside the all-expert NKI call.
+  Direct E4M3FN matmul is unsupported and bitcasting its `0x78..0x7e` codes to
+  legacy E4M3 is invalid. The real-weight isolated kernel passed for one and 32
+  experts, and two-layer full-graph correctness passed all ranks (logits cosine
+  0.999775-0.999834, all 32 IDs matched, state error <=0.251%). It still failed
+  the throughput gate: 7.93->32.26 ms and 4,033->992 tok/s. A matched replay
+  estimated HBM reads at 589.2->391.5 MB but device time at 6.366->41.559 ms,
+  DMA transfers at 3,548->27,792, and TensorE occupancy at 45.8%->10.3%.
+  Explorer reported DGE packet-count mismatches, so traffic is directional.
+  The first full-depth comparison exposed a harness bug: direct-state mode
+  discarded the returned DeltaNet and convolution states and relied on parent
+  slice mutation. Explicitly assigning both returned tensors made four-layer
+  direct and non-direct execution bit-identical. At 40 layers, exact FP8 step-0
+  logits had cosine 0.99921-0.99952 and relative L2 2.80-3.76%; state errors
+  were 0.67-1.14%. One row changed greedy ID only because the reference's top
+  two logits differed by 0.0625 and the candidate tied them. Teacher-forced
+  step 1, using the candidate state and reference token, improved logits to
+  cosine 0.99960-0.99972 and relative L2 1.96-2.52%, with state errors
+  0.54-1.73%. This clears continuous recurrence gates; exact greedy matching
+  remains sensitive to BF16 near-ties.
+  Full-depth throughput still fails decisively: BS=32 measured 618.72 ms /
+  51.7 tok/s at 6.84 GiB/rank versus BF16's 99.80 ms / 320.6 tok/s at
+  10.80 GiB/rank. BS=64 and BS=128 were therefore skipped. Native legacy-E4M3
+  reduced isolated-kernel cost but failed source-accuracy and four-layer gates;
+  symmetric INT8 also failed its numerical gates. Do not commit or present
+  fused W8 as a win.
+- **Coalesced block-power-of-two FP8 is two-layer qualified, not full-depth
+  qualified.** `MOE_FUSED_W8_FP8_IMPL=block_pow2_coalesced` keeps exact
+  128x128 scales while using `[E,H,2,I]` gate/up packing, 128x512 weight slabs,
+  two rotating weight/PSUM slots, and BS=32/64/128 column-packing factors
+  4/2/1. It is adapted from nki-library `7a5b6f9`; do not modify that checkout.
+  A 128x512 shared-scale variant was rejected: one/32-expert CPU MoE cosine was
+  0.999223446/0.999326253 and NRMSE was 3.94366%/3.67027%, so do not add
+  `block_group512`. The final `18e91693f453` two-layer artifact passes the
+  official hybrid comparison (worst logits cosine 0.99991870, logits relative
+  L2 0.47813%, state relative L2 0.24132%, exact IDs) and measures 10.67 ms /
+  2,998.0 tok/s. Against old `block_pow2`, Explorer reports 80.22% fewer DMA
+  transfers and 80.61% less GPSIMD time, but only 25.48% TensorE occupancy
+  versus the required 30%. HBM/DMA byte figures are directional due to the DGE
+  packet mismatch. Do not compile 40 layers or progress BS=64/128 full graphs
+  until the occupancy gate passes; do not commit this experiment as qualified.
 - **Sparse MoE does not scale to BS≥16.** `MOE_SPARSE=1` gathers `T·K` experts;
   the gathered graph explodes the *host* compiler memory at BS≥16 (F137 / OOM /
   host wedge). Use masked-dense MoE for BS≥16; sparse only wins BS≤4.
@@ -201,6 +253,16 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   The full 40-layer graph measured **99.80 ms/token / 320.6 tok/s**, versus the
   repeated direct-recurrent-state control at 105.31/105.28 ms and 303.9/304.0
   tok/s.
+- **BS=64 exceeds short-context BF16 full-graph HBM.**
+  The S=256 stateful graph compiled all eight rank NEFFs and placed the
+  10.89 GB/rank module, but execution failed allocating the next 240 MB BF16
+  recurrent-state tensor. Runtime accounting showed 11.852 GB/rank before that
+  allocation; two LNC=1 ranks share each 24 GB bank. A 13-minute
+  `trn1.32xlarge` cross-compile independently produced all eight ~43 MB
+  Trn2-targeted rank NEFFs. Trn2 replay loaded those full-graph artifacts
+  without recompiling them and reproduced the exact allocation failure,
+  proving compiler host RAM is not the constraint. Skip BS=128/256 after this
+  failure. BS=32 remains the largest loadable 40-layer full-graph batch.
 - **Historical prefill baseline: eager sequence bucketing.**
   `--bucket-chunk 2048 --bucket-compile 0` with `GQA_FLASH_PREFILL=1 DN_CHUNK_NKI=1`
   plus pad-token masking gives coherent 20k prefill with no OOM and ~9 min compile

@@ -39,7 +39,7 @@ prefix="$(cache_prefix "$cache_key")"
 payload_uri="$(cache_payload_uri "$cache_key")"
 manifest_uri="$(cache_manifest_uri "$cache_key")"
 
-if ! listing="$(aws s3 ls "$prefix/" --recursive 2>&1)"; then
+if ! listing="$(aws "${CACHE_S3_ARGS[@]}" s3 ls "$prefix/" --recursive 2>&1)"; then
   # AWS CLI returns 1 with no output for an empty, previously unused prefix.
   # Real authorization and transport failures include a diagnostic.
   if [[ -n "$listing" ]]; then
@@ -56,14 +56,17 @@ manifest="$(mktemp)"
 trap 'rm -f "$manifest"' EXIT
 write_manifest "$manifest" "$cache_key" "$cache_dir"
 
-sync_args=(s3 sync "$cache_dir/" "$payload_uri" --no-progress --only-show-errors)
+sync_args=(
+  "${CACHE_S3_ARGS[@]}" s3 sync "$cache_dir/" "$payload_uri"
+  --no-progress --only-show-errors --no-follow-symlinks --exclude '*.sock'
+)
 if [[ "$replace" -eq 1 ]]; then
   sync_args+=(--delete)
 fi
 
 echo "uploading complete cache root: $cache_dir -> $payload_uri"
 aws "${sync_args[@]}"
-aws s3 cp "$manifest" "$manifest_uri" --no-progress --only-show-errors
+aws "${CACHE_S3_ARGS[@]}" s3 cp "$manifest" "$manifest_uri" --no-progress --only-show-errors
 
 echo "uploaded $(cache_neff_count "$cache_dir") NEFFs, $(cache_file_count "$cache_dir") files, $(du -sh "$cache_dir" | awk '{print $1}')"
 echo "manifest: $manifest_uri"

@@ -61,19 +61,18 @@ models, which are the most heavily optimized):
 
 ## Running the scripts
 
-The deploy / profiling scripts under each model's `deploy/` directory reference a
-couple of environment-specific values (a container registry, a weights bucket)
-through placeholders like `${ECR_REGISTRY}` and `${S3_MODEL_BUCKET}`. Copy
-[`.env.example`](.env.example) to `.env`, fill in your own values, and `source`
-it before running them:
+The deploy and profiling scripts keep host paths and image references in an
+ignored `.env`. Copy [`.env.example`](.env.example) to `.env` and fill in the
+variables required by the model you are running:
 
 ```bash
 cp .env.example .env
-# edit .env with your registry / bucket
-source .env
+# edit .env with the required image and host-path values
 ```
 
-`.env` is gitignored.
+Qwen scripts load the root `.env` automatically and derive source mounts from
+their own location. Set `ENV_FILE` to use a different configuration file. `.env`
+is gitignored; committed scripts contain only stable container paths.
 
 ## License
 

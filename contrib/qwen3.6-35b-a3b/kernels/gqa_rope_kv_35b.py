@@ -89,21 +89,27 @@ def nki_gqa_rope_kv_dynamic(
     """Rotate Q/K and write K/V at runtime-selected contiguous cache rows.
 
     Shapes:
-      query: [Q_HEADS, CHUNK, 256] bf16
-      key/value: [CHUNK, 256] bf16
+      query: [B, Q_HEADS, CHUNK, 256] bf16
+      key/value: [B, CHUNK, 256] bf16
       rope_cos/rope_sin: [KMAX, 64] f32
-      kv_key/kv_value: [KMAX, 256] bf16, mutated in place
+      kv_key/kv_value: [B*KMAX, 256] bf16, mutated in place
       q_base: [1, 1] int32
     """
-    q_heads = query.shape[0]
-    chunk = query.shape[1]
+    batch_size = query.shape[0]
+    q_heads = query.shape[1]
+    chunk = query.shape[2]
+    kmax = kv_key.shape[0] // batch_size
     assert chunk % TILE == 0, "GQA dynamic RoPE/KV requires CHUNK divisible by 128"
 
     query_out = nl.ndarray(
-        (q_heads, chunk, HEAD_DIM), dtype=nl.float32, buffer=nl.shared_hbm
+        (batch_size, q_heads, chunk, HEAD_DIM),
+        dtype=nl.float32,
+        buffer=nl.shared_hbm,
     )
     key_out = nl.ndarray(
-        (chunk, HEAD_DIM), dtype=key.dtype, buffer=nl.shared_hbm
+        (batch_size, chunk, HEAD_DIM),
+        dtype=key.dtype,
+        buffer=nl.shared_hbm,
     )
     base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.dma_copy(dst=base, src=q_base)
@@ -133,30 +139,43 @@ def nki_gqa_rope_kv_dynamic(
             ),
         )
 
-        for head in nl.affine_range(q_heads):
-            q_rot = _rotate_tile(
-                query[head, row : row + TILE, :], cos, sin, TILE
+        # Keep the batch base static. Combining an affine batch index with the
+        # runtime row offset makes the driver conservatively bound the scalar
+        # DMA against the full flattened address range and reject the NEFF.
+        for batch in range(batch_size):
+            cache_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=cache_base,
+                data=tile_base,
+                op0=nl.add,
+                operand0=batch * kmax,
+            )
+            for head in nl.affine_range(q_heads):
+                q_rot = _rotate_tile(
+                    query[batch, head, row : row + TILE, :], cos, sin, TILE
+                )
+                nisa.dma_copy(
+                    dst=query_out[batch, head, row : row + TILE, :],
+                    src=q_rot,
+                )
+
+            key_rot = _rotate_tile(
+                key[batch, row : row + TILE, :], cos, sin, TILE
+            )
+            key_store = nl.ndarray((TILE, HEAD_DIM), dtype=kv_key.dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=key_store, src=key_rot)
+            nisa.dma_copy(dst=key_out[batch, row : row + TILE, :], src=key_store)
+            nisa.dma_copy(
+                dst=kv_key.ap(
+                    [[HEAD_DIM, TILE], [1, HEAD_DIM]], scalar_offset=cache_base
+                ),
+                src=key_store,
             )
             nisa.dma_copy(
-                dst=query_out[head, row : row + TILE, :],
-                src=q_rot,
+                dst=kv_value.ap(
+                    [[HEAD_DIM, TILE], [1, HEAD_DIM]], scalar_offset=cache_base
+                ),
+                src=value[batch, row : row + TILE, :],
             )
-
-        key_rot = _rotate_tile(key[row : row + TILE, :], cos, sin, TILE)
-        key_store = nl.ndarray((TILE, HEAD_DIM), dtype=kv_key.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=key_store, src=key_rot)
-        nisa.dma_copy(dst=key_out[row : row + TILE, :], src=key_store)
-        nisa.dma_copy(
-            dst=kv_key.ap(
-                [[HEAD_DIM, TILE], [1, HEAD_DIM]], scalar_offset=tile_base
-            ),
-            src=key_store,
-        )
-        nisa.dma_copy(
-            dst=kv_value.ap(
-                [[HEAD_DIM, TILE], [1, HEAD_DIM]], scalar_offset=tile_base
-            ),
-            src=value[row : row + TILE, :],
-        )
 
     return query_out, key_out, kv_key, kv_value

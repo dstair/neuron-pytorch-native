@@ -1,4 +1,4 @@
-"""Graph-safe LNC2 wrappers for nkilib's context-encoding MoE kernel."""
+"""Graph-safe LNC1/LNC2 wrappers for nkilib's context-encoding MoE kernel."""
 
 import nki
 import nki.isa as nisa
@@ -14,15 +14,17 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 
 _moe_cte_hybrid_impl = blockwise_mm_baseline_shard_intermediate_hybrid.func
 
-_LOCAL_EXPERTS = 64
 _TOP_K = 8
 _ROUTE_TILE = 2048
 _ASSIGNMENT_SLICE = 128
+_DIRECT_ROUTE_MAX_ASSIGNMENTS = 16384
 
 
-def _max_packed_blocks(num_assignments: int, block_size: int) -> int:
-    """Maximum blocks for 64 local experts and one out-of-rank dummy group."""
-    return (num_assignments - _LOCAL_EXPERTS + block_size - 1) // block_size + _LOCAL_EXPERTS
+def _max_packed_blocks(
+    num_assignments: int, num_local_experts: int, block_size: int
+) -> int:
+    """Maximum blocks for the local experts and one out-of-rank dummy group."""
+    return (num_assignments - num_local_experts + block_size - 1) // block_size + num_local_experts
 
 
 def _init_route_metadata(
@@ -30,6 +32,7 @@ def _init_route_metadata(
     block_to_expert,
     conditions,
     num_tokens: int,
+    num_local_experts: int,
     sbm: SbufManager,
     writer_id: int,
     num_writers: int,
@@ -73,7 +76,7 @@ def _init_route_metadata(
     )
     nisa.memset(
         dst=block_init,
-        value=_LOCAL_EXPERTS,
+        value=num_local_experts,
         name="route_pack_init_block_experts",
     )
     nisa.dma_copy(
@@ -108,6 +111,7 @@ def _init_route_metadata(
 def _pack_local_routes_impl(
     expert_indices,
     expert_lo: int,
+    num_local_experts: int,
     block_size: int,
     metadata_buffer,
     metadata_tensors=None,
@@ -118,7 +122,12 @@ def _pack_local_routes_impl(
     """Build stable, expert-grouped CTE metadata in two linear route passes."""
     T, K = expert_indices.shape
     assignments = T * K
+    num_shards = nl.num_programs(axes=0)
     kernel_assert(K == _TOP_K, f"route packer requires top-k {_TOP_K}, found {K}")
+    kernel_assert(
+        num_shards in (1, 2),
+        f"route packer requires LNC1 or LNC2, found {num_shards} shards",
+    )
     kernel_assert(
         block_size == 256 or block_size == 512,
         f"route packer supports block size 256 or 512, found {block_size}",
@@ -127,7 +136,11 @@ def _pack_local_routes_impl(
         assignments % _ROUTE_TILE == 0,
         f"route assignments ({assignments}) must be divisible by {_ROUTE_TILE}",
     )
-    max_blocks = _max_packed_blocks(assignments, block_size)
+    kernel_assert(
+        num_local_experts in (32, 64),
+        f"route packer supports 32 or 64 local experts, found {num_local_experts}",
+    )
+    max_blocks = _max_packed_blocks(assignments, num_local_experts, block_size)
     packed_len = max_blocks * block_size
     if metadata_tensors is None:
         token_position_to_id = nl.ndarray(
@@ -158,6 +171,7 @@ def _pack_local_routes_impl(
         block_to_expert,
         conditions,
         T,
+        num_local_experts,
         sbm,
         writer_id,
         num_writers,
@@ -165,7 +179,7 @@ def _pack_local_routes_impl(
 
     routes_hbm = expert_indices.reshape((1, assignments))
     expert_keys = sbm.alloc_stack(
-        (_LOCAL_EXPERTS, _ROUTE_TILE),
+        (num_local_experts, _ROUTE_TILE),
         dtype=nl.float32,
         name="route_pack_expert_keys",
     )
@@ -179,7 +193,7 @@ def _pack_local_routes_impl(
 
     # Pass 1: count assignments for each local expert.
     counts = sbm.alloc_stack(
-        (_LOCAL_EXPERTS, 1),
+        (num_local_experts, 1),
         dtype=nl.float32,
         name="route_pack_counts",
     )
@@ -187,7 +201,7 @@ def _pack_local_routes_impl(
     for tile_idx in nl.sequential_range(assignments // _ROUTE_TILE):
         sbm.open_scope(name=f"route_pack_count_tile_{tile_idx}")
         route_values = sbm.alloc_stack(
-            (_LOCAL_EXPERTS, _ROUTE_TILE),
+            (num_local_experts, _ROUTE_TILE),
             dtype=nl.float32,
             name=f"route_pack_count_routes_t{tile_idx}",
         )
@@ -199,7 +213,7 @@ def _pack_local_routes_impl(
         stream_shuffle_broadcast(route_values[0:1, :], route_values)
 
         matches = sbm.alloc_stack(
-            (_LOCAL_EXPERTS, _ROUTE_TILE),
+            (num_local_experts, _ROUTE_TILE),
             dtype=nl.float32,
             name=f"route_pack_count_matches_t{tile_idx}",
         )
@@ -211,7 +225,7 @@ def _pack_local_routes_impl(
             name=f"route_pack_count_equal_t{tile_idx}",
         )
         tile_counts = sbm.alloc_stack(
-            (_LOCAL_EXPERTS, 1),
+            (num_local_experts, 1),
             dtype=nl.float32,
             name=f"route_pack_tile_counts_t{tile_idx}",
         )
@@ -232,20 +246,20 @@ def _pack_local_routes_impl(
         sbm.close_scope()
 
     # Compute ceil(count / block_size), exclusive starts, and inclusive ends.
-    counts_psum = nl.ndarray((1, _LOCAL_EXPERTS), dtype=nl.float32, buffer=nl.psum)
+    counts_psum = nl.ndarray((1, num_local_experts), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(
         dst=counts_psum,
         data=counts,
         name="route_pack_counts_transpose",
     )
     counts_row = sbm.alloc_stack(
-        (1, _LOCAL_EXPERTS),
+        (1, num_local_experts),
         dtype=nl.int32,
         name="route_pack_counts_row",
     )
     nisa.tensor_copy(dst=counts_row, src=counts_psum, name="route_pack_counts_cast")
     rounded_counts = sbm.alloc_stack(
-        (1, _LOCAL_EXPERTS),
+        (1, num_local_experts),
         dtype=nl.int32,
         name="route_pack_rounded_counts",
     )
@@ -257,7 +271,7 @@ def _pack_local_routes_impl(
         name="route_pack_count_round_up",
     )
     blocks_per_expert = sbm.alloc_stack(
-        (1, _LOCAL_EXPERTS),
+        (1, num_local_experts),
         dtype=nl.int32,
         name="route_pack_blocks_per_expert",
     )
@@ -269,7 +283,7 @@ def _pack_local_routes_impl(
         name="route_pack_count_to_blocks",
     )
     scan_ones = sbm.alloc_stack(
-        (1, _LOCAL_EXPERTS),
+        (1, num_local_experts),
         dtype=nl.int32,
         name="route_pack_block_scan_ones",
     )
@@ -281,7 +295,7 @@ def _pack_local_routes_impl(
     )
     nisa.memset(dst=scan_zero, value=0, name="route_pack_init_block_carry")
     block_ends = sbm.alloc_stack(
-        (1, _LOCAL_EXPERTS),
+        (1, num_local_experts),
         dtype=nl.int32,
         name="route_pack_block_ends",
     )
@@ -295,7 +309,7 @@ def _pack_local_routes_impl(
         name="route_pack_block_prefix",
     )
     block_starts = sbm.alloc_stack(
-        (1, _LOCAL_EXPERTS),
+        (1, num_local_experts),
         dtype=nl.int32,
         name="route_pack_block_starts",
     )
@@ -309,25 +323,25 @@ def _pack_local_routes_impl(
 
     # Materialize block expert IDs and the dynamic active-block conditions.
     block_ids = sbm.alloc_stack(
-        (max_blocks, _LOCAL_EXPERTS),
+        (max_blocks, num_local_experts),
         dtype=nl.int32,
         name="route_pack_block_ids",
     )
     nisa.iota(
         dst=block_ids,
-        pattern=[[0, _LOCAL_EXPERTS]],
+        pattern=[[0, num_local_experts]],
         offset=0,
         channel_multiplier=1,
         name="route_pack_block_iota",
     )
     ends_broadcast = sbm.alloc_stack(
-        (max_blocks, _LOCAL_EXPERTS),
+        (max_blocks, num_local_experts),
         dtype=nl.int32,
         name="route_pack_ends_broadcast",
     )
     stream_shuffle_broadcast(block_ends, ends_broadcast)
     ended_experts = sbm.alloc_stack(
-        (max_blocks, _LOCAL_EXPERTS),
+        (max_blocks, num_local_experts),
         dtype=nl.int32,
         name="route_pack_ended_experts",
     )
@@ -381,7 +395,7 @@ def _pack_local_routes_impl(
         name="route_pack_active_block_count",
     )
     stream_shuffle_broadcast(
-        block_ends[0:1, _LOCAL_EXPERTS - 1 : _LOCAL_EXPERTS],
+        block_ends[0:1, num_local_experts - 1 : num_local_experts],
         active_block_count,
     )
     nisa.tensor_tensor(
@@ -427,7 +441,11 @@ def _pack_local_routes_impl(
         name="route_pack_store_conditions",
     )
 
-    if scatter_barrier:
+    # The direct four-expert nonzero path keeps a [pmax, assignments] result
+    # in SBUF. It is the fastest route packer through BS=2 (16,384
+    # assignments), but cannot fit at BS=4. Larger calls use the tiled stable
+    # scan below, which keeps route working sets bounded by _ROUTE_TILE.
+    if scatter_barrier and assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS:
         kernel_assert(
             num_writers == 1,
             "direct route packing requires one writer per metadata tensor",
@@ -473,7 +491,7 @@ def _pack_local_routes_impl(
             name="route_pack_zero_direct_write_offset",
         )
 
-        for expert_batch in nl.sequential_range(_LOCAL_EXPERTS // 4):
+        for expert_batch in nl.sequential_range(num_local_experts // 4):
             for expert_lane in range(4):
                 expert_idx = expert_batch * 4 + expert_lane
                 gpsimd_partition = expert_lane * 32
@@ -572,7 +590,7 @@ def _pack_local_routes_impl(
         return token_position_to_id, block_to_expert, conditions
 
     block_starts_float = sbm.alloc_stack(
-        (1, _LOCAL_EXPERTS),
+        (1, num_local_experts),
         dtype=nl.float32,
         name="route_pack_block_starts_float",
     )
@@ -582,7 +600,7 @@ def _pack_local_routes_impl(
         name="route_pack_block_starts_cast",
     )
     block_offsets_psum = nl.ndarray(
-        (_LOCAL_EXPERTS, 1),
+        (num_local_experts, 1),
         dtype=nl.float32,
         buffer=nl.psum,
     )
@@ -592,7 +610,7 @@ def _pack_local_routes_impl(
         name="route_pack_block_starts_transpose",
     )
     block_offsets = sbm.alloc_stack(
-        (_LOCAL_EXPERTS, 1),
+        (num_local_experts, 1),
         dtype=nl.float32,
         name="route_pack_block_offsets",
     )
@@ -611,13 +629,13 @@ def _pack_local_routes_impl(
 
     # Pass 2: stable per-expert ordinals, then unique indirect token-ID stores.
     carry = sbm.alloc_stack(
-        (_LOCAL_EXPERTS, 1),
+        (num_local_experts, 1),
         dtype=nl.float32,
         name="route_pack_ordinal_carry",
     )
     nisa.memset(dst=carry, value=0, name="route_pack_zero_ordinal_carry")
     ordinal_ones = sbm.alloc_stack(
-        (_LOCAL_EXPERTS, _ROUTE_TILE),
+        (num_local_experts, _ROUTE_TILE),
         dtype=nl.float32,
         name="route_pack_ordinal_ones",
     )
@@ -697,7 +715,7 @@ def _pack_local_routes_impl(
     for tile_idx in nl.sequential_range(assignments // _ROUTE_TILE):
         sbm.open_scope(name=f"route_pack_scan_tile_{tile_idx}")
         route_values = sbm.alloc_stack(
-            (_LOCAL_EXPERTS, _ROUTE_TILE),
+            (num_local_experts, _ROUTE_TILE),
             dtype=nl.float32,
             name=f"route_pack_scan_routes_t{tile_idx}",
         )
@@ -709,7 +727,7 @@ def _pack_local_routes_impl(
         stream_shuffle_broadcast(route_values[0:1, :], route_values)
 
         matches = sbm.alloc_stack(
-            (_LOCAL_EXPERTS, _ROUTE_TILE),
+            (num_local_experts, _ROUTE_TILE),
             dtype=nl.float32,
             name=f"route_pack_scan_matches_t{tile_idx}",
         )
@@ -721,7 +739,7 @@ def _pack_local_routes_impl(
             name=f"route_pack_scan_equal_t{tile_idx}",
         )
         inclusive = sbm.alloc_stack(
-            (_LOCAL_EXPERTS, _ROUTE_TILE),
+            (num_local_experts, _ROUTE_TILE),
             dtype=nl.float32,
             name=f"route_pack_inclusive_ordinals_t{tile_idx}",
         )
@@ -740,7 +758,7 @@ def _pack_local_routes_impl(
             name=f"route_pack_update_ordinal_carry_t{tile_idx}",
         )
         destinations = sbm.alloc_stack(
-            (_LOCAL_EXPERTS, _ROUTE_TILE),
+            (num_local_experts, _ROUTE_TILE),
             dtype=nl.float32,
             name=f"route_pack_destinations_t{tile_idx}",
         )
@@ -765,7 +783,7 @@ def _pack_local_routes_impl(
             slice_hi = slice_lo + _ASSIGNMENT_SLICE
 
             destination_psum = nl.ndarray(
-                (_ASSIGNMENT_SLICE, _LOCAL_EXPERTS),
+                (_ASSIGNMENT_SLICE, num_local_experts),
                 dtype=nl.float32,
                 buffer=nl.psum,
             )
@@ -775,7 +793,7 @@ def _pack_local_routes_impl(
                 name=f"route_pack_destination_transpose_t{tile_idx}_s{slice_idx}",
             )
             destination_rows = sbm.alloc_stack(
-                (_ASSIGNMENT_SLICE, _LOCAL_EXPERTS),
+                (_ASSIGNMENT_SLICE, num_local_experts),
                 dtype=nl.float32,
                 name=f"route_pack_destination_rows_t{tile_idx}_s{slice_idx}",
             )
@@ -823,7 +841,7 @@ def _pack_local_routes_impl(
                 dst=local_index,
                 data=local_index,
                 op0=nl.minimum,
-                operand0=_LOCAL_EXPERTS - 1,
+                operand0=num_local_experts - 1,
                 name=f"route_pack_local_index_upper_t{tile_idx}_s{slice_idx}",
             )
             local_index_u16 = sbm.alloc_stack(
@@ -900,7 +918,7 @@ def _pack_local_routes_impl(
                 dst=below_hi,
                 data=route_column,
                 op0=nl.less,
-                operand0=expert_lo + _LOCAL_EXPERTS,
+                operand0=expert_lo + num_local_experts,
                 name=f"route_pack_local_upper_compare_t{tile_idx}_s{slice_idx}",
             )
             nisa.tensor_tensor(
@@ -1099,12 +1117,20 @@ def _pack_local_routes_impl(
                 name=f"route_pack_scatter_token_ids_t{tile_idx}_s{slice_idx}",
             )
             if scatter_barrier:
-                nisa.core_barrier(
-                    expert_indices,
-                    (0, 1),
-                    engine=nisa.engine.dma,
-                    name=f"route_pack_scatter_barrier_t{tile_idx}_s{slice_idx}",
-                )
+                if num_shards == 1:
+                    nisa.core_barrier(
+                        expert_indices,
+                        (0),
+                        engine=nisa.engine.dma,
+                        name=f"route_pack_scatter_barrier_t{tile_idx}_s{slice_idx}",
+                    )
+                else:
+                    nisa.core_barrier(
+                        expert_indices,
+                        (0, 1),
+                        engine=nisa.engine.dma,
+                        name=f"route_pack_scatter_barrier_t{tile_idx}_s{slice_idx}",
+                    )
             sbm.close_scope()
         sbm.close_scope()
 
@@ -1116,12 +1142,14 @@ def _pack_local_routes_impl(
 def nki_pack_local_routes_35b(
     expert_indices,
     expert_lo: int,
+    num_local_experts: int,
     block_size: int,
 ):
     """Standalone route packer for device correctness and isolated profiling."""
     return _pack_local_routes_impl(
         expert_indices,
         expert_lo,
+        num_local_experts,
         block_size,
         nl.shared_hbm,
         scatter_barrier=True,
@@ -1169,12 +1197,21 @@ def nki_moe_cte_routed_35b(
     block_size: int,
 ):
     """Pack routes into internal metadata and immediately execute CTE MoE."""
-    E, _, _ = down_proj_weight.shape
-    kernel_assert(E == _LOCAL_EXPERTS, f"routed CTE requires {_LOCAL_EXPERTS} local experts, found {E}")
+    num_local_experts, _, _ = down_proj_weight.shape
+    kernel_assert(
+        num_local_experts in (32, 64),
+        f"routed CTE requires 32 or 64 local experts, found {num_local_experts}",
+    )
     T, K = expert_indices.shape
     assignments = T * K
-    max_blocks = _max_packed_blocks(assignments, block_size)
+    max_blocks = _max_packed_blocks(assignments, num_local_experts, block_size)
     packed_len = max_blocks * block_size
+    shard_id = nl.program_id(axis=0)
+    num_shards = nl.num_programs(axes=0)
+    kernel_assert(
+        num_shards in (1, 2),
+        f"routed CTE requires LNC1 or LNC2, found {num_shards} shards",
+    )
     token_position_0 = nl.ndarray(
         (packed_len,),
         dtype=nl.int32,
@@ -1193,46 +1230,55 @@ def nki_moe_cte_routed_35b(
         buffer=nl.shared_hbm,
         name="route_pack_conditions_shard_0",
     )
-    token_position_1 = nl.ndarray(
-        (packed_len,),
-        dtype=nl.int32,
-        buffer=nl.shared_hbm,
-        name="route_pack_token_position_shard_1",
-    )
-    block_to_expert_1 = nl.ndarray(
-        (max_blocks, 1),
-        dtype=nl.int32,
-        buffer=nl.shared_hbm,
-        name="route_pack_block_expert_shard_1",
-    )
-    conditions_1 = nl.ndarray(
-        (max_blocks + 1,),
-        dtype=nl.int32,
-        buffer=nl.shared_hbm,
-        name="route_pack_conditions_shard_1",
-    )
-    shard_id = nl.program_id(axis=0)
-    num_shards = nl.num_programs(axes=0)
-    kernel_assert(num_shards == 2, f"routed CTE requires LNC2, found {num_shards} shards")
-    if shard_id == 0:
+    if num_shards == 1:
         metadata_tensors = (
             token_position_0,
             block_to_expert_0,
             conditions_0,
         )
     else:
-        metadata_tensors = (
-            token_position_1,
-            block_to_expert_1,
-            conditions_1,
+        token_position_1 = nl.ndarray(
+            (packed_len,),
+            dtype=nl.int32,
+            buffer=nl.shared_hbm,
+            name="route_pack_token_position_shard_1",
         )
+        block_to_expert_1 = nl.ndarray(
+            (max_blocks, 1),
+            dtype=nl.int32,
+            buffer=nl.shared_hbm,
+            name="route_pack_block_expert_shard_1",
+        )
+        conditions_1 = nl.ndarray(
+            (max_blocks + 1,),
+            dtype=nl.int32,
+            buffer=nl.shared_hbm,
+            name="route_pack_conditions_shard_1",
+        )
+        if shard_id == 0:
+            metadata_tensors = (
+                token_position_0,
+                block_to_expert_0,
+                conditions_0,
+            )
+        else:
+            metadata_tensors = (
+                token_position_1,
+                block_to_expert_1,
+                conditions_1,
+            )
     token_position_to_id, block_to_expert, conditions = _pack_local_routes_impl(
         expert_indices,
         expert_lo,
+        num_local_experts,
         block_size,
         nl.shared_hbm,
         metadata_tensors=metadata_tensors,
-        scatter_barrier=True,
+        # The direct BS=1/2 path needs its established barrier behavior.
+        # At BS=4 the bounded tiled scan owns every non-padding destination
+        # uniquely; keeping its per-slice core barriers can cross-synchronize
+        # with a different TP rank's adjacent custom call.
+        scatter_barrier=assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS,
     )
     return _moe_cte_hybrid_impl(
         conditions=conditions,

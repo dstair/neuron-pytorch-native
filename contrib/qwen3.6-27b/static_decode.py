@@ -96,7 +96,7 @@ def functional_all_reduce(x, op, group):
     return _functional_all_reduce(x, op, group)
 
 
-MODEL_PATH = "/home/ubuntu/models/Qwen3.6-27B"
+MODEL_PATH = os.environ.get("QWEN27_MODEL_PATH", "/models/Qwen3.6-27B")
 
 # Architecture constants
 NUM_LAYERS = 64

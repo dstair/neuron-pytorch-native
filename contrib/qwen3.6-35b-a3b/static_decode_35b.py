@@ -36,8 +36,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels"))
 import model_dims as D
 from deltanet_decode import deltanet_recurrent_step
+from moe_w8 import (
+    build_local_affinities,
+    OfficialFP8ExpertReader,
+    QuantizationStats,
+    ROW_FP8_PROJECTION_CHOICES,
+)
+from topology_35b import LNC_DEGREE
 
-MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", "/mnt/nvme/Qwen3.5-35B-A3B")
+MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", "/models/Qwen3.5-35B-A3B")
+EXPERT_MODEL_PATH = os.environ.get("QWEN35_FP8_MODEL_PATH")
 
 # DeltaNet decode via the NKI kernel (env DN_NKI=1). Default OFF = pure-torch
 # recurrence (the CPU-validated correctness oracle). The kernel makes DeltaNet
@@ -135,8 +143,6 @@ DN_CAPTURE_CHUNK = int(os.environ.get("DN_CAPTURE_CHUNK", "-1"))
 # scale) — not all 64, not per-Linear — so the dequant is a single cheap
 # multiply on the gathered slice, fused with the gather. Default OFF = bf16.
 USE_MOE_FP8 = os.environ.get("MOE_FP8", "0") == "1"
-if USE_MOE_FP8:
-    import fp8_group_matvec_ops  # registers torch.ops.fp8moe.group_matvec
 if USE_MOE_DECODE_TP and USE_MOE_FP8:
     raise RuntimeError("MOE_DECODE_TP supports bf16 expert weights only")
 FP8_E4M3_MAX = 240.0  # legacy e4m3 max (Trn2 nc_matmul format); OCP fn extends to 448
@@ -146,11 +152,8 @@ FP8_E4M3_MAX = 240.0  # legacy e4m3 max (Trn2 nc_matmul format); OCP fn extends 
 # (dense for BS>=16, selective for BS=1) and FP8-ROW quant (TRN2 per-channel).
 # Being one opaque kernel, it COMPILES at BS>=16 where our torch-bmm sparse path
 # F137'd the host compiler. With MOE_FP8=1 it runs FP8-ROW; else bf16.
-# Library at ~/dev/neuron-docs/nki-library, staged on box at /home/ubuntu/nkilib.
+# Expose a compatible nki-library checkout through PYTHONPATH when enabling this.
 USE_MOE_NKILIB = os.environ.get("MOE_NKILIB", "0") == "1"
-if USE_MOE_NKILIB:
-    from nkilib.core.moe.moe_tkg.moe_tkg import moe_tkg as _nkilib_moe_tkg
-    from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
 
 # Context-encoding MoE kernel (env MOE_CTE=1). Unlike moe_tkg, moe_cte accepts
 # long token dimensions and computes expert work in routed blocks. Routing
@@ -160,14 +163,219 @@ USE_MOE_CTE_NKI_PACK = os.environ.get("MOE_CTE_NKI_PACK", "0") == "1"
 if USE_MOE_CTE:
     if USE_MOE_NKILIB:
         raise RuntimeError("MOE_CTE and MOE_NKILIB are mutually exclusive")
+
+# High-batch decode-only fused W8 experts. FP8 defaults to row-scaled legacy
+# E4M3 in nkilib's all-expert scheduler. Block power-of-two conversion preserves
+# the official 128x128 scales up to an exact exponent shift; dual planes remain
+# the exact accuracy control. INT8 requantizes each source block symmetrically.
+MOE_FUSED_W8 = os.environ.get("MOE_FUSED_W8", "").strip().lower()
+if MOE_FUSED_W8 not in ("", "fp8", "int8"):
+    raise RuntimeError("MOE_FUSED_W8 must be unset, 'fp8', or 'int8'")
+USE_MOE_FUSED_W8 = bool(MOE_FUSED_W8)
+MOE_FUSED_W8_FP8_IMPL = os.environ.get(
+    "MOE_FUSED_W8_FP8_IMPL", "row"
+).strip().lower()
+if MOE_FUSED_W8_FP8_IMPL not in (
+    "row",
+    "dual",
+    "block_pow2",
+    "block_pow2_coalesced",
+):
+    raise RuntimeError(
+        "MOE_FUSED_W8_FP8_IMPL must be 'row', 'dual', 'block_pow2', "
+        "or 'block_pow2_coalesced'"
+    )
+USE_MOE_FUSED_W8_ROW_FP8 = (
+    MOE_FUSED_W8 == "fp8" and MOE_FUSED_W8_FP8_IMPL == "row"
+)
+USE_MOE_FUSED_W8_DUAL_FP8 = (
+    MOE_FUSED_W8 == "fp8" and MOE_FUSED_W8_FP8_IMPL == "dual"
+)
+USE_MOE_FUSED_W8_BLOCK_COALESCED_FP8 = (
+    MOE_FUSED_W8 == "fp8"
+    and MOE_FUSED_W8_FP8_IMPL == "block_pow2_coalesced"
+)
+MOE_FUSED_W8_FP8_PROJECTIONS = os.environ.get(
+    "MOE_FUSED_W8_FP8_PROJECTIONS", "all"
+).strip().lower()
+if MOE_FUSED_W8_FP8_PROJECTIONS not in ("all", "gate_up", "down"):
+    raise RuntimeError(
+        "MOE_FUSED_W8_FP8_PROJECTIONS must be 'all', 'gate_up', or 'down'"
+    )
+if (
+    MOE_FUSED_W8_FP8_PROJECTIONS != "all"
+    and not USE_MOE_FUSED_W8_ROW_FP8
+):
+    raise RuntimeError(
+        "MOE_FUSED_W8_FP8_PROJECTIONS requires "
+        "MOE_FUSED_W8=fp8 and MOE_FUSED_W8_FP8_IMPL=row"
+    )
+MOE_FUSED_W8_FP8_LAYER_START = int(
+    os.environ.get("MOE_FUSED_W8_FP8_LAYER_START", "0")
+)
+MOE_FUSED_W8_FP8_LAYER_LIMIT = int(
+    os.environ.get("MOE_FUSED_W8_FP8_LAYER_LIMIT", "40")
+)
+if not (
+    0
+    <= MOE_FUSED_W8_FP8_LAYER_START
+    <= MOE_FUSED_W8_FP8_LAYER_LIMIT
+    <= 40
+):
+    raise RuntimeError(
+        "MOE_FUSED_W8_FP8_LAYER_START/LIMIT must define a range in [0, 40]"
+    )
+if (
+    (
+        MOE_FUSED_W8_FP8_LAYER_START != 0
+        or MOE_FUSED_W8_FP8_LAYER_LIMIT != 40
+    )
+    and not USE_MOE_FUSED_W8_ROW_FP8
+):
+    raise RuntimeError(
+        "MOE_FUSED_W8_FP8_LAYER_START/LIMIT requires "
+        "MOE_FUSED_W8=fp8 and MOE_FUSED_W8_FP8_IMPL=row"
+    )
+MOE_FUSED_W8_LAYOUT = os.environ.get(
+    "MOE_FUSED_W8_LAYOUT", "weight"
+).strip().lower()
+if MOE_FUSED_W8_LAYOUT not in ("weight", "token"):
+    raise RuntimeError("MOE_FUSED_W8_LAYOUT must be 'weight' or 'token'")
+if MOE_FUSED_W8_LAYOUT == "token" and MOE_FUSED_W8 != "fp8":
+    raise RuntimeError(
+        "MOE_FUSED_W8_LAYOUT=token requires MOE_FUSED_W8=fp8"
+    )
+if MOE_FUSED_W8 == "fp8" and MOE_FUSED_W8_LAYOUT != "weight":
+    raise RuntimeError(
+        "fused FP8 requires MOE_FUSED_W8_LAYOUT=weight"
+    )
+USE_MOE_OFFICIAL_FP8_REFERENCE = (
+    os.environ.get("MOE_OFFICIAL_FP8_REFERENCE", "0") == "1"
+)
+USE_MOE_W8_RESIDUAL_FP32 = (
+    os.environ.get("MOE_W8_RESIDUAL_FP32", "0") == "1"
+)
+if USE_MOE_W8_RESIDUAL_FP32 and not (
+    USE_MOE_FUSED_W8 or USE_MOE_OFFICIAL_FP8_REFERENCE
+):
+    raise RuntimeError(
+        "MOE_W8_RESIDUAL_FP32=1 requires a fused-W8 candidate or "
+        "official-FP8 reference"
+    )
+MOE_OFFICIAL_FP8_REFERENCE_ROUNDING = frozenset(
+    value.strip()
+    for value in os.environ.get(
+        "MOE_OFFICIAL_FP8_REFERENCE_ROUNDING", ""
+    ).split(",")
+    if value.strip()
+)
+_MOE_REFERENCE_ROUNDING_STAGES = frozenset(
+    ("affinity_bf16", "activation_bf16", "local_output_bf16")
+)
+unknown_reference_rounding = (
+    MOE_OFFICIAL_FP8_REFERENCE_ROUNDING - _MOE_REFERENCE_ROUNDING_STAGES
+)
+if unknown_reference_rounding:
+    raise RuntimeError(
+        "MOE_OFFICIAL_FP8_REFERENCE_ROUNDING contains unknown stages: "
+        + ", ".join(sorted(unknown_reference_rounding))
+    )
+if (
+    MOE_OFFICIAL_FP8_REFERENCE_ROUNDING
+    and not USE_MOE_OFFICIAL_FP8_REFERENCE
+):
+    raise RuntimeError(
+        "MOE_OFFICIAL_FP8_REFERENCE_ROUNDING requires "
+        "MOE_OFFICIAL_FP8_REFERENCE=1"
+    )
+if USE_MOE_FUSED_W8 and USE_MOE_OFFICIAL_FP8_REFERENCE:
+    raise RuntimeError(
+        "MOE_FUSED_W8 and MOE_OFFICIAL_FP8_REFERENCE are mutually exclusive"
+    )
+if USE_MOE_FUSED_W8 or USE_MOE_OFFICIAL_FP8_REFERENCE:
+    conflicts = [
+        name
+        for name, enabled in (
+            ("MOE_SPARSE", USE_MOE_SPARSE),
+            ("MOE_DECODE_TP", USE_MOE_DECODE_TP),
+            ("MOE_CTE", USE_MOE_CTE),
+            ("MOE_CTE_NKI_PACK", USE_MOE_CTE_NKI_PACK),
+            ("MOE_NKILIB", USE_MOE_NKILIB),
+            ("MOE_FP8", USE_MOE_FP8),
+        )
+        if enabled
+    ]
+    if conflicts:
+        mode_name = (
+            "MOE_FUSED_W8"
+            if USE_MOE_FUSED_W8
+            else "MOE_OFFICIAL_FP8_REFERENCE"
+        )
+        raise RuntimeError(
+            mode_name + " is mutually exclusive with " + ", ".join(conflicts)
+        )
+
+if USE_MOE_FP8:
+    import fp8_group_matvec_ops  # registers torch.ops.fp8moe.group_matvec
+if USE_MOE_NKILIB:
+    from nkilib.core.moe.moe_tkg.moe_tkg import moe_tkg as _nkilib_moe_tkg
+    from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
+if USE_MOE_CTE:
     from torch_neuronx import wrap_nki
     if USE_MOE_CTE_NKI_PACK:
         from moe_cte_35b import nki_moe_cte_routed_35b
-        _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_routed_35b)[2]
+        _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_routed_35b)[LNC_DEGREE]
     else:
         from moe_cte_adapter import pack_local_routes
         from moe_cte_35b import nki_moe_cte_35b
-        _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_35b)[2]
+        _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_35b)[LNC_DEGREE]
+if USE_MOE_FUSED_W8:
+    if USE_MOE_FUSED_W8_ROW_FP8:
+        import moe_tkg_row_fp8_35b_ops  # registers tkg_row_fp8
+    else:
+        import moe_fused_w8_35b_ops  # registers block-W8 ops
+
+
+def uses_row_fp8_layer(layer_index):
+    """Return whether this layer uses the row-FP8 expert kernel."""
+    return (
+        USE_MOE_FUSED_W8_ROW_FP8
+        and MOE_FUSED_W8_FP8_LAYER_START
+        <= layer_index
+        < MOE_FUSED_W8_FP8_LAYER_LIMIT
+    )
+
+
+def _load_fused_w8_expert_layer(
+    expert_reader,
+    layer_index,
+    expert_start,
+    expert_end,
+    mode,
+    fp8_impl,
+):
+    """Load one fused-W8 layer, retaining baseline BF16 outside its FP8 range."""
+    if mode == "fp8" and fp8_impl == "row":
+        if uses_row_fp8_layer(layer_index):
+            return expert_reader.load_layer_row_fp8(
+                layer_index,
+                expert_start,
+                expert_end,
+                fp8_projections=MOE_FUSED_W8_FP8_PROJECTIONS,
+            )
+        return (
+            expert_reader.load_layer_bf16(
+                layer_index, expert_start, expert_end
+            ),
+            None,
+        )
+    return expert_reader.load_layer(
+        layer_index,
+        expert_start,
+        expert_end,
+        mode,
+        fp8_impl=fp8_impl,
+    )
 
 
 def rw_to_global(rw_top, sel, device):
@@ -205,6 +413,15 @@ if USE_DN_DIRECT_STATE_OUT and not USE_DECODE_FULLGRAPH:
     raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DECODE_FULLGRAPH=1")
 if USE_GQA_STATEFUL_KV and not USE_DECODE_FULLGRAPH:
     raise RuntimeError("GQA_STATEFUL_KV=1 requires DECODE_FULLGRAPH=1")
+if (
+    USE_MOE_FUSED_W8 or USE_MOE_OFFICIAL_FP8_REFERENCE
+) and not USE_DECODE_FULLGRAPH:
+    mode_name = (
+        "MOE_FUSED_W8"
+        if USE_MOE_FUSED_W8
+        else "MOE_OFFICIAL_FP8_REFERENCE"
+    )
+    raise RuntimeError(f"{mode_name} requires DECODE_FULLGRAPH=1")
 
 
 def functional_all_reduce(x, op, group):
@@ -221,6 +438,13 @@ def rms_norm(x, weight):
     x_f32 = x.float()
     norm = x_f32 * torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + D.RMS_EPS)
     return ((1.0 + weight.float()) * norm).to(x.dtype)
+
+
+def decode_rms_norm(x, weight):
+    normalized = rms_norm(x, weight)
+    if USE_MOE_W8_RESIDUAL_FP32:
+        return normalized.to(torch.bfloat16)
+    return normalized
 
 
 def rms_norm_gated(x, gate, weight):
@@ -248,7 +472,8 @@ def apply_rope(q, k, cos, sin):
 
 # ─── MoE layer (masked-dense grouped bmm; expert-parallel) ───────────────────
 def moe_forward(x, router_w, gate_up, down, e_lo, e_hi,
-                sh_gate, sh_up, sh_down, sh_sigmoid, fp8_scales=None):
+                sh_gate, sh_up, sh_down, sh_sigmoid, fp8_scales=None,
+                return_routing=False):
     """Masked-dense (or true-sparse) MoE for a [T, H] activation block.
 
     Validated equivalent to HF sparse routing in test_moe_oracle_cpu.py.
@@ -285,6 +510,8 @@ def moe_forward(x, router_w, gate_up, down, e_lo, e_hi,
         on = (ej >= e_lo) & (ej < e_hi)
         oh = F.one_hot(local.clamp(0, E - 1), E).float()   # [T, E]
         gate = gate + oh * (rw_top[:, j] * on.float()).unsqueeze(-1)
+    if "affinity_bf16" in MOE_OFFICIAL_FP8_REFERENCE_ROUNDING:
+        gate = gate.to(torch.bfloat16).float()
 
     if os.environ.get("MOE_SHARED_ONLY", "0") == "1":
         # DIAGNOSTIC: skip the expert bmm entirely (routed=0). Isolates whether
@@ -361,14 +588,21 @@ def moe_forward(x, router_w, gate_up, down, e_lo, e_hi,
         I = gu.shape[-1] // 2
         g_, u_ = gu[:, :, :I], gu[:, :, I:]
         h = F.silu(g_) * u_                                    # [E, T, I]
+        if "activation_bf16" in MOE_OFFICIAL_FP8_REFERENCE_ROUNDING:
+            h = h.to(torch.bfloat16).float()
         y = torch.bmm(h, dn.transpose(1, 2))                   # [E, T, H]
         routed = (y * gate.t().unsqueeze(-1)).sum(dim=0)       # [T, H]
+
+    if "local_output_bf16" in MOE_OFFICIAL_FP8_REFERENCE_ROUNDING:
+        routed = routed.to(torch.bfloat16).float()
 
     # Sigmoid-gated shared expert (replicated weights; computed on each rank).
     sgate = torch.sigmoid(F.linear(xf, sh_sigmoid.float()))   # [T, 1]
     sh = F.linear(F.silu(F.linear(xf, sh_gate.float())) * F.linear(xf, sh_up.float()),
                   sh_down.float())                            # [T, H]
     shared = sgate * sh
+    if return_routing:
+        return routed, shared, sel, rw_top
     return routed, shared
 
 
@@ -377,6 +611,17 @@ class StaticDecode35B(nn.Module):
 
     def __init__(self, weights, max_seq_len, world_size, batch_size=1, rank=0):
         super().__init__()
+        if USE_MOE_FUSED_W8 and batch_size not in (32, 64, 128, 256):
+            raise RuntimeError(
+                "MOE_FUSED_W8 supports batch sizes 32, 64, 128, and 256"
+            )
+        if (
+            USE_MOE_FUSED_W8_BLOCK_COALESCED_FP8
+            and batch_size not in (32, 64, 128)
+        ):
+            raise RuntimeError(
+                "block_pow2_coalesced supports batch sizes 32, 64, and 128"
+            )
         self.max_seq_len = max_seq_len
         self.world_size = world_size
         self.tp_group = list(range(world_size))
@@ -389,6 +634,12 @@ class StaticDecode35B(nn.Module):
         self.rank = rank
         self.e_lo = rank * td["experts_per_core"]
         self.e_hi = self.e_lo + td["experts_per_core"]
+        if USE_MOE_FUSED_W8_ROW_FP8:
+            self.register_buffer(
+                "moe_row_fp8_rank_id",
+                torch.zeros((1, 1), dtype=torch.uint32),
+                persistent=False,
+            )
         self.nkv = max(1, D.GQA_KV_HEADS // world_size)   # KV heads per core
         if USE_GQA_STATEFUL_KV:
             if self.nkv != 1:
@@ -416,6 +667,7 @@ class StaticDecode35B(nn.Module):
         # model). setup_segments() splits the layer range so each compiled NEFF
         # stays under the neuronx-cc PGTiling collective limit.
         self._segments = [(0, D.NUM_LAYERS, self._run_layers)]
+        self._diagnostic_layers = ()
 
         # [C,C] host constants for the chunked-prefill NKI kernel (no iota in this
         # build). m_incl doubles as the cumsum operator. Only needed when the kernel
@@ -439,7 +691,70 @@ class StaticDecode35B(nn.Module):
             reg(f"l{i}_post_norm", lw["post_norm"], lw, "post_norm")
             # MoE (all layers)
             reg(f"l{i}_router", lw["router"], lw, "router")
-            if USE_MOE_NKILIB or USE_MOE_CTE:
+            if USE_MOE_FUSED_W8:
+                if uses_row_fp8_layer(i):
+                    reg(
+                        f"l{i}_row_gate_up",
+                        lw["row_gate_up"],
+                        lw,
+                        "row_gate_up",
+                    )
+                    reg(
+                        f"l{i}_row_gate_up_scale",
+                        lw["row_gate_up_scale"],
+                        lw,
+                        "row_gate_up_scale",
+                    )
+                    reg(f"l{i}_row_down", lw["row_down"], lw, "row_down")
+                    reg(
+                        f"l{i}_row_down_scale",
+                        lw["row_down_scale"],
+                        lw,
+                        "row_down_scale",
+                    )
+                elif USE_MOE_FUSED_W8_ROW_FP8:
+                    reg(
+                        f"l{i}_gate_up",
+                        lw["gate_up"],
+                        lw,
+                        "gate_up",
+                    )
+                    reg(f"l{i}_down", lw["down"], lw, "down")
+                else:
+                    reg(
+                        f"l{i}_w8_gate_up",
+                        lw["w8_gate_up"],
+                        lw,
+                        "w8_gate_up",
+                    )
+                    if USE_MOE_FUSED_W8_DUAL_FP8:
+                        reg(
+                            f"l{i}_w8_gate_up_residual",
+                            lw["w8_gate_up_residual"],
+                            lw,
+                            "w8_gate_up_residual",
+                        )
+                    reg(
+                        f"l{i}_w8_gate_up_scale",
+                        lw["w8_gate_up_scale"],
+                        lw,
+                        "w8_gate_up_scale",
+                    )
+                    reg(f"l{i}_w8_down", lw["w8_down"], lw, "w8_down")
+                    if USE_MOE_FUSED_W8_DUAL_FP8:
+                        reg(
+                            f"l{i}_w8_down_residual",
+                            lw["w8_down_residual"],
+                            lw,
+                            "w8_down_residual",
+                        )
+                    reg(
+                        f"l{i}_w8_down_scale",
+                        lw["w8_down_scale"],
+                        lw,
+                        "w8_down_scale",
+                    )
+            elif USE_MOE_NKILIB or USE_MOE_CTE:
                 # Repack to the nkilib MoE layout: gate_up [E,2I,H]->[E,H,2,I],
                 # down [E,H,I]->[E,I,H]. FP8-ROW quant (per-out-channel) when MOE_FP8.
                 gu = lw["gate_up"]; dn = lw["down"]              # [E,2I,H],[E,H,I]
@@ -520,6 +835,10 @@ class StaticDecode35B(nn.Module):
         """x: [B, 1, H] (decode) or [1, S, H] (prefill). Returns same shape."""
         lead = x.shape[:-1]
         x2d = x.reshape(-1, D.HIDDEN)
+        if USE_MOE_FUSED_W8 and (
+            not USE_MOE_FUSED_W8_ROW_FP8 or uses_row_fp8_layer(i)
+        ):
+            return self._moe_fused_w8(i, x2d, lead).to(x.dtype)
         if USE_MOE_CTE:
             return self._moe_cte(i, x2d, lead).to(x.dtype)
         if USE_MOE_NKILIB:
@@ -576,6 +895,155 @@ class StaticDecode35B(nn.Module):
         out = routed + shared
         return out.reshape(*lead, D.HIDDEN).to(x.dtype)
 
+    def _moe_routing(self, i, x2d):
+        xf = x2d.float()
+        logits = F.linear(xf, getattr(self, f"l{i}_router").float())
+        routing = F.softmax(logits, dim=1, dtype=torch.float)
+        top_weights, top_ids = torch.topk(routing, D.TOP_K, dim=-1)
+        if D.NORM_TOPK_PROB:
+            top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True)
+        return xf, top_ids, top_weights
+
+    def _shared_expert(self, i, xf):
+        shared_gate = torch.sigmoid(
+            F.linear(xf, getattr(self, f"l{i}_sh_sigmoid").float())
+        )
+        shared = F.linear(
+            F.silu(F.linear(xf, getattr(self, f"l{i}_sh_gate").float()))
+            * F.linear(xf, getattr(self, f"l{i}_sh_up").float()),
+            getattr(self, f"l{i}_sh_down").float(),
+        )
+        return shared_gate * shared
+
+    def _moe_fused_w8_parts(self, i, x2d):
+        """Return routing plus local/global/shared FP32 fused-W8 stages."""
+        if x2d.shape[0] != self.batch_size:
+            raise RuntimeError("MOE_FUSED_W8 is restricted to one-token decode")
+        local_experts = self.e_hi - self.e_lo
+        xf, top_ids, top_weights = self._moe_routing(i, x2d)
+        affinities = build_local_affinities(
+            top_ids, top_weights, self.e_lo, local_experts
+        )
+
+        if USE_MOE_FUSED_W8_ROW_FP8:
+            if not uses_row_fp8_layer(i):
+                raise RuntimeError(
+                    f"layer {i} is outside the configured row-FP8 range"
+                )
+            local_ids = (top_ids - self.e_lo).clamp(
+                0, local_experts - 1
+            ).to(torch.int32)
+            local_routed = torch.ops.moe_w8.tkg_row_fp8(
+                x2d.to(torch.bfloat16),
+                getattr(self, f"l{i}_row_gate_up"),
+                getattr(self, f"l{i}_row_down"),
+                getattr(self, f"l{i}_row_gate_up_scale"),
+                getattr(self, f"l{i}_row_down_scale"),
+                affinities.to(torch.bfloat16),
+                local_ids,
+                self.moe_row_fp8_rank_id,
+            )
+        elif USE_MOE_FUSED_W8_DUAL_FP8:
+            local_routed = torch.ops.moe_w8.fused_fp8_dual(
+                x2d.to(torch.bfloat16),
+                getattr(self, f"l{i}_w8_gate_up"),
+                getattr(self, f"l{i}_w8_gate_up_residual"),
+                getattr(self, f"l{i}_w8_down"),
+                getattr(self, f"l{i}_w8_down_residual"),
+                getattr(self, f"l{i}_w8_gate_up_scale"),
+                getattr(self, f"l{i}_w8_down_scale"),
+                affinities,
+            )
+        elif USE_MOE_FUSED_W8_BLOCK_COALESCED_FP8:
+            local_routed = torch.ops.moe_w8.fused_fp8_block_coalesced(
+                x2d.to(torch.bfloat16),
+                getattr(self, f"l{i}_w8_gate_up"),
+                getattr(self, f"l{i}_w8_down"),
+                getattr(self, f"l{i}_w8_gate_up_scale"),
+                getattr(self, f"l{i}_w8_down_scale"),
+                affinities,
+            )
+        elif MOE_FUSED_W8 == "fp8":
+            local_routed = torch.ops.moe_w8.fused_fp8_native(
+                x2d.to(torch.bfloat16),
+                getattr(self, f"l{i}_w8_gate_up"),
+                getattr(self, f"l{i}_w8_down"),
+                getattr(self, f"l{i}_w8_gate_up_scale"),
+                getattr(self, f"l{i}_w8_down_scale"),
+                affinities,
+            )
+        else:
+            local_routed = torch.ops.moe_w8.fused_int8(
+                x2d.to(torch.bfloat16),
+                getattr(self, f"l{i}_w8_gate_up"),
+                getattr(self, f"l{i}_w8_down"),
+                getattr(self, f"l{i}_w8_gate_up_scale"),
+                getattr(self, f"l{i}_w8_down_scale"),
+                affinities,
+            )
+        global_routed = functional_all_reduce(
+            local_routed, "sum", self.tp_group
+        )
+        shared = self._shared_expert(i, xf)
+        return (
+            top_ids,
+            top_weights,
+            local_routed,
+            global_routed,
+            shared,
+        )
+
+    def _moe_fused_w8(self, i, x2d, lead):
+        """High-batch all-expert W8 call; router/shared/TP semantics stay external."""
+        _, _, _, global_routed, shared = self._moe_fused_w8_parts(
+            i, x2d
+        )
+        return (global_routed + shared).reshape(*lead, D.HIDDEN)
+
+    def _moe_reference_parts(self, i, x2d):
+        """Return the same stages from the official-FP8-dequantized oracle."""
+        skipped_row_fp8_layer = (
+            USE_MOE_FUSED_W8_ROW_FP8 and not uses_row_fp8_layer(i)
+        )
+        if (
+            not USE_MOE_OFFICIAL_FP8_REFERENCE
+            and not skipped_row_fp8_layer
+        ):
+            raise RuntimeError(
+                "reference MoE diagnostics require "
+                "MOE_OFFICIAL_FP8_REFERENCE=1"
+            )
+        local_routed, shared, top_ids, top_weights = moe_forward(
+            x2d,
+            getattr(self, f"l{i}_router"),
+            getattr(self, f"l{i}_gate_up"),
+            getattr(self, f"l{i}_down"),
+            self.e_lo,
+            self.e_hi,
+            getattr(self, f"l{i}_sh_gate"),
+            getattr(self, f"l{i}_sh_up"),
+            getattr(self, f"l{i}_sh_down"),
+            getattr(self, f"l{i}_sh_sigmoid"),
+            return_routing=True,
+        )
+        global_routed = functional_all_reduce(
+            local_routed, "sum", self.tp_group
+        )
+        return (
+            top_ids,
+            top_weights,
+            local_routed,
+            global_routed,
+            shared,
+        )
+
+    def _moe_diagnostic_parts(self, i, x2d):
+        if USE_MOE_FUSED_W8 and (
+            not USE_MOE_FUSED_W8_ROW_FP8 or uses_row_fp8_layer(i)
+        ):
+            return self._moe_fused_w8_parts(i, x2d)
+        return self._moe_reference_parts(i, x2d)
+
     def _moe_cte(self, i, x2d, lead):
         """Long-token MoE using nkilib's blockwise context-encoding kernel."""
         T = x2d.shape[0]
@@ -631,6 +1099,10 @@ class StaticDecode35B(nn.Module):
                 block_size,
             )
         routed = routed[:T]
+        if os.environ.get("MOE_CTE_RETURN_ROUTED", "0") == "1":
+            return routed.reshape(*lead, D.HIDDEN)
+        if os.environ.get("MOE_CTE_SYNC_BEFORE_SHARED", "0") == "1":
+            torch.neuron.synchronize()
         routed = functional_all_reduce(routed.float(), "sum", self.tp_group)
 
         sg = torch.sigmoid(F.linear(xf, getattr(self, f"l{i}_sh_sigmoid").float()))
@@ -697,6 +1169,8 @@ class StaticDecode35B(nn.Module):
     def _decode_hidden(self, input_id, position, deltanet_states, conv_states,
                        kv_cache_k, kv_cache_v):
         hidden = F.embedding(input_id, self.embed).unsqueeze(1)   # [B,1,H]
+        if USE_MOE_W8_RESIDUAL_FP32:
+            hidden = hidden.float()
         if USE_DN_DIRECT_STATE_OUT:
             dn_states = torch.empty_like(deltanet_states)
             cv_states = torch.empty_like(conv_states)
@@ -731,6 +1205,8 @@ class StaticDecode35B(nn.Module):
                 )
 
         hidden = rms_norm(hidden, self.final_norm)
+        if USE_MOE_W8_RESIDUAL_FP32:
+            hidden = hidden.to(torch.bfloat16)
         return hidden, dn_states, cv_states, kv_k, kv_v
 
     # ── Decode forward (B tokens in, B logits out) ──
@@ -798,6 +1274,176 @@ class StaticDecode35B(nn.Module):
         )
         return outputs[0], outputs[1], outputs[2], outputs[3]
 
+    def set_diagnostic_layers(self, layers):
+        selected = tuple(int(layer) for layer in layers)
+        if not selected:
+            raise ValueError("at least one diagnostic layer is required")
+        if selected != tuple(sorted(set(selected))):
+            raise ValueError("diagnostic layers must be sorted and unique")
+        if selected[0] < 0 or selected[-1] >= D.NUM_LAYERS:
+            raise ValueError(
+                f"diagnostic layers must be in [0, {D.NUM_LAYERS - 1}]"
+            )
+        self._diagnostic_layers = selected
+
+    def decode_step_diagnostics(
+        self, input_id, position, deltanet_states, conv_states
+    ):
+        """Full decode with selected MoE and residual stages as graph outputs."""
+        if not USE_GQA_STATEFUL_KV:
+            raise RuntimeError(
+                "decode_step_diagnostics requires GQA_STATEFUL_KV=1"
+            )
+        if not (USE_MOE_FUSED_W8 or USE_MOE_OFFICIAL_FP8_REFERENCE):
+            raise RuntimeError(
+                "decode_step_diagnostics requires a fused-W8 candidate or "
+                "official-FP8 reference"
+            )
+        if not self._diagnostic_layers:
+            raise RuntimeError("call set_diagnostic_layers before compiling")
+        if not USE_DECODE_SHARDED_LM_HEAD:
+            raise RuntimeError(
+                "decode_step_diagnostics requires DECODE_SHARDED_LM_HEAD=1"
+            )
+
+        hidden = F.embedding(input_id, self.embed).unsqueeze(1)
+        if USE_MOE_W8_RESIDUAL_FP32:
+            hidden = hidden.float()
+        if USE_DN_DIRECT_STATE_OUT:
+            dn_states = torch.empty_like(deltanet_states)
+            cv_states = torch.empty_like(conv_states)
+        else:
+            dn_states = deltanet_states.clone()
+            cv_states = conv_states.clone()
+        kv_k = self.decode_kv_k
+        kv_v = self.decode_kv_v
+        cos = self.rope_cos.squeeze(0).squeeze(0).index_select(
+            0, position.unsqueeze(0)
+        ).unsqueeze(0).unsqueeze(0)
+        sin = self.rope_sin.squeeze(0).squeeze(0).index_select(
+            0, position.unsqueeze(0)
+        ).unsqueeze(0).unsqueeze(0)
+
+        layer_inputs = []
+        attention_outputs = []
+        post_attention_hiddens = []
+        moe_inputs = []
+        router_top_ids = []
+        router_top_weights = []
+        local_routed_outputs = []
+        global_routed_outputs = []
+        shared_outputs = []
+        layer_outputs = []
+
+        for i in range(D.NUM_LAYERS):
+            selected = i in self._diagnostic_layers
+            if selected:
+                layer_inputs.append(hidden.reshape(self.batch_size, D.HIDDEN))
+            normed = decode_rms_norm(
+                hidden, getattr(self, f"l{i}_input_norm")
+            )
+            if D.layer_type(i) == "deltanet":
+                if USE_DN_DIRECT_STATE_OUT:
+                    attention = self._deltanet_layer(
+                        i,
+                        normed,
+                        deltanet_states,
+                        conv_states,
+                        dn_states,
+                        cv_states,
+                    )
+                else:
+                    attention = self._deltanet_layer(
+                        i, normed, dn_states, cv_states
+                    )
+            else:
+                attention = self._gqa_layer(
+                    i, normed, cos, sin, position, kv_k, kv_v
+                )
+            hidden = hidden + attention
+            moe_input = decode_rms_norm(
+                hidden, getattr(self, f"l{i}_post_norm")
+            )
+
+            if selected:
+                x2d = moe_input.reshape(-1, D.HIDDEN)
+                (
+                    top_ids,
+                    top_weights,
+                    local_routed,
+                    global_routed,
+                    shared,
+                ) = self._moe_diagnostic_parts(i, x2d)
+                moe_output = (global_routed + shared).reshape_as(
+                    hidden
+                ).to(moe_input.dtype)
+                attention_outputs.append(
+                    attention.reshape(self.batch_size, D.HIDDEN)
+                )
+                post_attention_hiddens.append(
+                    hidden.reshape(self.batch_size, D.HIDDEN)
+                )
+                moe_inputs.append(
+                    moe_input.reshape(self.batch_size, D.HIDDEN)
+                )
+                router_top_ids.append(top_ids)
+                router_top_weights.append(top_weights)
+                local_routed_outputs.append(local_routed)
+                global_routed_outputs.append(global_routed)
+                shared_outputs.append(shared)
+            else:
+                moe_output = self._moe(i, moe_input)
+            hidden = hidden + moe_output
+            if selected:
+                layer_outputs.append(
+                    hidden.reshape(self.batch_size, D.HIDDEN)
+                )
+
+        hidden = rms_norm(hidden, self.final_norm)
+        if USE_MOE_W8_RESIDUAL_FP32:
+            hidden = hidden.to(torch.bfloat16)
+        if D.VOCAB % self.world_size:
+            raise RuntimeError(
+                "DECODE_SHARDED_LM_HEAD requires vocab size divisible by TP"
+            )
+        vocab_per_rank = D.VOCAB // self.world_size
+        vocab_lo = self.rank * vocab_per_rank
+        vocab_hi = vocab_lo + vocab_per_rank
+        logits = F.linear(
+            hidden, self.lm_head_w[vocab_lo:vocab_hi]
+        ).squeeze(1)
+        local_max, local_id = logits.max(dim=-1)
+        global_max = functional_all_reduce(
+            local_max, "max", self.tp_group
+        )
+        global_id = local_id.to(torch.int32) + vocab_lo
+        invalid_id = torch.full_like(global_id, -D.VOCAB)
+        neg_winner_id = torch.where(
+            local_max == global_max, -global_id, invalid_id
+        )
+        next_id = -functional_all_reduce(
+            neg_winner_id, "max", self.tp_group
+        )
+        diagnostics = (
+            torch.stack(layer_inputs),
+            torch.stack(attention_outputs),
+            torch.stack(post_attention_hiddens),
+            torch.stack(moe_inputs),
+            torch.stack(router_top_ids),
+            torch.stack(router_top_weights),
+            torch.stack(local_routed_outputs),
+            torch.stack(global_routed_outputs),
+            torch.stack(shared_outputs),
+            torch.stack(layer_outputs),
+        )
+        return (
+            logits,
+            next_id.to(torch.long),
+            dn_states,
+            cv_states,
+            *diagnostics,
+        )
+
     def _run_layers(self, lo, hi, hidden, cos, sin, position,
                     dn_states, cv_states, kv_k, kv_v):
         """Decode layers [lo, hi). Compiled per-segment to keep each NEFF's
@@ -805,12 +1451,16 @@ class StaticDecode35B(nn.Module):
         graph with ~3 all-reduce/layer trips a compiler tiling assertion;
         20-layer segments compile cleanly)."""
         for i in range(lo, hi):
-            normed = rms_norm(hidden, getattr(self, f"l{i}_input_norm"))
+            normed = decode_rms_norm(
+                hidden, getattr(self, f"l{i}_input_norm")
+            )
             if D.layer_type(i) == "deltanet":
                 hidden = hidden + self._deltanet_layer(i, normed, dn_states, cv_states)
             else:
                 hidden = hidden + self._gqa_layer(i, normed, cos, sin, position, kv_k, kv_v)
-            normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
+            normed = decode_rms_norm(
+                hidden, getattr(self, f"l{i}_post_norm")
+            )
             hidden = hidden + self._moe(i, normed)
         return hidden
 
@@ -820,7 +1470,9 @@ class StaticDecode35B(nn.Module):
     ):
         """Decode layers while keeping recurrent inputs and outputs disjoint."""
         for i in range(lo, hi):
-            normed = rms_norm(hidden, getattr(self, f"l{i}_input_norm"))
+            normed = decode_rms_norm(
+                hidden, getattr(self, f"l{i}_input_norm")
+            )
             if D.layer_type(i) == "deltanet":
                 hidden = hidden + self._deltanet_layer(
                     i, normed, dn_states_in, cv_states_in,
@@ -830,7 +1482,9 @@ class StaticDecode35B(nn.Module):
                 hidden = hidden + self._gqa_layer(
                     i, normed, cos, sin, position, kv_k, kv_v
                 )
-            normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
+            normed = decode_rms_norm(
+                hidden, getattr(self, f"l{i}_post_norm")
+            )
             hidden = hidden + self._moe(i, normed)
         return hidden
 
@@ -905,17 +1559,30 @@ class StaticDecode35B(nn.Module):
                 conv_out = cv_states_out[di].reshape(
                     B * qkv_dim, D.DN_CONV_KERNEL - 1
                 )
-                _, _, attn_flat = torch.ops.deltanet35b.full_batched_direct(
-                    state_in, qkv_in, conv_in, conv_w2, cb,
-                    a_in, b_in, z_in, A_log, dt_bias, norm_w.float(),
-                    state_out, conv_out,
+                new_state, new_cs, attn_flat = (
+                    torch.ops.deltanet35b.full_batched_direct(
+                        state_in, qkv_in, conv_in, conv_w2, cb,
+                        a_in, b_in, z_in, A_log, dt_bias, norm_w.float(),
+                        state_out, conv_out,
+                    )
                 )
+                # Keep the custom op's mutated outputs in explicit graph
+                # dataflow. Relying only on alias mutation of these parent
+                # slices can leave middle-layer state outputs unwritten.
+                dn_states_out[di] = new_state.reshape(
+                    B, VH * KD, VD
+                ).to(dn_states_out.dtype)
+                cv_states_out[di] = new_cs.reshape(
+                    B, qkv_dim, D.DN_CONV_KERNEL - 1
+                ).to(cv_states_out.dtype)
             else:
                 new_state, new_cs, attn_flat = torch.ops.deltanet35b.full_batched(
                     state_in, qkv_in, conv_in, conv_w2, cb,
                     a_in, b_in, z_in, A_log, dt_bias, norm_w.float(),
                 )
-                dn_states[di] = new_state.reshape(B, VH * KD, VD).to(dn_states.dtype)
+                dn_states[di] = new_state.reshape(
+                    B, VH * KD, VD
+                ).to(dn_states.dtype)
                 cv_states[di] = new_cs.reshape(
                     B, qkv_dim, D.DN_CONV_KERNEL - 1
                 ).to(cv_states.dtype)
@@ -1053,10 +1720,12 @@ class StaticDecode35B(nn.Module):
         out = functional_all_reduce(out, "sum", self.tp_group)
         return out.unsqueeze(1)                          # [B,1,H]
 
-    # ── Prefill (eager; BS=1) ──
+    # ── Prefill (eager; homogeneous batch) ──
     def prefill(self, input_ids, deltanet_states, conv_states, kv_cache_k, kv_cache_v):
-        S = input_ids.shape[0]
-        hidden = F.embedding(input_ids, self.embed).unsqueeze(0).float()   # [1,S,H]
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        B, S = input_ids.shape
+        hidden = F.embedding(input_ids, self.embed).float()                # [B,S,H]
         dn_states = deltanet_states.clone()
         cv_states = conv_states.clone()
         kv_k = kv_cache_k.clone()
@@ -1073,7 +1742,7 @@ class StaticDecode35B(nn.Module):
 
         hidden = rms_norm(hidden, self.final_norm)
         logits = self._lin("lm_head_w", hidden[:, -1:, :])
-        return logits.squeeze(0), dn_states, cv_states, kv_k, kv_v
+        return logits.squeeze(1), dn_states, cv_states, kv_k, kv_v
 
     def _deltanet_prefill(self, i, x, dn_states, cv_states, valid_len=None):
         di = D.deltanet_index(i)
@@ -1083,30 +1752,30 @@ class StaticDecode35B(nn.Module):
         key_dim = KH * KD
         val_dim = VH * VD
         qkv_dim = 2 * key_dim + val_dim
-        S = x.shape[1]
+        B, S = x.shape[:2]
 
         conv_w = getattr(self, f"l{i}_dn_conv_w")
         A_log = getattr(self, f"l{i}_dn_A_log").float()
         dt_bias = getattr(self, f"l{i}_dn_dt_bias").float()
         norm_w = getattr(self, f"l{i}_dn_norm")
-        x_2d = x.squeeze(0)                              # [S,H]
+        x_2d = x.reshape(B * S, D.HIDDEN)                 # [B*S,H]
 
-        mixed_qkv = self._lin(f"l{i}_dn_qkv", x_2d)       # [S,qkv_dim]
-        mqf = mixed_qkv.t().float()                       # [qkv_dim,S]
-        conv_input = torch.cat([cv_states[di, 0].float(), mqf], dim=-1)  # [qkv_dim,3+S]
-        conv_out = F.conv1d(conv_input.unsqueeze(0), conv_w.float(), groups=qkv_dim)  # [1,qkv_dim,S]
-        cv_states[di, 0] = mqf[:, -3:].to(cv_states.dtype)
-        mixed_qkv = F.silu(conv_out.squeeze(0).t())       # [S,qkv_dim]
+        mixed_qkv = self._lin(f"l{i}_dn_qkv", x_2d).reshape(B, S, qkv_dim)
+        mqf = mixed_qkv.permute(0, 2, 1).float()           # [B,qkv_dim,S]
+        conv_input = torch.cat([cv_states[di].float(), mqf], dim=-1)
+        conv_out = F.conv1d(conv_input, conv_w.float(), groups=qkv_dim)
+        cv_states[di] = mqf[:, :, -3:].to(cv_states.dtype)
+        mixed_qkv = F.silu(conv_out.permute(0, 2, 1))       # [B,S,qkv_dim]
 
-        q = mixed_qkv[:, :key_dim].reshape(S, KH, KD)
-        k = mixed_qkv[:, key_dim:2 * key_dim].reshape(S, KH, KD)
-        v = mixed_qkv[:, 2 * key_dim:].reshape(S, VH, VD)
+        q = mixed_qkv[:, :, :key_dim].reshape(B, S, KH, KD)
+        k = mixed_qkv[:, :, key_dim:2 * key_dim].reshape(B, S, KH, KD)
+        v = mixed_qkv[:, :, 2 * key_dim:].reshape(B, S, VH, VD)
         grp = VH // KH
-        q = q.repeat_interleave(grp, dim=1)               # [S,VH,KD]
-        k = k.repeat_interleave(grp, dim=1)
+        q = q.repeat_interleave(grp, dim=2)               # [B,S,VH,KD]
+        k = k.repeat_interleave(grp, dim=2)
 
-        a_out = self._lin(f"l{i}_dn_a", x_2d).float()     # [S,VH]
-        b_out = self._lin(f"l{i}_dn_b", x_2d)
+        a_out = self._lin(f"l{i}_dn_a", x_2d).reshape(B, S, VH).float()
+        b_out = self._lin(f"l{i}_dn_b", x_2d).reshape(B, S, VH)
         beta = b_out.sigmoid()
         g = -A_log.exp() * F.softplus(a_out + dt_bias)
 
@@ -1121,14 +1790,14 @@ class StaticDecode35B(nn.Module):
         # controls.
         if valid_len is not None:
             positions = torch.arange(S, dtype=torch.int32, device=beta.device)
-            pad = (positions < valid_len.reshape(-1)[0]).to(beta.dtype)[:, None]
+            pad = (positions < valid_len.reshape(-1)[0]).to(beta.dtype)[None, :, None]
             beta = beta * pad
             g = g * pad
         else:
             vlen = getattr(self, "_dn_valid_len", None)
         if valid_len is None and vlen is not None and vlen < S:
-            pad = torch.zeros(S, VH, dtype=beta.dtype, device=beta.device)
-            pad[:vlen] = 1.0
+            pad = torch.zeros(1, S, VH, dtype=beta.dtype, device=beta.device)
+            pad[:, :vlen] = 1.0
             beta = beta * pad
             g = g * pad
 
@@ -1137,12 +1806,12 @@ class StaticDecode35B(nn.Module):
             # pure-torch loop below trips NCC_IMGN901 under torch.compile). Kernel
             # is head-major (row h*S+t), L2-normalizes q,k + applies 1/sqrt(K) q-scale
             # INTERNALLY, so pass RAW q,k. Takes/returns state -> composes with buckets.
-            q_hm = q.float().transpose(0, 1).reshape(VH * S, KD).contiguous()
-            k_hm = k.float().transpose(0, 1).reshape(VH * S, KD).contiguous()
-            v_hm = v.float().transpose(0, 1).reshape(VH * S, VD).contiguous()
-            g_hm = g.transpose(0, 1).reshape(VH * S, 1).contiguous()
-            beta_hm = beta.float().transpose(0, 1).reshape(VH * S, 1).contiguous()
-            state_in = dn_states[di, 0].float()               # [VH*KD, VD]
+            q_hm = q.float().permute(0, 2, 1, 3).reshape(B * VH * S, KD).contiguous()
+            k_hm = k.float().permute(0, 2, 1, 3).reshape(B * VH * S, KD).contiguous()
+            v_hm = v.float().permute(0, 2, 1, 3).reshape(B * VH * S, VD).contiguous()
+            g_hm = g.permute(0, 2, 1).reshape(B * VH * S, 1).contiguous()
+            beta_hm = beta.float().permute(0, 2, 1).reshape(B * VH * S, 1).contiguous()
+            state_in = dn_states[di].float()                  # [B,VH*KD,VD]
             capture_here = (
                 DN_CAPTURE_DIR
                 and i == DN_CAPTURE_LAYER
@@ -1175,28 +1844,28 @@ class StaticDecode35B(nn.Module):
             out_hm, new_state = torch.ops.deltanet35b.chunked_prefill(
                 state_in, q_hm, k_hm, v_hm, g_hm, beta_hm,
                 self.chunk_m_incl, self.chunk_m_strict, self.chunk_eye)
-            dn_states[di, 0] = new_state.reshape(VH * KD, VD).to(dn_states.dtype)
-            attn_out = out_hm.reshape(VH, S, VD).transpose(0, 1)   # [S,VH,VD]
+            dn_states[di] = new_state.to(dn_states.dtype)
+            attn_out = out_hm.reshape(B, VH, S, VD).permute(0, 2, 1, 3)
         else:
             from chunked_prefill import neuron_chunk_gated_delta_rule
-            q_in = F.normalize(q.float(), p=2, dim=-1, eps=1e-6).unsqueeze(0)
-            k_in = F.normalize(k.float(), p=2, dim=-1, eps=1e-6).unsqueeze(0)
-            v_in = v.float().unsqueeze(0)
-            g_in = g.unsqueeze(0)
-            beta_in = beta.float().unsqueeze(0)
-            init_state = dn_states[di, 0].float().reshape(1, VH, KD, VD)
+            q_in = F.normalize(q.float(), p=2, dim=-1, eps=1e-6)
+            k_in = F.normalize(k.float(), p=2, dim=-1, eps=1e-6)
+            v_in = v.float()
+            g_in = g
+            beta_in = beta.float()
+            init_state = dn_states[di].float().reshape(B, VH, KD, VD)
             attn_4d, final_state = neuron_chunk_gated_delta_rule(
                 q_in, k_in, v_in, g=g_in, beta=beta_in, chunk_size=64,
                 initial_state=init_state, output_final_state=True,
                 use_qk_l2norm_in_kernel=False)
-            dn_states[di, 0] = final_state.squeeze(0).reshape(VH * KD, VD).to(dn_states.dtype)
-            attn_out = attn_4d.squeeze(0)                     # [S,VH,VD]
+            dn_states[di] = final_state.reshape(B, VH * KD, VD).to(dn_states.dtype)
+            attn_out = attn_4d                              # [B,S,VH,VD]
 
-        z = self._lin(f"l{i}_dn_z", x_2d).reshape(S, VH, VD)
+        z = self._lin(f"l{i}_dn_z", x_2d).reshape(B, S, VH, VD)
         gated = rms_norm_gated(attn_out.to(x.dtype), z, norm_w)
-        out = self._lin(f"l{i}_dn_out", gated.reshape(S, val_dim))
+        out = self._lin(f"l{i}_dn_out", gated.reshape(B * S, val_dim)).reshape(B, S, D.HIDDEN)
         out = functional_all_reduce(out, "sum", self.tp_group)
-        return out.unsqueeze(0)
+        return out
 
     def _gqa_prefill(self, i, x, S, kv_k, kv_v):
         gi = D.gqa_index(i)
@@ -1207,49 +1876,51 @@ class StaticDecode35B(nn.Module):
         GRP = QH // NKV
         q_norm_w = getattr(self, f"l{i}_gqa_q_norm")
         k_norm_w = getattr(self, f"l{i}_gqa_k_norm")
-        x_2d = x.squeeze(0)                              # [S,H]
+        B = x.shape[0]
+        x_2d = x.reshape(B * S, D.HIDDEN)
 
-        q_out = self._lin(f"l{i}_gqa_q", x_2d).reshape(S, QH, HD * 2)
+        q_out = self._lin(f"l{i}_gqa_q", x_2d).reshape(B, S, QH, HD * 2)
         query, gate = q_out.chunk(2, dim=-1)
-        gate = gate.reshape(S, QH * HD)
-        key = self._lin(f"l{i}_gqa_k", x_2d).reshape(S, NKV, HD)
-        value = self._lin(f"l{i}_gqa_v", x_2d).reshape(S, NKV, HD)
+        gate = gate.reshape(B, S, QH * HD)
+        key = self._lin(f"l{i}_gqa_k", x_2d).reshape(B, S, NKV, HD)
+        value = self._lin(f"l{i}_gqa_v", x_2d).reshape(B, S, NKV, HD)
         query = rms_norm(query, q_norm_w)
         key = rms_norm(key, k_norm_w)
 
         positions = torch.arange(S, device=x.device)
-        cos = self.rope_cos.squeeze(0).squeeze(0)[positions].unsqueeze(1)   # [S,1,rd]
-        sin = self.rope_sin.squeeze(0).squeeze(0)[positions].unsqueeze(1)
+        cos = self.rope_cos.squeeze(0).squeeze(0)[positions].reshape(1, S, 1, D.ROPE_DIM)
+        sin = self.rope_sin.squeeze(0).squeeze(0)[positions].reshape(1, S, 1, D.ROPE_DIM)
         query, key = apply_rope(query, key, cos, sin)
         query = query.to(x.dtype); key = key.to(x.dtype)
 
-        # cache [gi] = [B, NKV, S, HD]; prefill is BS=1 -> row 0.
-        kv_k[gi, 0, :, :S] = key.transpose(0, 1).to(kv_k.dtype)       # [NKV,S,HD]
-        kv_v[gi, 0, :, :S] = value.transpose(0, 1).to(kv_v.dtype)
+        kv_k[gi, :, :, :S] = key.permute(0, 2, 1, 3).to(kv_k.dtype)
+        kv_v[gi, :, :, :S] = value.permute(0, 2, 1, 3).to(kv_v.dtype)
 
         if USE_GQA_FLASH_PREFILL:
             # Flash causal-attention kernel. NKV=1/core, so all QH queries attend the
             # single KV head. q [QH,S,HD], k/v [S,HD]. Kernel returns [QH,S,HD].
-            q_f = query.reshape(S, QH, HD).permute(1, 0, 2).contiguous()   # [QH,S,HD]
-            k_f = key.reshape(S, HD).contiguous()                          # NKV=1 -> [S,HD]
-            v_f = value.reshape(S, HD).contiguous()
+            if B != 1:
+                raise RuntimeError("GQA_FLASH_PREFILL does not support batched prefill; use GQA_CTE_PREFILL")
+            q_f = query[0].permute(1, 0, 2).contiguous()
+            k_f = key[0].reshape(S, HD).contiguous()
+            v_f = value[0].reshape(S, HD).contiguous()
             attn_out = torch.ops.gqa35b.flash_prefill(q_f, k_f, v_f)       # [QH,S,HD]
-            attn_out = attn_out.permute(1, 0, 2).reshape(S, QH * HD)
+            attn_out = attn_out.permute(1, 0, 2).reshape(1, S, QH * HD)
         else:
             # grouped causal attention (pure-torch, full [S,S] — OOMs at large S)
-            q_g = query.reshape(S, NKV, GRP, HD).permute(1, 2, 0, 3)      # [NKV,GRP,S,HD]
-            k_g = key.transpose(0, 1)                                     # [NKV,S,HD]
-            scores = torch.matmul(q_g, k_g.unsqueeze(1).transpose(2, 3)) / math.sqrt(HD)  # [NKV,GRP,S,S]
+            q_g = query.reshape(B, S, NKV, GRP, HD).permute(0, 2, 3, 1, 4)
+            k_g = key.permute(0, 2, 1, 3)
+            scores = torch.matmul(q_g, k_g.unsqueeze(2).transpose(3, 4)) / math.sqrt(HD)
             causal = torch.tril(torch.ones(S, S, device=x.device, dtype=scores.dtype))
             scores = scores + (1.0 - causal) * (-1e9)
-            v_g = value.transpose(0, 1)                                   # [NKV,S,HD]
+            v_g = value.permute(0, 2, 1, 3)
             attn_w = F.softmax(scores.float(), dim=-1).to(v_g.dtype)
-            attn_out = torch.matmul(attn_w, v_g.unsqueeze(1))            # [NKV,GRP,S,HD]
-            attn_out = attn_out.permute(2, 0, 1, 3).reshape(S, QH * HD)
+            attn_out = torch.matmul(attn_w, v_g.unsqueeze(2))
+            attn_out = attn_out.permute(0, 3, 1, 2, 4).reshape(B, S, QH * HD)
         attn_out = attn_out * torch.sigmoid(gate)
-        out = self._lin(f"l{i}_gqa_o", attn_out)
+        out = self._lin(f"l{i}_gqa_o", attn_out.reshape(B * S, QH * HD)).reshape(B, S, D.HIDDEN)
         out = functional_all_reduce(out, "sum", self.tp_group)
-        return out.unsqueeze(0)
+        return out
 
     # ── Bucketed/chunked prefill ──
     def _gqa_prefill_chunk(self, i, x, q_base, chunk, kv_k, kv_v):
@@ -1264,84 +1935,91 @@ class StaticDecode35B(nn.Module):
         NKV = self.nkv                                   # =1 at TP4 (KV replicated)
         q_norm_w = getattr(self, f"l{i}_gqa_q_norm")
         k_norm_w = getattr(self, f"l{i}_gqa_k_norm")
-        x_2d = x.squeeze(0)                              # [chunk,H]
+        B = x.shape[0]
+        x_2d = x.reshape(B * chunk, D.HIDDEN)
 
-        q_out = self._lin(f"l{i}_gqa_q", x_2d).reshape(chunk, QH, HD * 2)
+        q_out = self._lin(f"l{i}_gqa_q", x_2d).reshape(B, chunk, QH, HD * 2)
         query, gate = q_out.chunk(2, dim=-1)
-        gate = gate.reshape(chunk, QH * HD)
-        key = self._lin(f"l{i}_gqa_k", x_2d).reshape(chunk, NKV, HD)
-        value = self._lin(f"l{i}_gqa_v", x_2d).reshape(chunk, NKV, HD)
+        gate = gate.reshape(B, chunk, QH * HD)
+        key = self._lin(f"l{i}_gqa_k", x_2d).reshape(B, chunk, NKV, HD)
+        value = self._lin(f"l{i}_gqa_v", x_2d).reshape(B, chunk, NKV, HD)
         query = rms_norm(query, q_norm_w)
         key = rms_norm(key, k_norm_w)
 
         if USE_GQA_DYNAMIC_ROPE_KV:
+            cache_k = kv_k[gi, :, 0].reshape(B * self.max_seq_len, HD)
+            cache_v = kv_v[gi, :, 0].reshape(B * self.max_seq_len, HD)
             q_f, k_active, k_filled, v_filled = torch.ops.gqa35b.rope_kv_dynamic(
-                query.permute(1, 0, 2).contiguous(),
-                key[:, 0].contiguous(),
-                value[:, 0].contiguous(),
+                query.permute(0, 2, 1, 3).contiguous(),
+                key[:, :, 0].contiguous(),
+                value[:, :, 0].contiguous(),
                 self.rope_cos.squeeze(0).squeeze(0),
                 self.rope_sin.squeeze(0).squeeze(0),
-                kv_k[gi, 0, 0],
-                kv_v[gi, 0, 0],
+                cache_k,
+                cache_v,
                 q_base,
             )
+            k_filled = k_filled.reshape(B, self.max_seq_len, HD)
+            v_filled = v_filled.reshape(B, self.max_seq_len, HD)
             qb = q_base.float()
         else:
             # Static offset path retained for eager controls and old compile caches.
             positions = torch.arange(q_base, q_base + chunk, device=x.device)
-            cos = self.rope_cos.squeeze(0).squeeze(0)[positions].unsqueeze(1)
-            sin = self.rope_sin.squeeze(0).squeeze(0)[positions].unsqueeze(1)
+            cos = self.rope_cos.squeeze(0).squeeze(0)[positions].reshape(1, chunk, 1, D.ROPE_DIM)
+            sin = self.rope_sin.squeeze(0).squeeze(0)[positions].reshape(1, chunk, 1, D.ROPE_DIM)
             query, key = apply_rope(query, key, cos, sin)
             query = query.to(x.dtype); key = key.to(x.dtype)
 
             # scatter_ was observed to miscompile here; index_copy_ is safe when
             # positions are static.
-            key_t = key.transpose(0, 1).to(kv_k.dtype)
-            val_t = value.transpose(0, 1).to(kv_v.dtype)
-            kv_k[gi, 0].index_copy_(1, positions, key_t)
-            kv_v[gi, 0].index_copy_(1, positions, val_t)
-            q_f = query.reshape(chunk, QH, HD).permute(1, 0, 2).float().contiguous()
-            k_filled = kv_k[gi, 0].reshape(-1, HD)
-            v_filled = kv_v[gi, 0].reshape(-1, HD)
+            key_t = key.permute(0, 2, 1, 3).to(kv_k.dtype)
+            val_t = value.permute(0, 2, 1, 3).to(kv_v.dtype)
+            kv_k[gi].index_copy_(2, positions, key_t)
+            kv_v[gi].index_copy_(2, positions, val_t)
+            q_f = query.permute(0, 2, 1, 3).reshape(B * QH, chunk, HD).float().contiguous()
+            k_filled = kv_k[gi, :, 0]
+            v_filled = kv_v[gi, :, 0]
             qb = torch.full((1, 1), float(q_base), dtype=torch.float32, device=x.device)
 
         if USE_GQA_CTE_PREFILL:
             attn_out = torch.ops.gqa35b.cte_prefill(
-                (q_f * (1.0 / math.sqrt(HD))).to(torch.bfloat16),
-                k_active.transpose(0, 1).unsqueeze(0),
-                value[:, 0].to(torch.bfloat16).unsqueeze(0),
-                k_filled.transpose(0, 1).unsqueeze(0),
-                v_filled.unsqueeze(0),
+                (q_f.reshape(B * QH, chunk, HD) * (1.0 / math.sqrt(HD))).to(torch.bfloat16),
+                k_active.transpose(1, 2),
+                value[:, :, 0].to(torch.bfloat16),
+                k_filled.transpose(1, 2),
+                v_filled,
                 q_base.reshape(1),
             )
-            attn_out = attn_out.permute(1, 0, 2).reshape(chunk, QH * HD)
+            attn_out = attn_out.reshape(B, QH, chunk, HD).permute(0, 2, 1, 3).reshape(B, chunk, QH * HD)
         elif USE_GQA_FLASH_PREFILL:
+            if B != 1:
+                raise RuntimeError("GQA_FLASH_PREFILL does not support batched prefill; use GQA_CTE_PREFILL")
             # Kernel computes in f32 (dma_transpose dst is f32) — cast the (bf16) KV
             # buffer + query to f32 so the kernel's dma_transpose src/dst dtypes match.
             k_f = k_filled.float()
             v_f = v_filled.float()
             attn_out = torch.ops.gqa35b.flash_prefill_chunk(q_f, k_f, v_f, qb)  # [QH,chunk,HD]
-            attn_out = attn_out.permute(1, 0, 2).reshape(chunk, QH * HD)
+            attn_out = attn_out.permute(1, 0, 2).reshape(1, chunk, QH * HD)
         else:
             # Pure-torch grouped causal attention over the KV buffer prefix
             # [0 : q_base+chunk], with the chunk's queries at global rows q_base..
             # (diagnostic / fallback path — no flash kernel).
             klen = q_base + chunk
-            kfull = kv_k[gi, 0].reshape(-1, HD)[:klen].float()    # [klen,HD]
-            vfull = kv_v[gi, 0].reshape(-1, HD)[:klen].float()
-            qd = query.reshape(chunk, QH, HD).permute(1, 0, 2).float()  # [QH,chunk,HD]
-            scores = torch.matmul(qd, kfull.t()) / math.sqrt(HD)  # [QH,chunk,klen]
+            kfull = kv_k[gi, :, 0, :klen].float()
+            vfull = kv_v[gi, :, 0, :klen].float()
+            qd = query.permute(0, 2, 1, 3).float()
+            scores = torch.matmul(qd, kfull.transpose(1, 2).unsqueeze(1)) / math.sqrt(HD)
             qpos = torch.arange(q_base, q_base + chunk, device=x.device).reshape(chunk, 1)
             kpos = torch.arange(klen, device=x.device).reshape(1, klen)
             cmask = (qpos >= kpos)                                # [chunk,klen]
-            scores = scores + (~cmask).reshape(1, chunk, klen) * (-1e9)
+            scores = scores + (~cmask).reshape(1, 1, chunk, klen) * (-1e9)
             attn_w = F.softmax(scores.float(), dim=-1)
-            attn_out = torch.matmul(attn_w, vfull)               # [QH,chunk,HD]
-            attn_out = attn_out.permute(1, 0, 2).reshape(chunk, QH * HD).to(x.dtype)
+            attn_out = torch.matmul(attn_w, vfull.unsqueeze(1))
+            attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, chunk, QH * HD).to(x.dtype)
         attn_out = attn_out * torch.sigmoid(gate)
-        out = self._lin(f"l{i}_gqa_o", attn_out)
+        out = self._lin(f"l{i}_gqa_o", attn_out.reshape(B * chunk, QH * HD)).reshape(B, chunk, D.HIDDEN)
         out = functional_all_reduce(out, "sum", self.tp_group)
-        return out.unsqueeze(0)
+        return out
 
     def _prefill_chunk_layer_range(
         self, hidden, q_base, valid_len, dn_states, cv_states, kv_k, kv_v,
@@ -1366,7 +2044,7 @@ class StaticDecode35B(nn.Module):
         self, chunk_ids, q_base, valid_len, dn_states, cv_states, kv_k, kv_v
     ):
         """All layers for one prompt chunk."""
-        hidden = F.embedding(chunk_ids, self.embed).unsqueeze(0).float()
+        hidden = F.embedding(chunk_ids, self.embed).float()
         return self._prefill_chunk_layer_range(
             hidden, q_base, valid_len, dn_states, cv_states, kv_k, kv_v,
             0, D.NUM_LAYERS,
@@ -1381,7 +2059,9 @@ class StaticDecode35B(nn.Module):
         scalars, allowing one graph set to serve every full or partial bucket.
         The KV buffer must be sized >= padded length. Returns last-token logits
         plus updated states."""
-        S = input_ids.shape[0]
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        B, S = input_ids.shape
         dn_states = deltanet_states.clone()
         cv_states = conv_states.clone()
         kv_k = kv_cache_k.clone()
@@ -1462,8 +2142,8 @@ class StaticDecode35B(nn.Module):
             csz = ce - cs
             # pad the final chunk up to `chunk` (padded rows are masked out of
             # attention by the causal mask and never read as the final token).
-            ids = torch.zeros(chunk, dtype=input_ids.dtype, device=dev)
-            ids[:csz] = input_ids[cs:ce]
+            ids = torch.zeros(B, chunk, dtype=input_ids.dtype, device=dev)
+            ids[:, :csz] = input_ids[:, cs:ce]
             # Tell DeltaNet how many rows are real so it zeros beta/g for the pad
             # tail (only the final chunk is padded). Prevents pad tokens corrupting
             # the recurrent state that decode inherits.
@@ -1486,7 +2166,7 @@ class StaticDecode35B(nn.Module):
                 )
                 report_finite(c, 0)
             else:
-                last_hidden = F.embedding(ids, self.embed).unsqueeze(0).float()
+                last_hidden = F.embedding(ids, self.embed).float()
                 for segment_idx, segment_fn in enumerate(segment_fns):
                     last_hidden = segment_fn(
                         last_hidden, q_base_arg, valid_len_arg,
@@ -1499,11 +2179,19 @@ class StaticDecode35B(nn.Module):
 
         hidden = rms_norm(last_hidden, self.final_norm)
         logits = self._lin("lm_head_w", hidden[:, last_valid - 1:last_valid, :])
-        return logits.squeeze(0), dn_states, cv_states, kv_k, kv_v
+        return logits.squeeze(1), dn_states, cv_states, kv_k, kv_v
 
 
 # ─── Weight loading from the HF checkpoint (per-rank TP shard) ────────────────
-def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
+def load_sharded_weights(
+    ckpt,
+    rank,
+    world_size,
+    num_layers=None,
+    expert_ckpt=None,
+    moe_w8_mode=None,
+    official_fp8_reference=None,
+):
     """Load + TP-shard the 35B-A3B weights for one rank into the per-core dict.
 
     Sharding (TP=world_size):
@@ -1517,10 +2205,22 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
         all expert IDs and shards each expert's intermediate width. Router and
         shared expert are replicated in both layouts.
     """
-    import json, glob
     from st_reader import SafeReader, build_weight_map
 
     NL = num_layers if num_layers is not None else D.NUM_LAYERS
+    w8_mode = MOE_FUSED_W8 if moe_w8_mode is None else moe_w8_mode
+    w8_fp8_impl = MOE_FUSED_W8_FP8_IMPL
+    use_official_reference = (
+        USE_MOE_OFFICIAL_FP8_REFERENCE
+        if official_fp8_reference is None
+        else official_fp8_reference
+    )
+    if w8_mode not in ("", "fp8", "int8"):
+        raise ValueError(f"invalid fused W8 mode {w8_mode!r}")
+    if w8_mode and use_official_reference:
+        raise ValueError("fused W8 and official-FP8 reference loading are exclusive")
+    if (w8_mode or use_official_reference) and not expert_ckpt:
+        raise ValueError("official FP8 expert loading requires an expert checkpoint")
 
     # Map every weight key -> shard file (dependency-free; the DLC lacks safetensors).
     wm = build_weight_map(ckpt)
@@ -1549,6 +2249,12 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
 
     EXPERTS_PACKED = (pfx + "layers.0.mlp.experts.gate_up_proj") in wm
 
+    expert_reader = (
+        OfficialFP8ExpertReader(expert_ckpt)
+        if (w8_mode or use_official_reference)
+        else None
+    )
+
     td = D.tp_dims(world_size)
     KH_full, VH_full = D.DN_K_HEADS, D.DN_V_HEADS
     KD, VD = D.DN_K_DIM, D.DN_V_DIM
@@ -1576,8 +2282,22 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
         s = w.shape[1] // ws
         return w[:, r * s:(r + 1) * s].clone()
 
-    def load_experts(lp):
+    def load_experts(lp, layer_index):
         """Load this rank's expert-parallel rows or intermediate-width shards."""
+        if w8_mode:
+            converted, stats = _load_fused_w8_expert_layer(
+                expert_reader,
+                layer_index,
+                e_lo,
+                e_hi,
+                w8_mode,
+                w8_fp8_impl,
+            )
+            if stats is not None:
+                w8_stats.merge(stats)
+            return converted
+        if use_official_reference:
+            return expert_reader.load_layer_bf16(layer_index, e_lo, e_hi)
         if USE_MOE_DECODE_TP:
             if D.MOE_INTER % world_size:
                 raise RuntimeError(
@@ -1592,7 +2312,7 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
                 up = gu_full[:, D.MOE_INTER + i0:D.MOE_INTER + i1]
                 gu = torch.cat([gate, up], dim=1).clone()
                 dn = get(lp + "mlp.experts.down_proj")[:, :, i0:i1].clone()
-                return gu, dn
+                return {"gate_up": gu, "down": dn}
             gus, dns = [], []
             for e in range(D.NUM_EXPERTS):
                 ep = lp + f"mlp.experts.{e}."
@@ -1600,14 +2320,14 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
                 up = get(ep + "up_proj.weight")[i0:i1]
                 gus.append(torch.cat([gate, up], dim=0))
                 dns.append(get(ep + "down_proj.weight")[:, i0:i1])
-            return (
-                torch.stack(gus, 0).clone(),
-                torch.stack(dns, 0).clone(),
-            )
+            return {
+                "gate_up": torch.stack(gus, 0).clone(),
+                "down": torch.stack(dns, 0).clone(),
+            }
         if EXPERTS_PACKED:
             gu = get(lp + "mlp.experts.gate_up_proj")[e_lo:e_hi].clone()   # [Ec,2I,H]
             dn = get(lp + "mlp.experts.down_proj")[e_lo:e_hi].clone()      # [Ec,H,I]
-            return gu, dn
+            return {"gate_up": gu, "down": dn}
         # unpacked: experts.<e>.{gate,up,down}_proj.weight, each [I,H]/[H,I]
         gus, dns = [], []
         for e in range(e_lo, e_hi):
@@ -1616,8 +2336,12 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
             u = get(ep + "up_proj.weight")            # [I,H]
             gus.append(torch.cat([g, u], dim=0))      # [2I,H]
             dns.append(get(ep + "down_proj.weight"))  # [H,I]
-        return torch.stack(gus, 0).clone(), torch.stack(dns, 0).clone()
+        return {
+            "gate_up": torch.stack(gus, 0).clone(),
+            "down": torch.stack(dns, 0).clone(),
+        }
 
+    w8_stats = QuantizationStats()
     weights = {
         "embed": get(EMBED_K),
         "final_norm": get(NORM_K),
@@ -1627,19 +2351,18 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
 
     for i in range(NL):
         lp = f"{pfx}layers.{i}."
-        gate_up, down = load_experts(lp)
+        expert_weights = load_experts(lp, i)
         lw = {
             "input_norm": get(lp + "input_layernorm.weight"),
             "post_norm": get(lp + "post_attention_layernorm.weight"),
             # MoE — expert-parallel slice + replicated router/shared
             "router": get(lp + "mlp.gate.weight"),                       # [E,H] replicated
-            "gate_up": gate_up,                                          # [Ec,2I,H]
-            "down": down,                                                # [Ec,H,I]
             "sh_gate": get(lp + "mlp.shared_expert.gate_proj.weight"),
             "sh_up": get(lp + "mlp.shared_expert.up_proj.weight"),
             "sh_down": get(lp + "mlp.shared_expert.down_proj.weight"),
             "sh_sigmoid": get(lp + "mlp.shared_expert_gate.weight"),
         }
+        lw.update(expert_weights)
         if D.layer_type(i) == "deltanet":
             ap = lp + "linear_attn."
             qkv = get(ap + "in_proj_qkv.weight")             # [2*key+val, H]
@@ -1685,6 +2408,36 @@ def load_sharded_weights(ckpt, rank, world_size, num_layers=None):
             lw["gqa_k_norm"] = get(ap + "k_norm.weight")
         weights["layers"].append(lw)
 
+    if w8_mode and rank == 0:
+        detail = f"/{w8_fp8_impl}" if w8_mode == "fp8" else ""
+        if w8_mode == "fp8" and w8_fp8_impl == "row":
+            detail += (
+                f"/{MOE_FUSED_W8_FP8_PROJECTIONS}"
+                f"/layers[{MOE_FUSED_W8_FP8_LAYER_START},"
+                f"{MOE_FUSED_W8_FP8_LAYER_LIMIT})"
+            )
+        print(
+            f"  official experts -> {w8_mode}{detail}: "
+            f"cosine={w8_stats.cosine:.7f}, "
+            f"normalized RMSE={w8_stats.normalized_rmse:.5%}"
+            + (
+                f", shifted blocks={w8_stats.shifted_block_fraction:.2%}, "
+                f"exact values={w8_stats.exact_fraction:.2%}, "
+                f"clipped={w8_stats.clipped_count}"
+                if w8_mode == "fp8"
+                and w8_fp8_impl in (
+                    "block_pow2",
+                    "block_pow2_coalesced",
+                )
+                else ""
+            )
+        )
+    if use_official_reference and rank == 0:
+        print("  experts loaded from the official FP8 checkpoint and dequantized to BF16")
+    if expert_reader is not None:
+        expert_reader.close()
+    for reader in _handles.values():
+        reader.close()
     return weights
 
 
@@ -1702,6 +2455,12 @@ def main():
                          "without the neuron backend.")
     ap.add_argument("--model-path", default=MODEL_PATH,
                     help="Checkpoint dir (config.json + safetensors).")
+    ap.add_argument(
+        "--expert-model-path",
+        default=EXPERT_MODEL_PATH,
+        help="Official FP8 checkpoint used only for fused W8 expert tensors "
+             "(default: QWEN35_FP8_MODEL_PATH).",
+    )
     ap.add_argument("--graph-splits", type=int, default=0,
                     help="Compile the layer loop in N segments (0=auto: ceil(layers/20)). "
                          "Works around the neuronx-cc PGTiling collective limit on the "
@@ -1730,6 +2489,27 @@ def main():
                     help="Iterations for the synced-TPOT benchmark.")
     args = ap.parse_args()
     model_path = args.model_path
+    if USE_MOE_FUSED_W8 or USE_MOE_OFFICIAL_FP8_REFERENCE:
+        if args.cpu:
+            ap.error("official FP8 expert modes are device validation paths")
+        if args.skip_compile:
+            ap.error("official FP8 expert modes require a compiled full decode graph")
+        if not args.expert_model_path:
+            ap.error(
+                "official FP8 expert modes require --expert-model-path or "
+                "QWEN35_FP8_MODEL_PATH"
+            )
+    if USE_MOE_FUSED_W8 or USE_MOE_OFFICIAL_FP8_REFERENCE:
+        if args.batch_size not in (32, 64, 128, 256):
+            ap.error(
+                "official FP8 expert modes support --batch-size "
+                "32, 64, 128, or 256"
+            )
+        if not args.skip_prefill or args.prompt_ids or args.prefill_bench:
+            ap.error(
+                "official FP8 expert modes are decode-only; use --skip-prefill without "
+                "--prompt-ids or --prefill-bench"
+            )
 
     # Config-driven dims: lets the same harness run the real 35B and the
     # tiny-random debug model. Falls back to the baked-in 35B constants.
@@ -1754,11 +2534,21 @@ def main():
         device = torch.neuron.current_device()
 
     if rank == 0:
-        print(f"=== 35B-A3B static decode: TP={world_size}, max_seq={args.max_seq_len}, "
-              f"layers={D.NUM_LAYERS}, BS={args.batch_size} ===")
+        print(f"=== 35B-A3B static decode: TP={world_size}, LNC={LNC_DEGREE}, max_seq={args.max_seq_len}, "
+              f"layers={D.NUM_LAYERS}, BS={args.batch_size}"
+              f"{', fused W8=' + MOE_FUSED_W8 if USE_MOE_FUSED_W8 else ''}"
+              f"{'/' + MOE_FUSED_W8_FP8_IMPL if MOE_FUSED_W8 == 'fp8' else ''}"
+              f"{'/' + MOE_FUSED_W8_FP8_PROJECTIONS if USE_MOE_FUSED_W8_ROW_FP8 else ''}"
+              f"{'/layers[' + str(MOE_FUSED_W8_FP8_LAYER_START) + ',' + str(MOE_FUSED_W8_FP8_LAYER_LIMIT) + ')' if USE_MOE_FUSED_W8_ROW_FP8 else ''} ===")
 
     t0 = time.time()
-    weights = load_sharded_weights(model_path, rank, world_size, num_layers=D.NUM_LAYERS)
+    weights = load_sharded_weights(
+        model_path,
+        rank,
+        world_size,
+        num_layers=D.NUM_LAYERS,
+        expert_ckpt=args.expert_model_path,
+    )
     if rank == 0:
         print(f"  weights loaded+sharded: {time.time()-t0:.1f}s")
 
@@ -1837,7 +2627,13 @@ def main():
     # is pure-torch full [S,S] causal, DeltaNet prefill is the chunked NKI kernel.
     if args.prefill_bench > 0:
         N = args.prefill_bench
-        pid = torch.arange(N, dtype=torch.long, device=device) % D.VOCAB
+        base_pid = torch.arange(N, dtype=torch.long) % D.VOCAB
+        # Distinct rows exercise KV/state isolation while retaining homogeneous
+        # sequence lengths and the same dynamic bucket offsets.
+        pid = (
+            base_pid.unsqueeze(0) + torch.arange(B).unsqueeze(1)
+        ) % D.VOCAB
+        pid = pid.to(device)
         bchunk = args.bucket_chunk
         use_bucket = bchunk > 0
         # warmup (compiles any lazily-traced prefill graphs) + timed run
@@ -1846,12 +2642,15 @@ def main():
                 dist.barrier()
             t0 = time.time()
             if use_bucket:
-                logits, *_ = mod.prefill_bucketed(pid, dn_states, conv_states, kv_k, kv_v,
-                                                  chunk=bchunk,
-                                                  compile_chunk=(args.bucket_compile == 1),
-                                                  compile_splits=args.prefill_splits)
+                outputs = mod.prefill_bucketed(
+                    pid, dn_states, conv_states, kv_k, kv_v,
+                    chunk=bchunk,
+                    compile_chunk=(args.bucket_compile == 1),
+                    compile_splits=args.prefill_splits,
+                )
             else:
-                logits, *_ = mod.prefill(pid, dn_states, conv_states, kv_k, kv_v)
+                outputs = mod.prefill(pid, dn_states, conv_states, kv_k, kv_v)
+            logits = outputs[0]
             _ = int(logits[0].argmax())   # force materialization
             if not args.cpu:
                 dist.barrier()
@@ -1860,16 +2659,22 @@ def main():
                 cc = "c" if args.bucket_compile == 1 else "e"
                 mode = f"bucket{bchunk}{cc}" if use_bucket else "eager"
                 tag = "warmup" if w == 0 else "TIMED "
-                print(f"  PREFILL {tag} N={N} ({mode}): {dt*1000:.1f} ms  |  {N/dt:.1f} prompt tok/s"
+                print(f"  PREFILL {tag} BS={B} N={N} ({mode}): {dt*1000:.1f} ms  |  {B*N/dt:.1f} aggregate prompt tok/s"
                       f"{' (incl compile)' if w == 0 else ''}")
                 if os.environ.get("PREFILL_FINGERPRINT", "0") == "1":
                     lf = logits.float()
                     top = torch.topk(lf[0], 5).indices
+                    finite_names = ("logits", "deltanet", "conv", "kv_k", "kv_v")
+                    finite = ",".join(
+                        f"{name}={bool(torch.isfinite(tensor).all())}"
+                        for name, tensor in zip(finite_names, outputs)
+                    )
                     print(
                         "  PREFILL fingerprint:"
                         f" sum={float(lf.sum()):.8e}"
                         f" norm={float(torch.linalg.vector_norm(lf)):.8e}"
                         f" top5={[int(v) for v in top]}"
+                        f" finite[{finite}]"
                     )
         return
 
@@ -1879,7 +2684,7 @@ def main():
     gen = []
     if args.prompt_ids:
         pid = [int(t) for t in args.prompt_ids.split(",") if t != ""]
-        in_t = torch.tensor(pid, dtype=torch.long, device=device)
+        in_t = torch.tensor(pid, dtype=torch.long, device=device).unsqueeze(0).expand(B, -1).contiguous()
         if args.bucket_chunk > 0:
             logits, dn_states, conv_states, kv_k, kv_v = mod.prefill_bucketed(
                 in_t, dn_states, conv_states, kv_k, kv_v,

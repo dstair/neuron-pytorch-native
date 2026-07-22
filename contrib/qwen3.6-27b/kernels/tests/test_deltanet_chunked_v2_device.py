@@ -12,11 +12,11 @@ It diffs the kernel's on-device (output, new_state) against ref_chunk_single_hea
 (the proven CPU mirror) per head, and reports per-head state error so we can see
 whether corruption is uniform (a precision/algorithm issue) or localized.
 
-Run INSIDE the 28ce3c3 serve image with the neuron device, e.g.:
+Run inside a compatible serving image with the Neuron device, e.g.:
 
   docker run --rm --privileged --device=/dev/neuron0 \
     -e NEURON_PLATFORM_TARGET_OVERRIDE=trn2 -e PJRT_DEVICE=NEURON \
-    -v /home/ubuntu/qwen3_6:/work -w /work/kernels/tests \
+    -v <qwen27-source>:/work -w /work/kernels/tests \
     --entrypoint python3 <serve-image> \
     test_deltanet_chunked_v2_device.py --C 64 --S 256
 """
