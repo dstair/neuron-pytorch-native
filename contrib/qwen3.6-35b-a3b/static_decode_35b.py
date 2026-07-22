@@ -49,6 +49,25 @@ if USE_DN_DIRECT_STATE_OUT and not USE_DN_NKI:
     raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DN_NKI=1")
 if USE_DN_DIRECT_STATE_OUT and os.environ.get("DNBATCHED_V2", "0") != "1":
     raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DNBATCHED_V2=1")
+# Tiled conv-state layout for the DeltaNet decode kernel (matches the
+# DN_TILED_CONV path in deltanet_full_batched_v2_35b.py). conv_states are stored
+# tile-partition-major [NUM_DN, B, PMAX, NT, 3] so the kernel's sliding-window
+# history load/store coalesce to ~3 DMAs/batch-item. Decode is byte-identical to
+# the default layout; the buffer is converted once before the decode loop.
+USE_DN_TILED_CONV = os.environ.get("DN_TILED_CONV", "0") == "1"
+_DN_TILED_PMAX = 128
+if USE_DN_TILED_CONV and not (USE_DN_NKI and os.environ.get("DNBATCHED_V2", "0") == "1"):
+    raise RuntimeError("DN_TILED_CONV=1 requires DN_NKI=1 and DNBATCHED_V2=1")
+
+
+def _conv_cm_to_tiled(cs):
+    """[NUM_DN, B, qkv_dim, 3] channel-major -> [NUM_DN, B, PMAX, NT, 3] tiled
+    (channel = t*PMAX + p), matching the DN_TILED_CONV kernel contract."""
+    nd, b, qkv, k = cs.shape
+    nt = qkv // _DN_TILED_PMAX
+    return cs.reshape(nd, b, nt, _DN_TILED_PMAX, k).permute(0, 1, 3, 2, 4).contiguous()
+
+
 if USE_DN_NKI:
     import deltanet_full_batched_35b_ops  # registers torch.ops.deltanet35b.full_batched
 
@@ -896,15 +915,25 @@ class StaticDecode35B(nn.Module):
             else:
                 state_in = dn_states[di].reshape(B * VH * KD, VD).float()
             qkv_in = mixed_qkv.to(torch.bfloat16).reshape(B * qkv_dim)   # [B*qkv_dim]
-            conv_in = cv_states[di].reshape(B * qkv_dim, D.DN_CONV_KERNEL - 1)
+            if USE_DN_TILED_CONV:
+                _nt = qkv_dim // _DN_TILED_PMAX
+                conv_in = cv_states[di].reshape(B * _DN_TILED_PMAX, _nt * (D.DN_CONV_KERNEL - 1))
+            else:
+                conv_in = cv_states[di].reshape(B * qkv_dim, D.DN_CONV_KERNEL - 1)
             a_in = a_out.reshape(B * VH)
             b_in = b_out.reshape(B * VH)
             z_in = z.to(torch.bfloat16).reshape(B * VH, VD)
             if USE_DN_DIRECT_STATE_OUT:
                 state_out = dn_states_out[di].reshape(B * VH * KD, VD)
-                conv_out = cv_states_out[di].reshape(
-                    B * qkv_dim, D.DN_CONV_KERNEL - 1
-                )
+                if USE_DN_TILED_CONV:
+                    _nt = qkv_dim // _DN_TILED_PMAX
+                    conv_out = cv_states_out[di].reshape(
+                        B * _DN_TILED_PMAX, _nt * (D.DN_CONV_KERNEL - 1)
+                    )
+                else:
+                    conv_out = cv_states_out[di].reshape(
+                        B * qkv_dim, D.DN_CONV_KERNEL - 1
+                    )
                 _, _, attn_flat = torch.ops.deltanet35b.full_batched_direct(
                     state_in, qkv_in, conv_in, conv_w2, cb,
                     a_in, b_in, z_in, A_log, dt_bias, norm_w.float(),
@@ -916,9 +945,15 @@ class StaticDecode35B(nn.Module):
                     a_in, b_in, z_in, A_log, dt_bias, norm_w.float(),
                 )
                 dn_states[di] = new_state.reshape(B, VH * KD, VD).to(dn_states.dtype)
-                cv_states[di] = new_cs.reshape(
-                    B, qkv_dim, D.DN_CONV_KERNEL - 1
-                ).to(cv_states.dtype)
+                if USE_DN_TILED_CONV:
+                    _nt = qkv_dim // _DN_TILED_PMAX
+                    cv_states[di] = new_cs.reshape(
+                        B, _DN_TILED_PMAX, _nt, D.DN_CONV_KERNEL - 1
+                    ).to(cv_states.dtype)
+                else:
+                    cv_states[di] = new_cs.reshape(
+                        B, qkv_dim, D.DN_CONV_KERNEL - 1
+                    ).to(cv_states.dtype)
             gated = attn_flat.reshape(B, VH * VD)                        # already gated
             out = self._lin(f"l{i}_dn_out", gated)
             out = functional_all_reduce(out, "sum", self.tp_group)
@@ -1903,6 +1938,12 @@ def main():
         next_id = torch.full((B,), 100, dtype=torch.long, device=device)
         position = torch.tensor(0, dtype=torch.long, device=device)
         gen.append(next_id)
+
+    # DN_TILED_CONV: convert conv_states to tile-partition-major ONCE before any
+    # decode step (works for the from-zeros bench and post-prefill). Decode then
+    # reads/writes it tiled; generated tokens are identical to channel-major.
+    if USE_DN_TILED_CONV:
+        conv_states = _conv_cm_to_tiled(conv_states)
 
     # ── PROFILE_STEPS: minimal isolated decode trace for neuron-explorer ──
     # When set, run 3 warmup + PROFILE_STEPS constant-(token,pos) decode steps
