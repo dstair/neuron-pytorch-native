@@ -49,6 +49,21 @@ QKV_DIM = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM  # 2048
 CONV_KERNEL = 4
 RMS_EPS = 1e-6
 
+# Tiled conv-state DMA coalescing (DN_TILED_CONV=1). conv_state /
+# new_conv_state are stored TILE-PARTITION-MAJOR as
+# [B*PMAX, NUM_QKV_TILES*(CONV_KERNEL-1)] (logically [B, PMAX, NUM_QKV_TILES, 3]),
+# where element [b, p, t, j] holds conv-history tap j of channel (t*PMAX + p).
+# That is the SAME channel<->(tile,partition) mapping the head loop and the
+# hoisted conv weights already use, so qkv_act ordering and ALL downstream
+# compute are byte-for-byte unchanged. The payoff: one batch item's entire 3-tap
+# history is 48 contiguous free elems per partition, so the sliding-window load
+# and store are ONE DMA each instead of NUM_QKV_TILES=16 small strided [128,3]
+# transfers — cutting conv-state DMAs from ~48 to ~18 per (batch, layer). Biggest
+# win at high batch (the BS=128 FP8 decode regime). Equivalent math to default.
+USE_TILED_CONV = _os.environ.get("DN_TILED_CONV", "0") == "1"
+_PMAX = 128
+_NT = QKV_DIM // _PMAX  # conv tiles per batch item (16 at TP=4)
+
 
 @nki.jit
 def nki_deltanet_full_batched(
@@ -74,7 +89,11 @@ def nki_deltanet_full_batched(
     else:
         new_state = state_out
     if conv_state_out is None:
-        new_conv_state = nl.ndarray((B * QKV_DIM, 3), dtype=conv_state.dtype, buffer=nl.shared_hbm)
+        if USE_TILED_CONV:
+            new_conv_state = nl.ndarray(
+                (B * _PMAX, _NT * (CONV_KERNEL - 1)), dtype=conv_state.dtype, buffer=nl.shared_hbm)
+        else:
+            new_conv_state = nl.ndarray((B * QKV_DIM, 3), dtype=conv_state.dtype, buffer=nl.shared_hbm)
     else:
         new_conv_state = conv_state_out
     output = nl.ndarray((B * V_HEADS, V_DIM), dtype=z.dtype, buffer=nl.shared_hbm)
@@ -128,6 +147,15 @@ def nki_deltanet_full_batched(
         nisa.dma_copy(dst=cw_all[0:PMAX, t, 0:CONV_KERNEL], src=conv_weight[cw_ch:cw_ch + PMAX, 0:CONV_KERNEL])
         nisa.dma_copy(dst=cb_all[0:PMAX, t:t + 1], src=conv_bias[cw_ch:cw_ch + PMAX])
 
+    # Tile-partition-major views for the coalesced conv-state DMA path.
+    if USE_TILED_CONV:
+        conv_state_t = conv_state.reshape((B, _PMAX, _NT, CONV_KERNEL - 1))
+        new_conv_state_t = new_conv_state.reshape((B, _PMAX, _NT, CONV_KERNEL - 1))
+        # channel-contiguous mixed_qkv viewed as [B, NT, PMAX]: element [b,t,p] is
+        # channel (t*PMAX+p), so a contiguous per-b load + one nc_transpose yields
+        # the [PMAX, NT] tile the conv wants (one DMA vs NUM_QKV_TILES small ones).
+        mixed_qkv_t = mixed_qkv.reshape((B, _NT, _PMAX))
+
     # =========================================================================
     # BATCH LOOP — independent per b, so affine_range (pipelined).
     # =========================================================================
@@ -148,33 +176,75 @@ def nki_deltanet_full_batched(
         zb_p = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=zb_p, value=0.0)
 
-        for t in nl.affine_range(NUM_QKV_TILES):
-            ch = qkv_base + t * PMAX
+        if USE_TILED_CONV:
+            # Fully-coalesced conv-state I/O: ~3 DMAs per (batch item) total instead
+            # of the default 3*NUM_QKV_TILES. (1) whole 3-tap history in ONE
+            # contiguous DMA; (2) the new sample mixed_qkv[b] in ONE contiguous DMA
+            # as [NT, PMAX] + one nc_transpose -> [PMAX, NT] (mq[p,t]=channel
+            # t*PMAX+p); (3) shifted history [hist1, hist2, mq] back in ONE DMA.
+            # Conv+SiLU vectorised over all tiles. qkv_act[p,t]=channel t*PMAX+p,
+            # matching the default path (equivalent math, tolerance-level fp diff
+            # from the 3+1 reduce split).
+            hist = nl.ndarray((PMAX, NUM_QKV_TILES, CONV_KERNEL - 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=hist[0:PMAX, 0:NUM_QKV_TILES, 0:3],
+                src=conv_state_t[b, 0:PMAX, 0:NUM_QKV_TILES, 0:3],
+            )
+            mq_raw = nl.ndarray((NUM_QKV_TILES, PMAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=mq_raw[0:NUM_QKV_TILES, 0:PMAX], src=mixed_qkv_t[b, 0:NUM_QKV_TILES, 0:PMAX])
+            mq_p = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(dst=mq_p, data=mq_raw[0:NUM_QKV_TILES, 0:PMAX])
+            mq = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=mq, src=mq_p)
 
-            # Load conv_state (3 cols) + mixed_qkv (1 col) straight into one f32
-            # conv_in tile via DMA (no separate bf16 staging + copy-activations).
-            conv_in = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=conv_in[0:PMAX, 0:3], src=conv_state[ch:ch + PMAX, 0:3])
-            nisa.dma_copy(dst=conv_in[0:PMAX, 3:4], src=mixed_qkv[ch:ch + PMAX])
-
-            # Write back updated conv_state (drop oldest column) — direct DMA from
-            # the shifted conv_in slice (no copy-activation staging).
-            nisa.dma_copy(dst=new_conv_state[ch:ch + PMAX, 0:3], src=conv_in[0:PMAX, 1:4])
-
-            # conv_weight / conv_bias read from hoisted SBUF tiles (no per-(b,t) DMA).
-            prod = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=prod, data1=conv_in, data2=cw_all[0:PMAX, t, 0:CONV_KERNEL], op=nl.multiply)
-
-            conv_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(
-                dst=prod, op=nl.copy, data=prod, bias=zb_p, scale=1.0,
-                reduce_op=nl.add, reduce_res=conv_sum,
-                reduce_cmd=nisa.reduce_cmd.reset_reduce,
+            # Writeback shifted history [hist[:,:,1], hist[:,:,2], mq] in ONE DMA.
+            new_hist = nl.ndarray((PMAX, NUM_QKV_TILES, CONV_KERNEL - 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=new_hist[0:PMAX, 0:NUM_QKV_TILES, 0:2], src=hist[0:PMAX, 0:NUM_QKV_TILES, 1:3])
+            nisa.tensor_copy(dst=new_hist[0:PMAX, 0:NUM_QKV_TILES, 2], src=mq[0:PMAX, 0:NUM_QKV_TILES])
+            nisa.dma_copy(
+                dst=new_conv_state_t[b, 0:PMAX, 0:NUM_QKV_TILES, 0:3],
+                src=new_hist[0:PMAX, 0:NUM_QKV_TILES, 0:3],
             )
 
-            act = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(dst=act, op=nl.silu, data=conv_sum, bias=cb_all[0:PMAX, t:t + 1], scale=1.0)
-            nisa.tensor_copy(dst=qkv_act[0:PMAX, t:t + 1], src=act)
+            # conv = sum_{tap<3} hist*cw[tap] + mq*cw[3]
+            prod3 = nl.ndarray((PMAX, NUM_QKV_TILES, CONV_KERNEL - 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=prod3, data1=hist, data2=cw_all[0:PMAX, 0:NUM_QKV_TILES, 0:3], op=nl.multiply)
+            conv_sum = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=conv_sum, op=nl.add, data=prod3, axis=2)
+            mq_contrib = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=mq_contrib, data1=mq, data2=cw_all[0:PMAX, 0:NUM_QKV_TILES, 3], op=nl.multiply)
+            nisa.tensor_tensor(dst=conv_sum, data1=conv_sum, data2=mq_contrib, op=nl.add)
+            conv_biased = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=conv_biased, data1=conv_sum, data2=cb_all, op=nl.add)
+            nisa.activation(dst=qkv_act, op=nl.silu, data=conv_biased, bias=zb_p, scale=1.0)
+        else:
+            for t in nl.affine_range(NUM_QKV_TILES):
+                ch = qkv_base + t * PMAX
+
+                # Load conv_state (3 cols) + mixed_qkv (1 col) straight into one f32
+                # conv_in tile via DMA (no separate bf16 staging + copy-activations).
+                conv_in = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=conv_in[0:PMAX, 0:3], src=conv_state[ch:ch + PMAX, 0:3])
+                nisa.dma_copy(dst=conv_in[0:PMAX, 3:4], src=mixed_qkv[ch:ch + PMAX])
+
+                # Write back updated conv_state (drop oldest column) — direct DMA from
+                # the shifted conv_in slice (no copy-activation staging).
+                nisa.dma_copy(dst=new_conv_state[ch:ch + PMAX, 0:3], src=conv_in[0:PMAX, 1:4])
+
+                # conv_weight / conv_bias read from hoisted SBUF tiles (no per-(b,t) DMA).
+                prod = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=prod, data1=conv_in, data2=cw_all[0:PMAX, t, 0:CONV_KERNEL], op=nl.multiply)
+
+                conv_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(
+                    dst=prod, op=nl.copy, data=prod, bias=zb_p, scale=1.0,
+                    reduce_op=nl.add, reduce_res=conv_sum,
+                    reduce_cmd=nisa.reduce_cmd.reset_reduce,
+                )
+
+                act = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=act, op=nl.silu, data=conv_sum, bias=cb_all[0:PMAX, t:t + 1], scale=1.0)
+                nisa.tensor_copy(dst=qkv_act[0:PMAX, t:t + 1], src=act)
 
         # ---------------------------------------------------------------------
         # silu(z) for this b -> HBM scratch slice [head_base:head_base+V_HEADS]
