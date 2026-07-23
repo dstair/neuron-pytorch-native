@@ -232,7 +232,7 @@ export QWEN35_FP8_LAYER_LIMIT="$fp8_layer_limit"
 export QWEN35_RESIDUAL="$residual"
 export QWEN35_DIRECT_STATE_OUTPUT="$direct_state_output"
 export QWEN35_COMPILE_CONCURRENCY="$compile_concurrency"
-export NEURON_CC_FLAGS="--target trn2 --lnc 1"
+export NEURON_CC_FLAGS="${QWEN35_XC_NEURON_CC_FLAGS:---target trn2 --lnc 1}"
 export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
 
 metadata="$cache_dir/qwen35_compile_metadata.env"
@@ -270,11 +270,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Harness MUST be test_decode_fullgraph_device.py, NOT static_decode_35b.py.
+# On the cross-compile host the trn2 NEFF cannot execute; test_decode catches the
+# expected "Invalid NEFF" load error AFTER the fullgraph NEFF is compiled+persisted,
+# writes rank markers, and exits cleanly -> the NEFF survives. static_decode instead
+# HANGS at execute and is SIGTERM'd before the persistent-cache write finalizes, so
+# only tiny NKI-kernel NEFFs land (fullgraph lost). See deploy/profile/README-profile-neff.md.
 docker run -d --name "$container_name" --privileged --network host --ipc host \
   -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
   -e LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so \
   -e QWEN35_CACHE_PLATFORM_TARGET=trn2 \
   -e NEURON_LOGICAL_NC_CONFIG=1 \
+  -e NEURON_COMPILE_CACHE_URL=/tmp/ccache \
   -e NEURON_CC_FLAGS="$NEURON_CC_FLAGS" \
   -e NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
   -e CROSS_TARGET_COMPILE_ONLY=1 \
@@ -286,6 +293,7 @@ docker run -d --name "$container_name" --privileged --network host --ipc host \
   -e DN_NKI=1 -e DNBATCHED_V2=1 \
   -e "DN_DIRECT_STATE_OUT=$direct_state_output_value" \
   -e "DN_WIDE_CONV=${DN_WIDE_CONV:-0}" \
+  -e "DN_TILED_CONV=${DN_TILED_CONV:-0}" \
   -e GQATAIL=1 -e GQA_STATEFUL_KV=1 \
   -e "XLA_IR_DEBUG=${XLA_IR_DEBUG:-0}" \
   -e "XLA_HLO_DEBUG=${XLA_HLO_DEBUG:-0}" \
@@ -307,12 +315,11 @@ docker run -d --name "$container_name" --privileged --network host --ipc host \
     torchrun --nproc-per-node=8 --max-restarts=0 \
       --log-dir '$rank_log_dir' --redirects=3 --tee=3 \
       kernels/tests/test_decode_fullgraph_device.py \
-      --mode sharded --output-dir /tmp/cross-output \
+      --mode sharded --world-size 8 --output-dir /tmp/cross-output \
       --model-path /models/Qwen3.5-35B-A3B \
       --expert-model-path /models/Qwen3.5-35B-A3B-FP8 \
       --num-layers '$layers' --batch-size '$batch_size' \
-      --max-seq-len 256 --capture-steps 1 \
-      ${diagnostic_args[*]}
+      --max-seq-len 256 --capture-steps 1 || true
   " >/dev/null
 
 while [[ "$(docker inspect --format '{{.State.Running}}' "$container_name" 2>/dev/null || true)" == "true" ]]; do
