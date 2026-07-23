@@ -529,6 +529,41 @@ def _tri_inverse_doubling(T, eye, C, span):
     return A
 
 
+def _tri_inverse_blockdiag(A_str, eye, C, half):
+    """Stable (I-A_str)^-1 for a C=32 strict-lower A_str.
+
+    The full-C doubling squares A_str up to A_str^16; when the real-model decay
+    pushes A_str entries toward 1 (deep context) those squarings amplify FP32
+    rounding and the carried recurrent state overflows a few chunks later (seen
+    at layer 18: v'=k_cumdecay@state hits ~3.2e38). Forward substitution is
+    stable but needs cross-partition row writes on device.
+
+    Split A_str = D + X with D block-diagonal (the two 16x16 diagonal blocks) and
+    X the strictly-lower-left 16x16 block. Doubling on D keeps every power
+    block-diagonal (only 16-wide squarings, exactly the depth the C16 path already
+    uses successfully), so it is stable. X @ X = 0, hence
+        (I - A_str)^-1 = (I-D)^-1 + (I-D)^-1 X (I-D)^-1 .
+    All ops are full CxC tiles, so no partition-offset matmul assembly is needed.
+    Tiles are minimized (A_str is reused in-place as D; the output reuses Binv) to
+    stay within the C=32 SBUF budget; `no_reorder` serializes the phases so the
+    allocator does not co-place the inverse tiles with the live q/k/v tiles."""
+    with nl.no_reorder():
+        # X = only the lower-left block of A_str (src/dst share partition base=half).
+        X = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=X, value=0.0)
+        nisa.tensor_copy(dst=X[half:C, 0:half], src=A_str[half:C, 0:half])
+        # Reuse A_str as D: zero its lower-left block so it becomes block-diagonal.
+        nisa.memset(dst=A_str[half:C, 0:half], value=0.0)
+        # Binv = (I-D)^-1 via doubling on the block-diagonal part (stable).
+        Binv = _tri_inverse_doubling(A_str, eye, C, C)
+        # coupling = Binv @ X @ Binv  (X@X=0 truncates the Neumann series exactly).
+        XBinv = _mm(_T(X, C, C), Binv, C, C)
+        coupling = _mm(_T(Binv, C, C), XBinv, C, C)
+        # A = Binv + coupling, written back into Binv's storage.
+        nisa.tensor_tensor(dst=Binv, data1=Binv, data2=coupling, op=nl.add)
+    return Binv
+
+
 def _tri_inverse_doubling_to(T, eye, dst, span, sbm):
     """Build a C16 triangular inverse using scoped, reusable SBUF scratch."""
     sbm.open_scope(name="c32_inverse")
@@ -820,6 +855,16 @@ def _chunk(s, out, base, query, key, value, g, beta,
         nisa.tensor_tensor(dst=A_str, data1=kk, data2=dm, op=nl.multiply)
         nisa.tensor_scalar(dst=A_str, data=A_str, op0=nl.multiply, operand0=-1.0)
         nisa.tensor_tensor(dst=A_str, data1=A_str, data2=m_strict, op=nl.multiply)
+        # NOTE (C=32 stability): full-32 doubling overflows on deep-context inputs
+        # (A_str entries near 1 -> the carried state blows up a few chunks later;
+        # root-caused at layer 18: v'=k_cumdecay@state ~3.2e38). The CPU-validated
+        # stable+exact fix is `_tri_inverse_blockdiag` (block-diagonal doubling +
+        # coupling), but calling it here currently fails C=32 SBUF allocation
+        # (a [32,32] tile cannot be co-placed with the live q/k/v [32,128] tiles).
+        # To land it, allocate its tiles via the scoped BufferManager / HBM-stage
+        # the blocks exactly like the STABLE_C32=1 path. Until then C=32 keeps the
+        # (numerically fragile) full doubling; C=16 is unaffected and is the
+        # validated production chunk size.
         A = _tri_inverse_doubling(A_str, eye, C, C)
         A_T = _T(A, C, C)
 
