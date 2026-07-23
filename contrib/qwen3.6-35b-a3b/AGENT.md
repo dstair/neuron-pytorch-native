@@ -334,13 +334,21 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   T = D(block-diag) + X(lower-left 16×16); double D (powers stay block-diagonal →
   only 16-wide squarings → stable); X@X=0 ⇒ (I-T)⁻¹ = (I-D)⁻¹ + (I-D)⁻¹X(I-D)⁻¹.
   Finite on the rank2 reproducer, cosine 1.0 vs forward-sub. **BLOCKED landing it:**
-  wiring into the C=32 `_chunk` else-path fails C=32 SBUF allocation-scheduling (a
-  [32,32] tile can't co-place with live q/k/v [32,128] tiles); tile-reuse +
-  `no_reorder` didn't clear it. Land via `BufferManager` scoping / HBM-stage the
-  block inverse like STABLE_C32=1. Validate on the rank2 reproducer
-  (`capture-c32s0-bs2-l18c10`), then compiled bs2 finite fingerprint + real-prompt
-  coherence (also make `replay_dn_capture.py` BATCH-AWARE — bs1-shaped today).
-  Prize confirmed: +14.7% (2407.9 tok/s). Debug hook: `PREFILL_TRACE_LAYER=1`.
+  wiring into the C=32 `_chunk` else-path fails C=32 SBUF placement
+  (`SB<0,0>(32x128)`). Tried plain, tile-reuse, `no_reorder`, AND scoped
+  `BufferManager`+`_c32_tile`+`_tri_inverse_doubling_to` — all fail because the
+  light STABLE_C32=0 path keeps too many live `[C,128]` tiles (v_c, k_c, qS) across
+  the inverse and the scoped stack (base 0) collides with them (deferring v_beta
+  past the inverse helped but wasn't enough). So landing it needs **STABLE_C32=1-
+  style HBM staging of k_c/qS/v_c before the inverse** (c32_key_scratch/
+  c32_q_scratch), then call `_tri_inverse_blockdiag` — a light-path refactor, not a
+  self-contained inverse swap. (Alternative: fix STABLE_C32=1's inverse — it has the
+  staging — but its 40L compile OOMs trn2's 124 GB.) Validate on the rank2
+  reproducer (`capture-c32s0-bs2-l18c10`), then compiled bs2 finite fingerprint +
+  real-prompt coherence (also make `replay_dn_capture.py` BATCH-AWARE — bs1-shaped
+  today). `_tri_inverse_blockdiag` (scoped) is committed as the reference impl;
+  v_beta deferral kept. Prize confirmed: +14.7% (2407.9 tok/s). Hook:
+  `PREFILL_TRACE_LAYER=1`.
 - **Prefill optlevel: O1 is the only tractable level; O2/O3 are compile-cost-
   prohibitive (2026-07-23).** `deploy/compile_prefill_trn2.sh --optlevel` selects
   the neuronx-cc level (the framework injects a default `-O2`; the appended
