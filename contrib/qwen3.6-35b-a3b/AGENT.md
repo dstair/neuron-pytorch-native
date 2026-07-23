@@ -299,6 +299,40 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   from roughly 1.0 error to 1.2e-4, but its first Trn2 compile hit an SBUF
   allocation/scheduling conflict involving a `32x128` tile. Resolve allocation,
   then require all-rank capture replay before a full 20k benchmark.
+- **`DN_STABLE_C32=1` fixes C32's SBUF+finiteness but NOT its deep-context
+  numerics (2026-07-23).** The in-tree `STABLE_C32` path moves the C32 block-solve
+  scratch to `nl.shared_hbm` (`deltanet_chunked_prefill_35b.py`), resolving the
+  `32x128` SBUF conflict — a 4-layer smoke compiles clean, and eager 40L/20k C32
+  stays FINITE through every layer/bucket (old C32 went NaN at L18/b21). It is
+  still WRONG: an all-rank capture replay at layer 18 / offset ~12288 gave 3/4
+  ranks non-finite and rank 3 cosine=0 / max_diff=3.4e35 vs the CPU stable solve,
+  while a matched C16 replay was cosine≈1 / ~1e-7 on all ranks (harness is sound).
+  RMSNorm masks the blown-up raw output, so the eager final top5 looked ≈C16 — do
+  NOT trust eager finiteness/top5 for C32. C32 needs a genuinely deep-context-stable
+  chunk-32 inverse, not just an allocation fix. STABLE_C32 is also ~2× slower eager
+  than C16 (49187 vs 24576 ms, bs1) and its 40L compile OOMs trn2's 124 GB.
+- **Prefill optlevel: O1 is the only tractable level; O2/O3 are compile-cost-
+  prohibitive (2026-07-23).** `deploy/compile_prefill_trn2.sh --optlevel` selects
+  the neuronx-cc level (the framework injects a default `-O2`; the appended
+  `--optlevel N` wins). On the TP=4/LNC=2 CTE prefill graph, O1 compiles all four
+  10-layer segments in ~24 min, but O2's walrus backend ran >51 min on a *single*
+  segment (0 NEFFs) and climbed toward host-OOM — abort it. O1 (=2089.7/2098.7)
+  stands. Scratchpad page-size 128 MiB is neutral (bit-identical fingerprint), so
+  the graph is not scratchpad-bound.
+- **Compile TP=4/LNC=2 prefill NATIVELY on trn2, never cross-compiled on trn1
+  (2026-07-23).** The `compile_prefill_trn2.sh` trn1 cross-compile path only works
+  for TP=8/**LNC=1**; a TP=4/LNC=2 invocation dies in ~40s at
+  `dist.init_process_group(backend="neuron")` because LNC=2 is a Trn2-only
+  logical-NeuronCore config that trn1 hardware cannot bring up (the harness inits
+  the physical device before compiling, even under the cross-target shim). Compile
+  it natively on trn2 (124 GB fits the 4×10 CTE compile with ~11 GB swap).
+- **FP8 CTE prefill lever (scoped 2026-07-23).** To make TP=8/LNC=1 40L prefill
+  loadable (weight-bound OOM at 12–13 GB/core) the experts must be resident FP8 and
+  dequantized in-kernel; `MOE_CTE` is BF16-only today. nkilib `moe_cte`
+  @`1ee625782` ships an MX (block-scaled FP8) variant (`bwmm_shard_on_{I,block}_mx`,
+  `gate_up_projection_mx`, `down_projection_mx`, `moe_cte_mx_utils`) = the natural
+  integration point, but MX microscaling (E8M0) ≠ the official 128×128 E4M3FN
+  scaling, so it needs a scale bridge + an all-rank 20k gate.
 - **Split compiled prefill into coarse 10-layer NEFFs.** A monolithic 20-layer
   CTE graph generated 5,440,131 instructions and failed the compiler's 5,000,000
   limit. `--prefill-splits 2` compiled and loaded two 10-layer segments; use
