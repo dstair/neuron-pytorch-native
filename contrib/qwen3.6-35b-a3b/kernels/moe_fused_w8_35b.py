@@ -436,30 +436,11 @@ def _moe_fused_w8_block_coalesced(
             buffer=nl.sbuf,
         ),
     ]
-    gate_psums = [
-        nl.ndarray(
-            (TILE, COALESCED_WIDTH),
-            dtype=nl.float32,
-            buffer=nl.psum,
-        ),
-        nl.ndarray(
-            (TILE, COALESCED_WIDTH),
-            dtype=nl.float32,
-            buffer=nl.psum,
-        ),
-    ]
-    up_psums = [
-        nl.ndarray(
-            (TILE, COALESCED_WIDTH),
-            dtype=nl.float32,
-            buffer=nl.psum,
-        ),
-        nl.ndarray(
-            (TILE, COALESCED_WIDTH),
-            dtype=nl.float32,
-            buffer=nl.psum,
-        ),
-    ]
+    # PSUMs are allocated FRESH per input_group (in the loops below) instead of
+    # reused rotating slots: a matmul into a fresh nl.psum ndarray overwrites
+    # (starts the accumulation group), so no per-iteration memset is needed —
+    # matching _gate_or_up_projection. (Reused slots require zeroing because the
+    # matmul continues-accumulates onto stale data; confirmed by iso test.)
 
     for expert in nl.sequential_range(experts):
         gate_scale_table = _load_coalesced_scale_table(
@@ -503,9 +484,12 @@ def _moe_fused_w8_block_coalesced(
 
         gate_groups = hidden_tiles // column_packing
         for input_group in range(gate_groups):
-            psum_slot = input_group % 2
-            nisa.memset(dst=gate_psums[psum_slot], value=0.0)
-            nisa.memset(dst=up_psums[psum_slot], value=0.0)
+            gate_psum = nl.ndarray(
+                (TILE, COALESCED_WIDTH), dtype=nl.float32, buffer=nl.psum
+            )
+            up_psum = nl.ndarray(
+                (TILE, COALESCED_WIDTH), dtype=nl.float32, buffer=nl.psum
+            )
             for packed_index in range(column_packing):
                 input_tile = (
                     input_group * column_packing + packed_index
@@ -526,7 +510,7 @@ def _moe_fused_w8_block_coalesced(
                     nl.float8_e4m3
                 )
                 nisa.nc_matmul(
-                    dst=gate_psums[psum_slot][
+                    dst=gate_psum[
                         nl.ds(packed_row, tokens), :
                     ],
                     stationary=hidden_sb[:, input_tile, :],
@@ -535,7 +519,7 @@ def _moe_fused_w8_block_coalesced(
                     tile_size=(TILE, tokens),
                 )
                 nisa.nc_matmul(
-                    dst=up_psums[psum_slot][
+                    dst=up_psum[
                         nl.ds(packed_row, tokens), :
                     ],
                     stationary=hidden_sb[:, input_tile, :],
@@ -552,7 +536,7 @@ def _moe_fused_w8_block_coalesced(
                 nisa.activation(
                     dst=partial,
                     op=nl.copy,
-                    data=gate_psums[psum_slot][
+                    data=gate_psum[
                         nl.ds(packed_row, tokens), :
                     ],
                     scale=1.0,
@@ -583,7 +567,7 @@ def _moe_fused_w8_block_coalesced(
                 nisa.activation(
                     dst=partial,
                     op=nl.copy,
-                    data=up_psums[psum_slot][
+                    data=up_psum[
                         nl.ds(packed_row, tokens), :
                     ],
                     scale=1.0,
@@ -673,8 +657,9 @@ def _moe_fused_w8_block_coalesced(
         for hidden_slab in nl.affine_range(hidden_slabs):
             hidden_start = hidden_slab * COALESCED_WIDTH
             for input_group in range(down_groups):
-                psum_slot = input_group % 2
-                nisa.memset(dst=gate_psums[psum_slot], value=0.0)
+                down_psum = nl.ndarray(
+                    (TILE, COALESCED_WIDTH), dtype=nl.float32, buffer=nl.psum
+                )
                 for packed_index in range(column_packing):
                     intermediate_tile = (
                         input_group * column_packing + packed_index
@@ -694,7 +679,7 @@ def _moe_fused_w8_block_coalesced(
                         :, 0, :
                     ].view(nl.float8_e4m3)
                     nisa.nc_matmul(
-                        dst=gate_psums[psum_slot][
+                        dst=down_psum[
                             nl.ds(packed_row, tokens), :
                         ],
                         stationary=activated[
@@ -713,7 +698,7 @@ def _moe_fused_w8_block_coalesced(
                     nisa.activation(
                         dst=partial,
                         op=nl.copy,
-                        data=gate_psums[psum_slot][
+                        data=down_psum[
                             nl.ds(packed_row, tokens), :
                         ],
                         scale=1.0,
