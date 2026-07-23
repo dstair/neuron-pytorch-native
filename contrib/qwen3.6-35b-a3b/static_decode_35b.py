@@ -2066,6 +2066,21 @@ class StaticDecode35B(nn.Module):
     ):
         """Run one fixed layer range for a prompt chunk."""
         chunk = hidden.shape[1]
+        trace_layer = os.environ.get("PREFILL_TRACE_LAYER", "0") == "1"
+
+        def _lt(tag, i, t):
+            if not trace_layer or self.rank != 0:
+                return
+            h = t.detach().cpu().float()
+            fin = torch.isfinite(h)
+            mx = float(h[fin].abs().max()) if bool(fin.any()) else float("nan")
+            print(
+                f"  LAYER finite chunk={getattr(self, '_prefill_chunk_index', -1)}"
+                f" layer={i} type={D.layer_type(i)} {tag}:"
+                f" finite={bool(fin.all())}/max={mx:.4e}",
+                flush=True,
+            )
+
         for i in range(start, end):
             normed = rms_norm(hidden, getattr(self, f"l{i}_input_norm"))
             if D.layer_type(i) == "deltanet":
@@ -2075,8 +2090,10 @@ class StaticDecode35B(nn.Module):
                 )
             else:
                 hidden = hidden + self._gqa_prefill_chunk(i, normed, q_base, chunk, kv_k, kv_v)
+            _lt("attn", i, hidden)
             normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
             hidden = hidden + self._moe(i, normed)
+            _lt("moe", i, hidden)
         return hidden
 
     def _prefill_chunk_layers(

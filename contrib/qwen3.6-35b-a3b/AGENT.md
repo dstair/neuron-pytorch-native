@@ -321,11 +321,19 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   (32-partition tiles, depth-5 doubling) at 16 streams; the device kernel output at
   L0 bs2 is finite so it originates at a later layer (1-9) at deep context.
   Since the reference is benign everywhere, it's an implementation bug, not
-  numerics. To finish: bisect layers 1-9 at chunk≥10 in eager bs2 (per-layer
-  capture + PREFILL_TRACE_FINITE), replay vs a BATCH-AWARE reference (extend
-  `replay_dn_capture.py` to 16 streams), and suspect SBUF alloc / partition
-  alignment for 32-wide tiles across 16 streams. Gate any C32 win on a batch-aware
-  all-rank replay (cosine≈1) + real-prompt coherence — never eager finiteness.
+  numerics. ROOT-CAUSED: the bs2 NaN is at **layer 18 / chunk 10 / DeltaNet attn**
+  (a NaN, max~1.9, not overflow). CPU drill of that exact captured input (both
+  forward-sub AND doubling inverse, all 16 streams, fp32) is fully finite, and an
+  ISOLATED device replay of the same capture is also finite — yet the full eager
+  bs2 run NaNs there. Same kernel + same input → NaN in full run but finite alone
+  ⇒ a **context-dependent uninitialized / leftover-SBUF read** in the C=32
+  (32-partition) `_chunk` else-path, benign at bs1/in isolation but poisoned by the
+  preceding 17 layers' SBUF state at bs2. FIX: add defensive `nisa.memset(0)` to the
+  C32 working tiles (or find the specific read-before-write / PSUM-accum tile),
+  re-run eager bs2 (NaN should vanish). Also make `replay_dn_capture.py` BATCH-AWARE
+  (16 streams; it's bs1-shaped today). Gate any C32 win on batch-aware all-rank
+  replay (cosine≈1) + compiled finite fingerprint + real-prompt coherence — never
+  eager finiteness. Prize confirmed: +14.7% (2407.9 tok/s).
 - **Prefill optlevel: O1 is the only tractable level; O2/O3 are compile-cost-
   prohibitive (2026-07-23).** `deploy/compile_prefill_trn2.sh --optlevel` selects
   the neuronx-cc level (the framework injects a default `-O2`; the appended
