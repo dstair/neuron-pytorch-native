@@ -31,11 +31,13 @@ Options:
                    Torch NeuronX cache identity: trn1 or trn2 (default: trn2)
   --scratchpad-page-size-mb MIB
                    Compiler/runtime HBM scratchpad page size in MiB (default: 64)
+  --optlevel N     neuronx-cc optimization level: 1, 2, or 3 (default: 1)
   --cache-dir DIR  Complete host directory mounted at container /tmp
   --log-name NAME  Compile-log basename (default derived from shape)
 
 The supported topology pairs are TP=8/LNC=1 and TP=4/LNC=2. The target is
-always Trn2 and optlevel 1. The cache-platform target affects only Torch
+always Trn2; optlevel defaults to 1 and is selectable with --optlevel. The
+cache-platform target affects only Torch
 NeuronX's persistent-cache key. Use trn2 for a portable cross-compile on Trn1;
 use trn1 only to replay a legacy cache whose keys were generated on Trn1.
 The overall command may fail after compilation on Trn1 because a Trn2 NEFF
@@ -50,6 +52,7 @@ tp=8
 lnc=1
 cache_platform_target="${QWEN35_CACHE_PLATFORM_TARGET:-trn2}"
 scratchpad_page_size_mb="${QWEN35_SCRATCHPAD_PAGE_SIZE_MB:-64}"
+optlevel="${QWEN35_OPTLEVEL:-1}"
 cache_dir="${QWEN35_COMPILER_CACHE_DIR:-}"
 log_name=""
 
@@ -62,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --lnc) lnc="${2:-}"; shift 2 ;;
     --cache-platform-target) cache_platform_target="${2:-}"; shift 2 ;;
     --scratchpad-page-size-mb) scratchpad_page_size_mb="${2:-}"; shift 2 ;;
+    --optlevel) optlevel="${2:-}"; shift 2 ;;
     --cache-dir) cache_dir="${2:-}"; shift 2 ;;
     --log-name) log_name="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -82,6 +86,8 @@ done
 [[ "$scratchpad_page_size_mb" =~ ^[1-9][0-9]*$ ]] &&
   (( scratchpad_page_size_mb < 4096 )) ||
   die "--scratchpad-page-size-mb must be an integer between 1 and 4095"
+[[ "$optlevel" == "1" || "$optlevel" == "2" || "$optlevel" == "3" ]] ||
+  die "--optlevel must be 1, 2, or 3"
 [[ -n "$cache_dir" ]] ||
   die "pass --cache-dir or set QWEN35_COMPILER_CACHE_DIR"
 [[ -n "${QWEN35_NATIVE_IMAGE:-}" ]] ||
@@ -101,7 +107,7 @@ cache_dir="$(mkdir -p "$cache_dir" && cd "$cache_dir" && pwd)"
 model_dir="$(cd "$QWEN35_MODEL_DIR" && pwd)"
 nkilib_dir="$(cd "$QWEN35_NKILIB_DIR" && pwd)"
 source_dir="$QWEN35_SOURCE_DIR"
-log_name="${log_name:-tp${tp}-lnc${lnc}-l${layers}-s${splits}-b${bucket}-o1}"
+log_name="${log_name:-tp${tp}-lnc${lnc}-l${layers}-s${splits}-b${bucket}-o${optlevel}}"
 log_dir="$cache_dir/compile_logs/$log_name"
 mkdir -p "$log_dir"
 
@@ -176,7 +182,7 @@ export QWEN35_BUCKET_CHUNK="$bucket"
 export QWEN35_PREFILL_SPLITS="$splits"
 export CHUNK_SIZE=16
 export MOE_CTE_BLOCK=512
-export NEURON_CC_FLAGS="--target trn2 --lnc $lnc --optlevel 1 --hbm-scratchpad-page-size $scratchpad_page_size_mb"
+export NEURON_CC_FLAGS="--target trn2 --lnc $lnc --optlevel $optlevel --hbm-scratchpad-page-size $scratchpad_page_size_mb"
 export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
 export QWEN35_PLATFORM_TARGET_SHIM_DEBUG="${QWEN35_PLATFORM_TARGET_SHIM_DEBUG:-0}"
 export QWEN35_COMPILE_HOST="${QWEN35_COMPILE_HOST:-$(hostname)}"
