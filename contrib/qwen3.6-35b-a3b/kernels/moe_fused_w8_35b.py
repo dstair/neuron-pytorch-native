@@ -342,8 +342,17 @@ def _moe_fused_w8_block_coalesced(
     gate_up_scales,
     down_scales,
     affinities,
+    coarse_scale=False,
 ):
     """Coalesced native-E4M3 MoE retaining exact 128x128 block scales.
+
+    ``coarse_scale`` (Reduction B1) requires the scale table to be
+    input-independent (one scale per 128-output-block, repeated across input
+    tiles — produced by moe_w8.requantize_official_fp8_output_block). It then
+    accumulates the whole contraction natively in PSUM and post-scales each
+    output block once, instead of the per-128x128-block Vector scale-adds. It is
+    ONLY correct on such coarse weights, so it defaults OFF: the standard
+    per-block path (block_pow2_coalesced) is unchanged.
 
     The ring-buffer and TensorE column-packing schedule is adapted from
     nki-library commit 7a5b6f9 (`moe_tkg/mlp_tkg_*_projection.py`).
@@ -483,7 +492,7 @@ def _moe_fused_w8_block_coalesced(
         )
 
         gate_groups = hidden_tiles // column_packing
-        if column_packing == 1:
+        if column_packing == 1 and coarse_scale:
             # Reduction B1: the coarse output-block scale is input-independent
             # (s[i,o] == s[o]), so sum_i(partial_i * s[o]) == s[o] * sum_i
             # partial_i. Accumulate the whole hidden contraction natively in
@@ -720,7 +729,7 @@ def _moe_fused_w8_block_coalesced(
         down_groups = intermediate_tiles // column_packing
         for hidden_slab in nl.affine_range(hidden_slabs):
             hidden_start = hidden_slab * COALESCED_WIDTH
-            if column_packing == 1:
+            if column_packing == 1 and coarse_scale:
                 # Reduction B1 (see gate/up): accumulate the intermediate
                 # contraction for this hidden slab natively in PSUM, then
                 # post-scale each 128-wide output block ONCE with s[o].
@@ -1276,6 +1285,27 @@ def nki_moe_fused_w8_fp8_block_coalesced(
         gate_up_scales,
         down_scales,
         affinities,
+    )
+
+
+@nki.jit
+def nki_moe_fused_w8_fp8_block_coalesced_ob(
+    hidden,
+    gate_up,
+    down,
+    gate_up_scales,
+    down_scales,
+    affinities,
+):
+    # Reduction B1: input-independent per-output-block scales, PSUM-accumulate.
+    return _moe_fused_w8_block_coalesced(
+        hidden,
+        gate_up,
+        down,
+        gate_up_scales,
+        down_scales,
+        affinities,
+        coarse_scale=True,
     )
 
 

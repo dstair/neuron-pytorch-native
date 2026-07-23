@@ -545,7 +545,9 @@ def main():
             "--drop-residual requires --mode fp8 --fp8-impl dual"
         )
     if args.mode == "fp8":
-        if args.fp8_impl in ("block_pow2_coalesced", "block_ob_coalesced"):
+        if args.fp8_impl == "block_ob_coalesced":
+            op = torch.ops.moe_w8.fused_fp8_block_coalesced_ob
+        elif args.fp8_impl == "block_pow2_coalesced":
             op = torch.ops.moe_w8.fused_fp8_block_coalesced
         elif args.fp8_impl == "block_pow2" or args.drop_residual:
             op = torch.ops.moe_w8.fused_fp8_native
