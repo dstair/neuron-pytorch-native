@@ -299,18 +299,33 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   from roughly 1.0 error to 1.2e-4, but its first Trn2 compile hit an SBUF
   allocation/scheduling conflict involving a `32x128` tile. Resolve allocation,
   then require all-rank capture replay before a full 20k benchmark.
-- **`DN_STABLE_C32=1` fixes C32's SBUF+finiteness but NOT its deep-context
-  numerics (2026-07-23).** The in-tree `STABLE_C32` path moves the C32 block-solve
-  scratch to `nl.shared_hbm` (`deltanet_chunked_prefill_35b.py`), resolving the
-  `32x128` SBUF conflict — a 4-layer smoke compiles clean, and eager 40L/20k C32
-  stays FINITE through every layer/bucket (old C32 went NaN at L18/b21). It is
-  still WRONG: an all-rank capture replay at layer 18 / offset ~12288 gave 3/4
-  ranks non-finite and rank 3 cosine=0 / max_diff=3.4e35 vs the CPU stable solve,
-  while a matched C16 replay was cosine≈1 / ~1e-7 on all ranks (harness is sound).
-  RMSNorm masks the blown-up raw output, so the eager final top5 looked ≈C16 — do
-  NOT trust eager finiteness/top5 for C32. C32 needs a genuinely deep-context-stable
-  chunk-32 inverse, not just an allocation fix. STABLE_C32 is also ~2× slower eager
-  than C16 (49187 vs 24576 ms, bs1) and its 40L compile OOMs trn2's 124 GB.
+- **C32 status (2026-07-23, updated): the math is correct; `DN_STABLE_C32=1` (the
+  DEFAULT) is device-broken; `=0` is correct-in-isolation but NaNs at bs2 via an
+  NKI impl bug. C32 is worth ~+14.7% if fixed.** CPU analysis of real captures
+  (all ranks/streams) proves the C32 solve is benign: strict-lower T max <1,
+  `(I-T)^-1` max = 1.000, block-factorized ≡ CPU forward-sub (cosine 1.0), and
+  bf16-rounding inputs does not blow up. So C32 is NOT fundamentally
+  ill-conditioned. Two implementations:
+  (a) `DN_STABLE_C32=1` — block-factorized forward-sub staged through
+  `nl.shared_hbm`; compiles (SBUF conflict resolved) and eager-20k is finite, but
+  its all-rank replay at L18/offset~12288 is catastrophically wrong (3/4 ranks
+  non-finite, rank3 cosine=0/max_diff=3.4e35) while a matched C16 replay is
+  cosine≈1 — a device bug in the HBM forward-sub. RMSNorm masks it so eager
+  finiteness/top5 look fine; do NOT trust them.
+  (b) `DN_STABLE_C32=0` — full-32 `_tri_inverse_doubling` (the SAME code path as
+  the working C16, just C=32). Isolated deep-context replay is CORRECT on all ranks
+  (cosine≥0.9998); eager bs1 20k is finite; compiled bs2 measured **2407.9 tok/s
+  (+14.7% vs 2098.7)** and compiles light (~55 GB, no OOM). BUT it NaNs at **bs2**
+  (eager chunk10/seg0; compiled chunk11/seg1) while bs1 is finite, and C16 through
+  the same generic stream loop at bs2 is finite → the bug is specific to C=32
+  (32-partition tiles, depth-5 doubling) at 16 streams; the device kernel output at
+  L0 bs2 is finite so it originates at a later layer (1-9) at deep context.
+  Since the reference is benign everywhere, it's an implementation bug, not
+  numerics. To finish: bisect layers 1-9 at chunk≥10 in eager bs2 (per-layer
+  capture + PREFILL_TRACE_FINITE), replay vs a BATCH-AWARE reference (extend
+  `replay_dn_capture.py` to 16 streams), and suspect SBUF alloc / partition
+  alignment for 32-wide tiles across 16 streams. Gate any C32 win on a batch-aware
+  all-rank replay (cosine≈1) + real-prompt coherence — never eager finiteness.
 - **Prefill optlevel: O1 is the only tractable level; O2/O3 are compile-cost-
   prohibitive (2026-07-23).** `deploy/compile_prefill_trn2.sh --optlevel` selects
   the neuronx-cc level (the framework injects a default `-O2`; the appended
