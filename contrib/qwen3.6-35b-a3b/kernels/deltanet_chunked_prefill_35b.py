@@ -544,23 +544,36 @@ def _tri_inverse_blockdiag(A_str, eye, C, half):
     uses successfully), so it is stable. X @ X = 0, hence
         (I - A_str)^-1 = (I-D)^-1 + (I-D)^-1 X (I-D)^-1 .
     All ops are full CxC tiles, so no partition-offset matmul assembly is needed.
-    Tiles are minimized (A_str is reused in-place as D; the output reuses Binv) to
-    stay within the C=32 SBUF budget; `no_reorder` serializes the phases so the
-    allocator does not co-place the inverse tiles with the live q/k/v tiles."""
+    The work tiles are placed on a scoped ``BufferManager`` stack (explicit LIFO
+    lifetimes) so the allocator can fit them beside the live q/k/v tiles that
+    defeated a plain-``nl.ndarray`` version at C=32 (SB<0,0> co-placement conflict).
+    ``Binv`` (the output) is allocated outside the scope so it survives."""
+    Binv = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
+    sbm = BufferManager(
+        0, nl.tile_size.total_available_sbuf_size, use_auto_alloc=True
+    )
+    sbm.open_scope(name="c32_blockdiag")
     with nl.no_reorder():
         # X = only the lower-left block of A_str (src/dst share partition base=half).
-        X = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
+        X = _c32_tile(sbm, C, C)
         nisa.memset(dst=X, value=0.0)
         nisa.tensor_copy(dst=X[half:C, 0:half], src=A_str[half:C, 0:half])
         # Reuse A_str as D: zero its lower-left block so it becomes block-diagonal.
         nisa.memset(dst=A_str[half:C, 0:half], value=0.0)
-        # Binv = (I-D)^-1 via doubling on the block-diagonal part (stable).
-        Binv = _tri_inverse_doubling(A_str, eye, C, C)
-        # coupling = Binv @ X @ Binv  (X@X=0 truncates the Neumann series exactly).
-        XBinv = _mm(_T(X, C, C), Binv, C, C)
-        coupling = _mm(_T(Binv, C, C), XBinv, C, C)
-        # A = Binv + coupling, written back into Binv's storage.
+        # Binv = (I-D)^-1 via scoped doubling on the block-diagonal part (stable;
+        # every power stays block-diagonal so only 16-wide squarings occur).
+        _tri_inverse_doubling_to(A_str, eye, Binv, C, sbm)
+        # coupling = Binv @ X @ Binv (X@X=0 truncates the Neumann series exactly).
+        xt = _c32_tile(sbm, C, C)
+        _T_to(X, C, C, xt)
+        xbinv = _c32_tile(sbm, C, C)
+        _mm_to(xt, Binv, xbinv, C, C)          # X @ Binv
+        bt = _c32_tile(sbm, C, C)
+        _T_to(Binv, C, C, bt)
+        coupling = _c32_tile(sbm, C, C)
+        _mm_to(bt, xbinv, coupling, C, C)       # Binv @ (X @ Binv)
         nisa.tensor_tensor(dst=Binv, data1=Binv, data2=coupling, op=nl.add)
+    sbm.close_scope()
     return Binv
 
 
@@ -844,8 +857,9 @@ def _chunk(s, out, base, query, key, value, g, beta,
             nisa.dma_copy(dst=c32_inverse_scratch, src=inverse_c)
         c32_sbm.close_scope()
     else:
-        v_beta = nl.ndarray((C, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=v_beta, data=v_c, op0=nl.multiply, operand0=b_c)
+        # v_beta is only needed AFTER the inverse (v_corr = A @ v_beta). Defer its
+        # creation to its use site so this [C,128] tile is not live across the
+        # inverse — that frees the SBUF slot the C=32 block-diagonal inverse needs.
         k_beta = nl.ndarray((C, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=k_beta, data=k_c, op0=nl.multiply, operand0=b_c)
         kb_T = _T(k_beta, C, K_DIM)              # [K,C]
@@ -855,16 +869,13 @@ def _chunk(s, out, base, query, key, value, g, beta,
         nisa.tensor_tensor(dst=A_str, data1=kk, data2=dm, op=nl.multiply)
         nisa.tensor_scalar(dst=A_str, data=A_str, op0=nl.multiply, operand0=-1.0)
         nisa.tensor_tensor(dst=A_str, data1=A_str, data2=m_strict, op=nl.multiply)
-        # NOTE (C=32 stability): full-32 doubling overflows on deep-context inputs
-        # (A_str entries near 1 -> the carried state blows up a few chunks later;
-        # root-caused at layer 18: v'=k_cumdecay@state ~3.2e38). The CPU-validated
-        # stable+exact fix is `_tri_inverse_blockdiag` (block-diagonal doubling +
-        # coupling), but calling it here currently fails C=32 SBUF allocation
-        # (a [32,32] tile cannot be co-placed with the live q/k/v [32,128] tiles).
-        # To land it, allocate its tiles via the scoped BufferManager / HBM-stage
-        # the blocks exactly like the STABLE_C32=1 path. Until then C=32 keeps the
-        # (numerically fragile) full doubling; C=16 is unaffected and is the
-        # validated production chunk size.
+        # C=32 fix: `_tri_inverse_blockdiag` is the CPU-validated stable+exact
+        # inverse (block-diagonal doubling + coupling) — but even scoped-allocated
+        # it fails C=32 SBUF placement here, because this light STABLE_C32=0 path
+        # keeps too many live [C,128] tiles (v_c, k_c, qS) across the inverse. To
+        # land it, stage those to HBM before the inverse exactly like STABLE_C32=1
+        # (c32_key_scratch/c32_q_scratch), then call `_tri_inverse_blockdiag`.
+        # Until then C=32 keeps the (fragile) full doubling; C=16 is unaffected.
         A = _tri_inverse_doubling(A_str, eye, C, C)
         A_T = _T(A, C, C)
 
@@ -974,6 +985,8 @@ def _chunk(s, out, base, query, key, value, g, beta,
         nisa.dma_copy(dst=qS, src=c32_q_scratch)
     else:
         # ---- v_corrected = A @ v_beta ; k_cumdecay = A @ (k_beta*exp(g_cum)) ----
+        v_beta = nl.ndarray((C, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=v_beta, data=v_c, op0=nl.multiply, operand0=b_c)
         v_corr = _mm(A_T, v_beta, C, V_DIM)      # [C,V]
         expg = nl.ndarray((C, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=expg, op=nl.exp, data=g_cum, bias=zC1, scale=1.0)
