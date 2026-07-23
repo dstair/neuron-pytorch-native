@@ -483,7 +483,71 @@ def _moe_fused_w8_block_coalesced(
         )
 
         gate_groups = hidden_tiles // column_packing
-        for input_group in range(gate_groups):
+        if column_packing == 1:
+            # Reduction B1: the coarse output-block scale is input-independent
+            # (s[i,o] == s[o]), so sum_i(partial_i * s[o]) == s[o] * sum_i
+            # partial_i. Accumulate the whole hidden contraction natively in
+            # PSUM (a matmul into a fresh nl.psum starts the accumulation group;
+            # subsequent matmuls accumulate), then post-scale each output block
+            # ONCE — replacing hidden_tiles*intermediate_tiles narrow Vector
+            # scale-adds with intermediate_tiles wide post-scales per projection.
+            gate_psum = nl.ndarray(
+                (TILE, COALESCED_WIDTH), dtype=nl.float32, buffer=nl.psum
+            )
+            up_psum = nl.ndarray(
+                (TILE, COALESCED_WIDTH), dtype=nl.float32, buffer=nl.psum
+            )
+            for input_tile in range(hidden_tiles):
+                input_start = input_tile * TILE
+                weight_slot = input_tile % 2
+                nisa.dma_copy(
+                    dst=weight_slots[weight_slot],
+                    src=gate_up[
+                        expert,
+                        nl.ds(input_start, TILE),
+                        :,
+                        :,
+                    ],
+                )
+                native_weight = weight_slots[weight_slot].view(
+                    nl.float8_e4m3
+                )
+                nisa.nc_matmul(
+                    dst=gate_psum,
+                    stationary=hidden_sb[:, input_tile, :],
+                    moving=native_weight[:, 0, :],
+                )
+                nisa.nc_matmul(
+                    dst=up_psum,
+                    stationary=hidden_sb[:, input_tile, :],
+                    moving=native_weight[:, 1, :],
+                )
+            for output_block in range(intermediate_tiles):
+                output_start = output_block * TILE
+                gate_scale_index = output_block
+                up_scale_index = (
+                    hidden_tiles * intermediate_tiles + output_block
+                )
+                nisa.tensor_scalar(
+                    dst=gate[:, nl.ds(output_start, TILE)],
+                    data=gate_psum[:tokens, nl.ds(output_start, TILE)],
+                    op0=nl.multiply,
+                    operand0=gate_scale_table[
+                        :tokens,
+                        gate_scale_index : gate_scale_index + 1,
+                    ],
+                )
+                nisa.tensor_scalar(
+                    dst=up[:, nl.ds(output_start, TILE)],
+                    data=up_psum[:tokens, nl.ds(output_start, TILE)],
+                    op0=nl.multiply,
+                    operand0=gate_scale_table[
+                        :tokens,
+                        up_scale_index : up_scale_index + 1,
+                    ],
+                )
+        else:
+          for input_group in range(gate_groups):
             gate_psum = nl.ndarray(
                 (TILE, COALESCED_WIDTH), dtype=nl.float32, buffer=nl.psum
             )
@@ -656,6 +720,51 @@ def _moe_fused_w8_block_coalesced(
         down_groups = intermediate_tiles // column_packing
         for hidden_slab in nl.affine_range(hidden_slabs):
             hidden_start = hidden_slab * COALESCED_WIDTH
+            if column_packing == 1:
+                # Reduction B1 (see gate/up): accumulate the intermediate
+                # contraction for this hidden slab natively in PSUM, then
+                # post-scale each 128-wide output block ONCE with s[o].
+                down_psum = nl.ndarray(
+                    (TILE, COALESCED_WIDTH), dtype=nl.float32, buffer=nl.psum
+                )
+                for intermediate_tile in range(intermediate_tiles):
+                    intermediate_start = intermediate_tile * TILE
+                    weight_slot = intermediate_tile % 2
+                    nisa.dma_copy(
+                        dst=weight_slots[weight_slot][:, 0, :],
+                        src=down[
+                            expert,
+                            nl.ds(intermediate_start, TILE),
+                            nl.ds(hidden_start, COALESCED_WIDTH),
+                        ],
+                    )
+                    native_weight = weight_slots[weight_slot][
+                        :, 0, :
+                    ].view(nl.float8_e4m3)
+                    nisa.nc_matmul(
+                        dst=down_psum,
+                        stationary=activated[:, intermediate_tile, :],
+                        moving=native_weight,
+                    )
+                for slab_block in range(COALESCED_WIDTH // TILE):
+                    output_block = (
+                        hidden_slab * (COALESCED_WIDTH // TILE) + slab_block
+                    )
+                    output_start = slab_block * TILE
+                    scale_index = output_block
+                    expert_start = hidden_start + output_start
+                    nisa.tensor_scalar(
+                        dst=expert_output[:, nl.ds(expert_start, TILE)],
+                        data=down_psum[:tokens, nl.ds(output_start, TILE)],
+                        op0=nl.multiply,
+                        operand0=down_scale_table[
+                            :tokens,
+                            scale_index : scale_index + 1,
+                        ],
+                    )
+                # column_packing==1 is a compile-time constant, so this branch
+                # is taken uniformly for every slab (safe inside affine_range).
+                continue
             for input_group in range(down_groups):
                 down_psum = nl.ndarray(
                     (TILE, COALESCED_WIDTH), dtype=nl.float32, buffer=nl.psum

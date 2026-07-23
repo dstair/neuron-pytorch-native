@@ -378,6 +378,66 @@ def requantize_official_fp8_pow2(
     return result, result_scales, stats
 
 
+def requantize_official_fp8_output_block(
+    raw,
+    source_scales,
+    block_size=BLOCK_SIZE,
+):
+    """Requantize to legacy E4M3 with ONE scale per 128-output-row block.
+
+    Unlike ``requantize_official_fp8_pow2`` (a scale per 128x128 block), the
+    scale here depends only on the OUTPUT-row block and is shared across every
+    input-column block. Reduction B relies on exactly this input-independence:
+    because ``sum_i(partial_i * s[o]) == s[o] * sum_i partial_i``, the coalesced
+    kernel's per-block scale-adds become a single post-accumulation scale, so
+    the native-FP8 contraction can accumulate in PSUM. The trade is FP8
+    accuracy — a whole 128-output-channel x full-input group shares one absmax
+    scale instead of one per 128x128 tile.
+
+    Returns ``(int8_bytes, bf16_scales, stats)`` with the SAME scale-grid shape
+    as the source (values repeated across the input-block axis) so the existing
+    ``pack_coalesced_block_scales`` / kernel scale indexing works unchanged.
+    """
+    if source_scales.dtype != torch.bfloat16:
+        raise TypeError(
+            f"official weight_scale_inv must be BF16, got {source_scales.dtype}"
+        )
+    expected = (*raw.shape[:-2], *_scale_grid_shape(raw.shape, block_size))
+    if tuple(source_scales.shape) != expected:
+        raise ValueError(
+            f"scale shape {tuple(source_scales.shape)} does not match expected {expected}"
+        )
+
+    source = dequantize_official_fp8(raw, source_scales, block_size)
+    result = torch.empty_like(raw, dtype=torch.int8)
+    result_scales = torch.empty_like(source_scales)
+    stats = QuantizationStats()
+
+    leading_shape = raw.shape[:-2]
+    leading_count = math.prod(leading_shape) if leading_shape else 1
+    rows, cols = raw.shape[-2:]
+    row_blocks, col_blocks = _scale_grid_shape(raw.shape, block_size)
+    source_flat = source.reshape(leading_count, rows, cols)
+    result_flat = result.reshape(leading_count, rows, cols)
+    scale_flat = result_scales.reshape(leading_count, row_blocks, col_blocks)
+
+    for leading in range(leading_count):
+        for row_block, row_start in enumerate(range(0, rows, block_size)):
+            row_end = min(row_start + block_size, rows)
+            block = source_flat[leading, row_start:row_end, :]
+            scale = block.abs().amax().clamp_min(1e-12) / LEGACY_E4M3_MAX
+            stored_scale = scale.to(torch.bfloat16)
+            stored_f32 = stored_scale.float()
+            quantized = encode_legacy_e4m3(block / stored_f32)
+            reconstructed = decode_legacy_e4m3(quantized) * stored_f32
+            result_flat[leading, row_start:row_end, :] = quantized
+            scale_flat[leading, row_block, :] = stored_scale
+            stats.block_count += col_blocks
+            stats.update(block, reconstructed)
+
+    return result, result_scales, stats
+
+
 def requantize_official_fp8_row(
     raw,
     source_scales,
@@ -648,13 +708,15 @@ class OfficialFP8ExpertReader:
             "dual",
             "block_pow2",
             "block_pow2_coalesced",
+            "block_ob_coalesced",
         ):
             raise ValueError(
-                "fp8_impl must be 'dual', 'block_pow2', or "
-                "'block_pow2_coalesced' for block FP8"
+                "fp8_impl must be 'dual', 'block_pow2', "
+                "'block_pow2_coalesced', or 'block_ob_coalesced' for block FP8"
             )
-        coalesced = (
-            mode == "fp8" and fp8_impl == "block_pow2_coalesced"
+        coalesced = mode == "fp8" and fp8_impl in (
+            "block_pow2_coalesced",
+            "block_ob_coalesced",
         )
         gate_up_weights = []
         gate_up_residuals = []
@@ -680,6 +742,12 @@ class OfficialFP8ExpertReader:
                     if fp8_impl == "dual":
                         converted, residual, scales, stats = (
                             split_official_fp8(raw, source_scales)
+                        )
+                    elif fp8_impl == "block_ob_coalesced":
+                        converted, scales, stats = (
+                            requantize_official_fp8_output_block(
+                                raw, source_scales
+                            )
                         )
                     else:
                         converted, scales, stats = (
@@ -720,6 +788,12 @@ class OfficialFP8ExpertReader:
                 if fp8_impl == "dual":
                     converted, residual, scales, stats = split_official_fp8(
                         raw, source_scales
+                    )
+                elif fp8_impl == "block_ob_coalesced":
+                    converted, scales, stats = (
+                        requantize_official_fp8_output_block(
+                            raw, source_scales
+                        )
                     )
                 else:
                     converted, scales, stats = (
