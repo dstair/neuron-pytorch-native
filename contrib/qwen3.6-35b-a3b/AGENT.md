@@ -321,19 +321,26 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   (32-partition tiles, depth-5 doubling) at 16 streams; the device kernel output at
   L0 bs2 is finite so it originates at a later layer (1-9) at deep context.
   Since the reference is benign everywhere, it's an implementation bug, not
-  numerics. ROOT-CAUSED: the bs2 NaN is at **layer 18 / chunk 10 / DeltaNet attn**
-  (a NaN, max~1.9, not overflow). CPU drill of that exact captured input (both
-  forward-sub AND doubling inverse, all 16 streams, fp32) is fully finite, and an
-  ISOLATED device replay of the same capture is also finite — yet the full eager
-  bs2 run NaNs there. Same kernel + same input → NaN in full run but finite alone
-  ⇒ a **context-dependent uninitialized / leftover-SBUF read** in the C=32
-  (32-partition) `_chunk` else-path, benign at bs1/in isolation but poisoned by the
-  preceding 17 layers' SBUF state at bs2. FIX: add defensive `nisa.memset(0)` to the
-  C32 working tiles (or find the specific read-before-write / PSUM-accum tile),
-  re-run eager bs2 (NaN should vanish). Also make `replay_dn_capture.py` BATCH-AWARE
-  (16 streams; it's bs1-shaped today). Gate any C32 win on batch-aware all-rank
-  replay (cosine≈1) + compiled finite fingerprint + real-prompt coherence — never
-  eager finiteness. Prize confirmed: +14.7% (2407.9 tok/s).
+  numerics. ROOT-CAUSED to the inverse method (replay ALL ranks, not just rank0):
+  the bs2 NaN is at **layer 18 / chunk 10, rank2 stream 13**, whose strict-lower T
+  has a max entry **~0.944 (near 1)**. The full-32 doubling
+  `(I+T)(I+T²)(I+T⁴)(I+T⁸)(I+T¹⁶)` amplifies FP32 rounding for near-1 entries; over
+  the carried recurrence the state diverges and `v'=k_cumdecay@state` hits ~3.2e38 →
+  inf → NaN (sub-chunk 9). CPU drill of that exact capture: **forward-sub finite,
+  full-32 doubling OVERFLOWS, block-diagonal finite on all streams**. (C16 works
+  because 16-token chunks give smaller T; 32-token chunks push T toward 1. It's
+  data-dependent, not context-dependent — rank2 reproduces the NaN in isolation.)
+  **FIX (CPU-validated, exact, committed as `_tri_inverse_blockdiag`):** split
+  T = D(block-diag) + X(lower-left 16×16); double D (powers stay block-diagonal →
+  only 16-wide squarings → stable); X@X=0 ⇒ (I-T)⁻¹ = (I-D)⁻¹ + (I-D)⁻¹X(I-D)⁻¹.
+  Finite on the rank2 reproducer, cosine 1.0 vs forward-sub. **BLOCKED landing it:**
+  wiring into the C=32 `_chunk` else-path fails C=32 SBUF allocation-scheduling (a
+  [32,32] tile can't co-place with live q/k/v [32,128] tiles); tile-reuse +
+  `no_reorder` didn't clear it. Land via `BufferManager` scoping / HBM-stage the
+  block inverse like STABLE_C32=1. Validate on the rank2 reproducer
+  (`capture-c32s0-bs2-l18c10`), then compiled bs2 finite fingerprint + real-prompt
+  coherence (also make `replay_dn_capture.py` BATCH-AWARE — bs1-shaped today).
+  Prize confirmed: +14.7% (2407.9 tok/s). Debug hook: `PREFILL_TRACE_LAYER=1`.
 - **Prefill optlevel: O1 is the only tractable level; O2/O3 are compile-cost-
   prohibitive (2026-07-23).** `deploy/compile_prefill_trn2.sh --optlevel` selects
   the neuronx-cc level (the framework injects a default `-O2`; the appended
