@@ -138,6 +138,13 @@ def nki_deltanet_chunked_prefill_v2(
     onesC = nl.ndarray((1, C), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=onesC, value=1.0)
 
+    # Constant [C,C] lower-left block mask for the stable C=32 block-diagonal
+    # inverse (built once; full-tile, no partition-offset slicing). Only the
+    # generic-loop STABLE_C32=0 C=32 path uses it.
+    ll_mask = None
+    if C == 32 and not STABLE_C32:
+        ll_mask = _lowerleft_mask(eye_s, onesC, C, C // 2)
+
     if PAIRED_BATCH and batch_size % 2 == 0 and C == 16:
         pair_rows = 2 * C
         pair_m_incl = nl.ndarray(
@@ -274,6 +281,7 @@ def nki_deltanet_chunked_prefill_v2(
                     c32_q_scratch, c32_vprime_scratch,
                     c32_inverse_scratch, c32_vcorr_scratch,
                     c32_state_scratch, c32_row_scratch, C, Q_SCALE,
+                    ll_mask,
                 )
             nisa.dma_copy(
                 dst=new_state[
@@ -529,51 +537,67 @@ def _tri_inverse_doubling(T, eye, C, span):
     return A
 
 
-def _tri_inverse_blockdiag(A_str, eye, C, half):
+def _tri_inverse_series(T, eye, C, iters):
+    """(I-T)^-1 = I + T + T^2 + ... for nilpotent T, via Horner accumulation
+    P <- I + T@P. Unlike doubling ((I+T)(I+T^2)(I+T^4)...), the intermediates here
+    are PARTIAL SUMS (O(1), bounded), never large powers T^(2^k). Doubling's large
+    intermediates only cancel to ~1 at the end; device nc_matmul's reduced precision
+    loses that cancellation and diverges when T entries approach 1 (rank2: all
+    T00/T11/X ~0.9-0.95). Horner stays bounded, so it is device-stable there.
+    ``iters`` must be >= the nilpotency index - 1 (16 for a 16-wide block)."""
+    Tt = _T(T, C, C)                          # T^T once; _mm(Tt, P) = T @ P
+    P = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=P, src=eye)          # P_0 = I
+    for _ in range(iters):
+        TP = _mm(Tt, P, C, C)                 # T @ P
+        nisa.tensor_tensor(dst=P, data1=eye, data2=TP, op=nl.add)   # P = I + T@P
+    return P
+
+
+def _lowerleft_mask(eye, onesC, C, half):
+    """Build a [C,C] mask that is 1 on the strictly-lower-left [half:C, 0:half]
+    block and 0 elsewhere, using only full-tile ops (no partition-offset slicing,
+    no iota — this NKI build has neither reliably). Derived from ``eye``:
+    reducing eye's column halves gives per-row block indicators, whose outer
+    product is the block mask. Build ONCE per kernel (constant across chunks)."""
+    # Only slice eye at column offset 0 (eye[:,0:half]); a free-axis-offset slice
+    # like eye[:,half:C] is NOT honored by the device transpose and silently reads
+    # the wrong columns. Derive rows>=half as (1 - rows<half).
+    ones_h1 = _T(onesC[0:1, 0:half], 1, half)                    # [half,1] ones
+    rows_lt = _mm(_T(eye[0:C, 0:half], C, half), ones_h1, C, 1)  # [C,1] 1 iff row<half
+    rows_ge = nl.ndarray((C, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=rows_ge, value=1.0)
+    nisa.tensor_tensor(dst=rows_ge, data1=rows_ge, data2=rows_lt, op=nl.subtract)  # 1 iff row>=half
+    cols_lt = _T(rows_lt, C, 1)                                  # [1,C] 1 iff col<half
+    return _mm(_T(rows_ge, C, 1), cols_lt, C, C)                 # [C,C] outer product
+
+
+def _tri_inverse_blockdiag(A_str, eye, ll_mask, C, half):
     """Stable (I-A_str)^-1 for a C=32 strict-lower A_str.
 
     The full-C doubling squares A_str up to A_str^16; when the real-model decay
     pushes A_str entries toward 1 (deep context) those squarings amplify FP32
-    rounding and the carried recurrent state overflows a few chunks later (seen
-    at layer 18: v'=k_cumdecay@state hits ~3.2e38). Forward substitution is
-    stable but needs cross-partition row writes on device.
+    rounding and the carried recurrent state overflows a few chunks later
+    (root-caused at layer 18: v'=k_cumdecay@state ~3.2e38 on the rank2 reproducer).
 
-    Split A_str = D + X with D block-diagonal (the two 16x16 diagonal blocks) and
-    X the strictly-lower-left 16x16 block. Doubling on D keeps every power
-    block-diagonal (only 16-wide squarings, exactly the depth the C16 path already
-    uses successfully), so it is stable. X @ X = 0, hence
+    Split A_str = D + X with D block-diagonal (the two 16x16 diagonal blocks) and X
+    the strictly-lower-left 16x16 block. Doubling on D keeps every power
+    block-diagonal (only 16-wide squarings, exactly the depth the C16 path uses
+    successfully), so it is stable. X @ X = 0, hence
         (I - A_str)^-1 = (I-D)^-1 + (I-D)^-1 X (I-D)^-1 .
-    All ops are full CxC tiles, so no partition-offset matmul assembly is needed.
-    The work tiles are placed on a scoped ``BufferManager`` stack (explicit LIFO
-    lifetimes) so the allocator can fit them beside the live q/k/v tiles that
-    defeated a plain-``nl.ndarray`` version at C=32 (SB<0,0> co-placement conflict).
-    ``Binv`` (the output) is allocated outside the scope so it survives."""
-    Binv = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
-    sbm = BufferManager(
-        0, nl.tile_size.total_available_sbuf_size, use_auto_alloc=True
-    )
-    sbm.open_scope(name="c32_blockdiag")
-    with nl.no_reorder():
-        # X = only the lower-left block of A_str (src/dst share partition base=half).
-        X = _c32_tile(sbm, C, C)
-        nisa.memset(dst=X, value=0.0)
-        nisa.tensor_copy(dst=X[half:C, 0:half], src=A_str[half:C, 0:half])
-        # Reuse A_str as D: zero its lower-left block so it becomes block-diagonal.
-        nisa.memset(dst=A_str[half:C, 0:half], value=0.0)
-        # Binv = (I-D)^-1 via scoped doubling on the block-diagonal part (stable;
-        # every power stays block-diagonal so only 16-wide squarings occur).
-        _tri_inverse_doubling_to(A_str, eye, Binv, C, sbm)
-        # coupling = Binv @ X @ Binv (X@X=0 truncates the Neumann series exactly).
-        xt = _c32_tile(sbm, C, C)
-        _T_to(X, C, C, xt)
-        xbinv = _c32_tile(sbm, C, C)
-        _mm_to(xt, Binv, xbinv, C, C)          # X @ Binv
-        bt = _c32_tile(sbm, C, C)
-        _T_to(Binv, C, C, bt)
-        coupling = _c32_tile(sbm, C, C)
-        _mm_to(bt, xbinv, coupling, C, C)       # Binv @ (X @ Binv)
-        nisa.tensor_tensor(dst=Binv, data1=Binv, data2=coupling, op=nl.add)
-    sbm.close_scope()
+    D and X are formed by full-tile masking with ``ll_mask`` (NOT partition-offset
+    slicing, which defeated SBUF placement); everything is a full CxC tile op like
+    the plain doubling that already compiles. A_str is reused in-place as D."""
+    X = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=X, data1=A_str, data2=ll_mask, op=nl.multiply)   # X = lower-left
+    nisa.tensor_tensor(dst=A_str, data1=A_str, data2=X, op=nl.subtract)     # A_str -> D
+    # D is block-diagonal (16-nilpotent blocks, D^16=0). Use Horner series, NOT
+    # doubling: doubling's T^(2^k) intermediates lose device precision when the
+    # diagonal-block entries approach 1 (rank2 overflowed to 1e30). half iters exact.
+    Binv = _tri_inverse_series(A_str, eye, C, half)                        # (I-D)^-1 (stable)
+    XBinv = _mm(_T(X, C, C), Binv, C, C)                                    # X @ Binv
+    coupling = _mm(_T(Binv, C, C), XBinv, C, C)                             # Binv @ (X @ Binv)
+    nisa.tensor_tensor(dst=Binv, data1=Binv, data2=coupling, op=nl.add)     # + coupling
     return Binv
 
 
@@ -644,7 +668,8 @@ def _tri_inverse_forward_from_hbm_to(
 def _chunk(s, out, base, query, key, value, g, beta,
            m_incl, m_strict, eye, eps1, zC1, zCC, onesC, c32_key_scratch,
            c32_q_scratch, c32_vprime_scratch, c32_inverse_scratch,
-           c32_vcorr_scratch, c32_state_scratch, c32_row_scratch, C, Q_SCALE):
+           c32_vcorr_scratch, c32_state_scratch, c32_row_scratch, C, Q_SCALE,
+           ll_mask=None):
     """One chunk for one head. Mutates s (state) in place; writes out[base:base+C].
     Mirrors deltanet_chunked_v2_ref.ref_chunk_single_head exactly."""
     if C == 32 and STABLE_C32:
@@ -844,17 +869,43 @@ def _chunk(s, out, base, query, key, value, g, beta,
         )
         c32_sbm.close_scope()
 
-        # The block-factorized solve is algebraically correct but its changed
-        # association loses material bits on the captured rank-2 state. Build
-        # the inverse in the CPU oracle's ordered forward-substitution form.
-        c32_sbm.open_scope(name="c32_forward_inverse")
+        # Assemble (I - A_str)^-1 = [[B00, 0], [B11 X B00, B11]] via block-diagonal
+        # doubling. B00/B11 are the 16x16 diagonal-block inverses built with the
+        # SAME depth-4 doubling the C16 path uses successfully (stable — every power
+        # stays inside a 16-wide block, so near-1 A_str entries do NOT get amplified
+        # by 32-wide squarings the way the old full-32 doubling did; that overflow
+        # was root-caused at layer 18 as v'=k_cumdecay@state ~3.2e38). X@X=0 makes
+        # the coupling exact. Reads the strict-lower blocks staged in
+        # c32_inverse_scratch and writes the assembled inverse back into it; the
+        # upper-right block stays 0 from the initial m_strict copy. Replaces the
+        # per-row forward-substitution-from-HBM solve (device-wrong AND slow: 31
+        # per-row HBM round trips).
+        c32_sbm.open_scope(name="c32_blockdiag_inverse")
         with nl.no_reorder():
-            inverse_c = _c32_tile(c32_sbm, C, C)
-            _tri_inverse_forward_from_hbm_to(
-                c32_inverse_scratch, eye, inverse_c, c32_row_scratch,
-                C, c32_sbm,
-            )
-            nisa.dma_copy(dst=c32_inverse_scratch, src=inverse_c)
+            eye16 = _c32_tile(c32_sbm, half, half)
+            nisa.dma_copy(dst=eye16, src=eye[0:half, 0:half])
+            t00 = _c32_tile(c32_sbm, half, half)
+            nisa.dma_copy(dst=t00, src=c32_inverse_scratch[0:half, 0:half])
+            t11 = _c32_tile(c32_sbm, half, half)
+            nisa.dma_copy(dst=t11, src=c32_inverse_scratch[half:C, half:C])
+            xblk = _c32_tile(c32_sbm, half, half)
+            nisa.dma_copy(dst=xblk, src=c32_inverse_scratch[half:C, 0:half])
+            b00 = _c32_tile(c32_sbm, half, half)
+            _tri_inverse_doubling_to(t00, eye16, b00, half, c32_sbm)
+            b11 = _c32_tile(c32_sbm, half, half)
+            _tri_inverse_doubling_to(t11, eye16, b11, half, c32_sbm)
+            # C21 = B11 @ X @ B00
+            xt = _c32_tile(c32_sbm, half, half)
+            _T_to(xblk, half, half, xt)
+            xb00 = _c32_tile(c32_sbm, half, half)
+            _mm_to(xt, b00, xb00, half, half)            # X @ B00
+            b11t = _c32_tile(c32_sbm, half, half)
+            _T_to(b11, half, half, b11t)
+            c21 = _c32_tile(c32_sbm, half, half)
+            _mm_to(b11t, xb00, c21, half, half)           # B11 @ (X @ B00)
+            nisa.dma_copy(dst=c32_inverse_scratch[0:half, 0:half], src=b00)
+            nisa.dma_copy(dst=c32_inverse_scratch[half:C, half:C], src=b11)
+            nisa.dma_copy(dst=c32_inverse_scratch[half:C, 0:half], src=c21)
         c32_sbm.close_scope()
     else:
         # v_beta is only needed AFTER the inverse (v_corr = A @ v_beta). Defer its
@@ -869,14 +920,13 @@ def _chunk(s, out, base, query, key, value, g, beta,
         nisa.tensor_tensor(dst=A_str, data1=kk, data2=dm, op=nl.multiply)
         nisa.tensor_scalar(dst=A_str, data=A_str, op0=nl.multiply, operand0=-1.0)
         nisa.tensor_tensor(dst=A_str, data1=A_str, data2=m_strict, op=nl.multiply)
-        # C=32 fix: `_tri_inverse_blockdiag` is the CPU-validated stable+exact
-        # inverse (block-diagonal doubling + coupling) — but even scoped-allocated
-        # it fails C=32 SBUF placement here, because this light STABLE_C32=0 path
-        # keeps too many live [C,128] tiles (v_c, k_c, qS) across the inverse. To
-        # land it, stage those to HBM before the inverse exactly like STABLE_C32=1
-        # (c32_key_scratch/c32_q_scratch), then call `_tri_inverse_blockdiag`.
-        # Until then C=32 keeps the (fragile) full doubling; C=16 is unaffected.
-        A = _tri_inverse_doubling(A_str, eye, C, C)
+        if C == 32:
+            # Stable block-diagonal doubling + coupling (full-32 doubling overflows
+            # on near-1 deep-context A_str). Full-tile masking via ll_mask avoids the
+            # partition-offset slicing that defeated SBUF placement earlier.
+            A = _tri_inverse_blockdiag(A_str, eye, ll_mask, C, C // 2)
+        else:
+            A = _tri_inverse_doubling(A_str, eye, C, C)
         A_T = _T(A, C, C)
 
     if C == 32 and STABLE_C32:
