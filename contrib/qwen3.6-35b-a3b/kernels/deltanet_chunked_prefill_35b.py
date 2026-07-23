@@ -591,10 +591,11 @@ def _tri_inverse_blockdiag(A_str, eye, ll_mask, C, half):
     X = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=X, data1=A_str, data2=ll_mask, op=nl.multiply)   # X = lower-left
     nisa.tensor_tensor(dst=A_str, data1=A_str, data2=X, op=nl.subtract)     # A_str -> D
-    # D is block-diagonal (16-nilpotent blocks, D^16=0). Use Horner series, NOT
-    # doubling: doubling's T^(2^k) intermediates lose device precision when the
-    # diagonal-block entries approach 1 (rank2 overflowed to 1e30). half iters exact.
-    Binv = _tri_inverse_series(A_str, eye, C, half)                        # (I-D)^-1 (stable)
+    # D is block-diagonal (16-nilpotent blocks, D^16=0). Doubling with depth=half:
+    # only the 16-wide diagonal blocks are squared (small intermediates), unlike the
+    # full-32 doubling that overflowed. Cheaper than Horner; testing if it stays
+    # finite fresh (the earlier "doubling overflow" was on contaminated captures).
+    Binv = _tri_inverse_doubling(A_str, eye, C, half)                      # (I-D)^-1
     XBinv = _mm(_T(X, C, C), Binv, C, C)                                    # X @ Binv
     coupling = _mm(_T(Binv, C, C), XBinv, C, C)                             # Binv @ (X @ Binv)
     nisa.tensor_tensor(dst=Binv, data1=Binv, data2=coupling, op=nl.add)     # + coupling
