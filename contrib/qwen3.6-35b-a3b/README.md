@@ -638,7 +638,8 @@ historical results in this section must not be attributed to it.
 
 | Test | Framework | Config | Latency | Prompt tok/s |
 |---|---|---|---|---|
-| **Batched compiled CTE-GQA + fused NKI-routed CTE-MoE + paired DeltaNet C16** | PyTorch Native | BS=2, N=20000 each, bucket=1024 | **19.141 s** | **2,089.7 aggregate** |
+| **Batched compiled CTE-GQA + fused NKI-routed CTE-MoE + stable DeltaNet C32 (block-diagonal)** | PyTorch Native | BS=2, N=20000 each, bucket=1024 | **17.568 s** | **2,276.9 aggregate** |
+| Batched compiled CTE-GQA + fused NKI-routed CTE-MoE + paired DeltaNet C16 | PyTorch Native | BS=2, N=20000 each, bucket=1024 | 19.141 s | 2,089.7 aggregate |
 | Batched compiled CTE-GQA + fused NKI-routed CTE-MoE + paired DeltaNet C16 | PyTorch Native | BS=4, N=20000 each, bucket=512 | 39.788 s | 2010.6 aggregate |
 | **Compiled CTE-GQA + fused NKI-routed CTE-MoE + DeltaNet C16** | PyTorch Native | BS=1, N=20000, bucket=1024 | **13.488 s** | **1482.8** |
 | Compiled CTE-GQA + Torch-routed CTE-MoE + DeltaNet C16 | PyTorch Native | BS=1, N=20000, bucket=1024 | 17.374 s | 1151.1 |
@@ -650,13 +651,27 @@ historical results in this section must not be attributed to it.
 | Eager prefill (pre-kernelization) | PyTorch Native | N=4000 | 146.7 s | 27.3 |
 | Eager prefill (pre-kernelization) | PyTorch Native | N=2000 | 68.4 s | 29.3 |
 
-The highest validated aggregate throughput uses BS=2, 1024-token buckets,
-paired-C16 DeltaNet, four compiled 10-layer segments, runtime bucket
-offsets/valid lengths, and fused NKI-routed CTE MoE. A cache-reuse run measured
-19.1411 seconds / 2,089.7 aggregate prompt tok/s, with identical finite warm and
-timed fingerprints. BS=4 also fits with 512-token buckets and measured 39.7883
-seconds / 2,010.6 aggregate prompt tok/s after restoring its compiler cache,
-matching the original 2,012.2 tok/s median.
+The highest validated aggregate throughput uses BS=2, 1024-token buckets, four
+compiled 10-layer segments, runtime bucket offsets/valid lengths, fused
+NKI-routed CTE MoE, and **stable DeltaNet C32** (`DN_STABLE_C32=0 CHUNK_SIZE=32`;
+opt-in). It measured 17.568 seconds / 2,276.9 aggregate prompt tok/s — **+8.5%**
+over the paired-C16 baseline (19.141 s / 2,089.7), with identical finite warm and
+timed fingerprints. C32 halves the DeltaNet chunk count; the win required a
+numerically stable inverse — `_tri_inverse_blockdiag` splits the 32×32 chunk
+matrix into two 16×16 diagonal blocks plus a coupling term and inverts the blocks
+by doubling (the naive full-32 doubling overflows on near-1-decay streams, and a
+Horner series is stable but ~4× costlier at 2,037.5 tok/s). C32 correctness was
+gated on all four checks: finite warm≡timed fingerprint; final-token top-5
+matching the C16 baseline; **all-rank capture-replay vs the CPU reference at deep
+context (cosine ≈ 1.0, max_diff ~1e-6 on all four TP ranks)**; and real-prompt
+coherence identical to C16 (bit-identical greedy continuation via iterative
+prefill). C16 remains the default; C32 is the opt-in faster path.
+
+The paired-C16 configuration (same shapes) measured 19.1411 seconds / 2,089.7
+aggregate prompt tok/s with identical finite warm and timed fingerprints. BS=4
+also fits with 512-token buckets and measured 39.7883 seconds / 2,010.6 aggregate
+prompt tok/s after restoring its compiler cache, matching the original 2,012.2
+tok/s median.
 
 The fastest validated single-prompt path uses 1024-token buckets, the fused
 NKI-routed CTE MoE kernel (`MOE_CTE_NKI_PACK=1`), and `CHUNK_SIZE=16`.
