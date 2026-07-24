@@ -6,6 +6,7 @@ from torch_neuronx import nki_op
 from moe_fused_w8_35b import (
     nki_moe_fused_w8_fp8,
     nki_moe_fused_w8_fp8_block_coalesced,
+    nki_moe_fused_w8_fp8_block_coalesced_ob,
     nki_moe_fused_w8_fp8_dual,
     nki_moe_fused_w8_fp8_native,
     nki_moe_fused_w8_fp8_token_stationary,
@@ -74,6 +75,20 @@ def fused_fp8_block_coalesced(
     affinities: torch.Tensor,
 ) -> torch.Tensor:
     return nki_moe_fused_w8_fp8_block_coalesced(
+        hidden, gate_up, down, gate_up_scales, down_scales, affinities
+    )
+
+
+@nki_op("moe_w8::fused_fp8_block_coalesced_ob", mutates_args={})
+def fused_fp8_block_coalesced_ob(
+    hidden: torch.Tensor,
+    gate_up: torch.Tensor,
+    down: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    down_scales: torch.Tensor,
+    affinities: torch.Tensor,
+) -> torch.Tensor:
+    return nki_moe_fused_w8_fp8_block_coalesced_ob(
         hidden, gate_up, down, gate_up_scales, down_scales, affinities
     )
 
