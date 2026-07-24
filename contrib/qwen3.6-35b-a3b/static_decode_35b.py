@@ -2734,6 +2734,31 @@ def main():
                     )
         return
 
+    # Iterative-prefill coherence generation (PREFILL_GEN=1 + --prompt-ids): generate
+    # by RE-PREFILLING [prompt + generated] each step and taking the last-token
+    # argmax — never enters the decode path. This keeps the fast CTE prefill MoE the
+    # whole time (decode's MOE_SPARSE and prefill's MOE_CTE are mutually exclusive),
+    # and exercises exactly the chunked-prefill DeltaNet (incl. C32). O(n^2) but
+    # trivial for a short prompt. Matches how C16 coherence was validated.
+    if args.prompt_ids and os.environ.get("PREFILL_GEN", "0") == "1":
+        pid = [int(t) for t in args.prompt_ids.split(",") if t != ""]
+        seq = list(pid)
+        for step in range(args.num_tokens):
+            in_t = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0).expand(B, -1).contiguous()
+            # prefill_bucketed clones the passed states internally, so the original
+            # zero states are reused unmutated each step (fresh prefill of `seq`).
+            outs = mod.prefill_bucketed(
+                in_t, dn_states, conv_states, kv_k, kv_v,
+                chunk=args.bucket_chunk, compile_chunk=(args.bucket_compile == 1),
+                compile_splits=args.prefill_splits)
+            nid = int(outs[0][0].argmax())
+            seq.append(nid)
+            if rank == 0:
+                print(f"  PREFILL_GEN step {step}: id={nid}", flush=True)
+        if rank == 0:
+            print(f"  PREFILL_GEN prompt={pid} generated={seq[len(pid):]}", flush=True)
+        return
+
     # Optional real-prompt prefill: --prompt-ids "760,6511,..." runs the (eager)
     # prefill to build DeltaNet/conv/KV state, then decodes from the prompt's
     # last-token logits — a coherence check. Without it, seed token 100 @ pos 0.
