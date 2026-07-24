@@ -42,6 +42,13 @@ NeuronX's persistent-cache key. Use trn2 for a portable cross-compile on Trn1;
 use trn1 only to replay a legacy cache whose keys were generated on Trn1.
 The overall command may fail after compilation on Trn1 because a Trn2 NEFF
 cannot load there; inspect per-rank logs and replay the cache on Trn2.
+
+DeltaNet chunking defaults to the fastest validated config, stable C32
+(CHUNK_SIZE=32, DN_STABLE_C32=0, DN_PAIRED_BATCH=0; ~2,277 agg prompt tok/s).
+Override via environment for the paired-C16 fallback (~2,090 tok/s):
+  CHUNK_SIZE=16 DN_STABLE_C32=1 DN_PAIRED_BATCH=1 compile_prefill_trn2.sh ...
+CHUNK_SIZE changes the traced graph, so use a distinct --cache-dir per config;
+the metadata guard refuses to mix a C16 and a C32 cache root.
 EOF
 }
 
@@ -180,7 +187,9 @@ export QWEN35_MAX_SEQ_LEN=20480
 export QWEN35_PREFILL_TOKENS=20000
 export QWEN35_BUCKET_CHUNK="$bucket"
 export QWEN35_PREFILL_SPLITS="$splits"
-export CHUNK_SIZE=16
+export CHUNK_SIZE="${CHUNK_SIZE:-32}"
+export DN_STABLE_C32="${DN_STABLE_C32:-0}"
+export DN_PAIRED_BATCH="${DN_PAIRED_BATCH:-0}"
 export MOE_CTE_BLOCK=512
 export NEURON_CC_FLAGS="--target trn2 --lnc $lnc --optlevel $optlevel --hbm-scratchpad-page-size $scratchpad_page_size_mb"
 export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
@@ -188,7 +197,7 @@ export QWEN35_PLATFORM_TARGET_SHIM_DEBUG="${QWEN35_PLATFORM_TARGET_SHIM_DEBUG:-0
 export QWEN35_COMPILE_HOST="${QWEN35_COMPILE_HOST:-$(hostname)}"
 export QWEN35_COMPILE_REGION="${QWEN35_COMPILE_REGION:-unknown}"
 
-command_text="NEURON_CC_FLAGS=$NEURON_CC_FLAGS NEURON_PLATFORM_TARGET_OVERRIDE=$NEURON_PLATFORM_TARGET_OVERRIDE QWEN35_CACHE_PLATFORM_TARGET=$QWEN35_CACHE_PLATFORM_TARGET LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so torchrun --nproc-per-node=$tp static_decode_35b.py --model-path /models/Qwen3.5-35B-A3B --batch-size 2 --num-layers $layers --max-seq-len 20480 --prefill-bench 20000 --bucket-chunk $bucket --bucket-compile 1 --prefill-splits $splits --skip-compile"
+command_text="NEURON_CC_FLAGS=$NEURON_CC_FLAGS NEURON_PLATFORM_TARGET_OVERRIDE=$NEURON_PLATFORM_TARGET_OVERRIDE QWEN35_CACHE_PLATFORM_TARGET=$QWEN35_CACHE_PLATFORM_TARGET CHUNK_SIZE=$CHUNK_SIZE DN_STABLE_C32=$DN_STABLE_C32 DN_PAIRED_BATCH=$DN_PAIRED_BATCH LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so torchrun --nproc-per-node=$tp static_decode_35b.py --model-path /models/Qwen3.5-35B-A3B --batch-size 2 --num-layers $layers --max-seq-len 20480 --prefill-bench 20000 --bucket-chunk $bucket --bucket-compile 1 --prefill-splits $splits --skip-compile"
 export QWEN35_COMPILE_COMMAND_SHA256="$(
   printf '%s' "$command_text" | sha256sum | awk '{print $1}'
 )"
@@ -213,8 +222,8 @@ fi
     QWEN35_COMPILE_HOST QWEN35_COMPILE_REGION QWEN35_TP QWEN35_LNC \
     QWEN35_BATCH_SIZE QWEN35_NUM_LAYERS QWEN35_MAX_SEQ_LEN QWEN35_PREFILL_TOKENS \
     QWEN35_BUCKET_CHUNK QWEN35_PREFILL_SPLITS QWEN35_COMPILE_COMMAND_SHA256 \
-    CHUNK_SIZE MOE_CTE_BLOCK NEURON_CC_FLAGS NEURON_PLATFORM_TARGET_OVERRIDE \
-    QWEN35_PLATFORM_TARGET_SHIM_DEBUG
+    CHUNK_SIZE DN_STABLE_C32 DN_PAIRED_BATCH MOE_CTE_BLOCK NEURON_CC_FLAGS \
+    NEURON_PLATFORM_TARGET_OVERRIDE QWEN35_PLATFORM_TARGET_SHIM_DEBUG
   do
     printf 'export %s=%q\n' "$name" "${!name:-unknown}"
   done
@@ -244,7 +253,8 @@ docker run -d --name "$container_name" --privileged \
   -e QWEN35_PLATFORM_TARGET_SHIM_DEBUG="$QWEN35_PLATFORM_TARGET_SHIM_DEBUG" \
   -e MOE_CTE=1 -e MOE_CTE_NKI_PACK=1 -e MOE_CTE_BLOCK=512 \
   -e GQA_CTE_PREFILL=1 -e GQA_DYNAMIC_ROPE_KV=1 \
-  -e DN_CHUNK_NKI=1 -e CHUNK_SIZE=16 -e DN_PAIRED_BATCH=1 \
+  -e DN_CHUNK_NKI=1 -e CHUNK_SIZE="$CHUNK_SIZE" \
+  -e DN_STABLE_C32="$DN_STABLE_C32" -e DN_PAIRED_BATCH="$DN_PAIRED_BATCH" \
   -e DN_NKI=1 -e GQATAIL=1 -e PREFILL_FINGERPRINT=1 \
   -e DN_K_HEADS="$dn_k_heads" -e DN_V_HEADS="$dn_v_heads" \
   -e GQA_Q_HEADS="$gqa_q_heads" \

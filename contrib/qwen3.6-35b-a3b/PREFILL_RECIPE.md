@@ -34,9 +34,10 @@ the Trn2** and benches in the same run. No device-to-device transfer step.
 | Container | internal Neuron DLC (`QWEN35_NATIVE_IMAGE`) with host Neuron lib available |
 
 The compile is split into 4 regions of 10 layers (`--splits 4`) to keep per-region
-peak RAM manageable. The stable C32 inverse (`_tri_inverse_blockdiag`) is already
-in `kernels/deltanet_chunked_prefill_35b.py`; it is selected at runtime by
-`DN_STABLE_C32=0 CHUNK_SIZE=32` (§3). The fused NKI route packer
+peak RAM manageable. The stable C32 inverse (`_tri_inverse_blockdiag`) is in
+`kernels/deltanet_chunked_prefill_35b.py`, and `compile_prefill_trn2.sh` now
+**defaults to stable C32** (`CHUNK_SIZE=32 DN_STABLE_C32=0 DN_PAIRED_BATCH=0`);
+the paired-C16 fallback is one env override (§3b). The fused NKI route packer
 (`MOE_CTE_NKI_PACK=1`) is set inside the compile script.
 
 ---
@@ -57,18 +58,9 @@ swapon --show   # confirm ~16G available
 **and** runs the throughput benchmark (`--prefill-bench 20000`) + fingerprints, in
 a single native run.
 
-### 3a. Fastest — stable C32 (≈2,277 tok/s, +8.5%)
+### 3a. Fastest — stable C32 (≈2,277 tok/s, +8.5%) — default
 
-The committed script hard-pins the DeltaNet chunking (`CHUNK_SIZE=16`,
-`DN_PAIRED_BATCH=1`) and does not pass `DN_STABLE_C32`, so **two lines must be
-changed** to build the C32 graph. In `deploy/compile_prefill_trn2.sh`:
-
-- the exported-env line (~L183): `export CHUNK_SIZE=16` → `export CHUNK_SIZE=32`
-- the container `-e` line (~L247): `-e CHUNK_SIZE=16 -e DN_PAIRED_BATCH=1` →
-  `-e CHUNK_SIZE=32 -e DN_STABLE_C32=0` (drop `DN_PAIRED_BATCH`; C32 does not pair)
-
-Use a **separate `--cache-dir`** from any C16 build — `CHUNK_SIZE` changes the
-traced graph, so C32 will not (and must not) cache-hit a C16 cache root. Then:
+The script defaults to stable C32; no flags or edits needed:
 
 ```bash
 source .env
@@ -77,16 +69,21 @@ deploy/compile_prefill_trn2.sh \
   --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c32"
 ```
 
-### 3b. Reliable default — paired C16 (≈2,090 tok/s)
+### 3b. Reliable fallback — paired C16 (≈2,090 tok/s)
 
-The committed script builds C16 as-is (no edits):
+Override the chunk config via environment (one distinct `--cache-dir`):
 
 ```bash
 source .env
-DN_PAIRED_BATCH=1 deploy/compile_prefill_trn2.sh \
+CHUNK_SIZE=16 DN_STABLE_C32=1 DN_PAIRED_BATCH=1 \
+deploy/compile_prefill_trn2.sh \
   --tp 4 --lnc 2 --layers 40 --splits 4 --bucket 1024 --optlevel 1 \
   --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c16"
 ```
+
+`CHUNK_SIZE` changes the traced graph, so **each config needs its own
+`--cache-dir`** — C32 will not (and must not) cache-hit a C16 cache root, and the
+script's metadata guard refuses to mix them.
 
 - Both paths need `QWEN35_NATIVE_IMAGE`, `QWEN35_MODEL_DIR` (BF16), `QWEN35_NKILIB_DIR`.
 - The script pins `DN_CHUNK_NKI=1`, `MOE_CTE=1 MOE_CTE_NKI_PACK=1`, batch-size 2,
