@@ -138,7 +138,14 @@ dtype. `MOE_FUSED_W8_FP8_IMPL=row` uses the nkilib row-scaled scheduler,
 `block_pow2` maps each 128x128 source block to one native legacy-E4M3 plane by
 an exact scale exponent shift. `block_pow2_coalesced` retains those exact
 128x128 scales but uses 128x512 native-E4M3 slabs, rotating buffers, and
-BS-dependent TensorE column packing; it supports BS=32/64/128. Direct E4M3FN
+BS-dependent TensorE column packing; it supports BS=32/64/128.
+`block_ob_coalesced` (Reduction B1) re-quantizes the experts to ONE scale per
+128-output-block (input-independent), so the native-FP8 contraction accumulates
+the whole hidden dim in PSUM and each output block is post-scaled ONCE — removing
+the per-128x128-block Vector scale-adds. It is the fastest decode config: at
+BS=128 with tiled DeltaNet conv it reaches **442.1 tok/s (289.5 ms/tok)**, +28.7%
+over `block_pow2_coalesced` (343.6 tok/s), with bit-identical output (gen hash
+`0cc59fb25112`). See `DECODE_RECIPE.md`. Direct E4M3FN
 matmul is not supported by this Trn2 toolchain and bitcasting codes
 `0x78..0x7e` is invalid. The `int8` fallback uses symmetric signed INT8 per
 source block. The path is mutually exclusive with `MOE_SPARSE`,
