@@ -30,6 +30,7 @@ from moe_w8 import (  # noqa: E402
     pack_coalesced_block_scales,
     QuantizationStats,
     requantize_official_fp8,
+    requantize_official_fp8_output_block,
     requantize_official_fp8_pow2,
     requantize_official_fp8_row,
     retain_official_fp8,
@@ -525,6 +526,90 @@ def test_official_reader_builds_coalesced_pow2_layout(tmp_path):
     )
     assert stats.shifted_block_count > 0
     assert stats.clipped_count == 0
+
+
+def _random_official_block_fp8(out, inp, gain, seed):
+    """Random weight rounded to per-128x128-block E4M3FN bytes + BF16 scales."""
+    generator = torch.Generator().manual_seed(seed)
+    weight = torch.randn(out, inp, generator=generator) * gain
+    row_blocks, col_blocks = out // 128, inp // 128
+    scales = torch.empty(row_blocks, col_blocks, dtype=torch.bfloat16)
+    raw = torch.empty(out, inp, dtype=torch.uint8)
+    for r in range(row_blocks):
+        for c in range(col_blocks):
+            block = weight[r * 128:(r + 1) * 128, c * 128:(c + 1) * 128]
+            scale = (block.abs().amax().clamp_min(1e-12) / 448.0).to(torch.bfloat16)
+            scales[r, c] = scale
+            quantized = (block / scale.float()).to(torch.float8_e4m3fn)
+            raw[r * 128:(r + 1) * 128, c * 128:(c + 1) * 128] = quantized.view(torch.uint8)
+    return raw.view(torch.uint8), scales
+
+
+def test_output_block_requant_scale_is_input_independent():
+    raw, source_scales = _random_official_block_fp8(512, 2048, 0.02, seed=1)
+    bytes_out, scales_out, stats = requantize_official_fp8_output_block(
+        raw, source_scales
+    )
+    # Reduction B invariant: one scale per output-row block, constant across
+    # every input-column block. This is what lets the kernel accumulate in PSUM.
+    assert torch.equal(scales_out, scales_out[:, :1].expand_as(scales_out))
+    assert scales_out.shape == source_scales.shape
+    validate_legacy_e4m3_bytes(bytes_out)
+    # Coarsening a uniform-magnitude weight costs ~nothing beyond legacy-E4M3
+    # rounding, so the gated weight-level metric still passes comfortably.
+    assert stats.cosine >= 0.9995
+    assert stats.normalized_rmse <= 0.035
+
+
+def test_official_reader_builds_output_block_coalesced_layout(tmp_path):
+    expected = _write_official_expert_checkpoint(tmp_path)
+    reader = OfficialFP8ExpertReader(tmp_path)
+    try:
+        converted, stats = reader.load_layer(
+            0, 0, 2, "fp8", fp8_impl="block_ob_coalesced"
+        )
+    finally:
+        reader.close()
+
+    assert converted["w8_gate_up"].shape == (2, 256, 2, 128)
+    assert converted["w8_gate_up_scale"].shape == (2, 128, 4)
+    assert converted["w8_down"].shape == (2, 128, 256)
+    assert converted["w8_down_scale"].shape == (2, 128, 2)
+    validate_legacy_e4m3_bytes(converted["w8_gate_up"])
+    validate_legacy_e4m3_bytes(converted["w8_down"])
+    assert stats.cosine >= 0.9995
+
+    gate_up_grid, down_grid = unpack_coalesced_block_scales(
+        converted["w8_gate_up_scale"],
+        converted["w8_down_scale"],
+        hidden_size=256,
+        intermediate_size=128,
+    )
+    # gate/up scale must not vary along the hidden (input) block axis [dim 2];
+    # down must not vary along the intermediate (input) block axis [dim 1].
+    # The output axes (intermediate for gate/up, hidden for down) still vary.
+    assert torch.equal(
+        gate_up_grid, gate_up_grid[:, :, :1, :].expand_as(gate_up_grid)
+    )
+    assert torch.equal(
+        down_grid, down_grid[:, :1, :].expand_as(down_grid)
+    )
+
+    # Dequantizing the stored bytes with the coarse grid must reproduce exactly
+    # what the requantizer reconstructed (kernel-consumed representation).
+    for projection_index, projection in ((0, "gate_proj"), (1, "up_proj")):
+        recovered = dequantize_w8(
+            converted["w8_gate_up"][0, :, projection_index, :],
+            gate_up_grid[0, projection_index],
+            "fp8",
+        ).transpose(0, 1)
+        assert recovered.shape == expected[0, projection].shape
+        cosine = torch.nn.functional.cosine_similarity(
+            recovered.flatten().double(),
+            expected[0, projection].flatten().double(),
+            dim=0,
+        )
+        assert cosine >= 0.9995
 
 
 def test_retain_official_fp8_is_exact_and_validates_scales():

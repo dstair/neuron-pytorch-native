@@ -23,8 +23,8 @@ Usage: compile_decode_fp8_trn2.sh [options]
 
 Options:
   --mode MODE          fp8 or reference
-  --fp8-impl MODE      row, dual, block_pow2, or block_pow2_coalesced
-                       (default: row)
+  --fp8-impl MODE      row, dual, block_pow2, block_pow2_coalesced, or
+                       block_ob_coalesced (default: row)
   --layout MODE        weight or token stationary (default: weight)
   --fp8-projections P  all, gate_up, or down (default: all)
   --fp8-layer-start N  First layer using FP8 projections (default: 0)
@@ -96,8 +96,9 @@ done
   die "--mode must be fp8 or reference"
 [[ "$fp8_impl" == "row" || "$fp8_impl" == "dual" ||
    "$fp8_impl" == "block_pow2" ||
-   "$fp8_impl" == "block_pow2_coalesced" ]] ||
-  die "--fp8-impl must be row, dual, block_pow2, or block_pow2_coalesced"
+   "$fp8_impl" == "block_pow2_coalesced" ||
+   "$fp8_impl" == "block_ob_coalesced" ]] ||
+  die "--fp8-impl must be row, dual, block_pow2, block_pow2_coalesced, or block_ob_coalesced"
 [[ "$mode" == "fp8" || "$fp8_impl" == "row" ]] ||
   die "--fp8-impl applies only to --mode fp8"
 [[ "$layout" == "weight" || "$layout" == "token" ]] ||
@@ -134,8 +135,8 @@ done
 [[ "$batch_size" == "32" || "$batch_size" == "64" ||
    "$batch_size" == "128" || "$batch_size" == "256" ]] ||
   die "--batch-size must be 32, 64, 128, or 256"
-[[ "$fp8_impl" != "block_pow2_coalesced" || "$batch_size" != "256" ]] ||
-  die "--fp8-impl block_pow2_coalesced supports batch sizes 32, 64, and 128"
+[[ ( "$fp8_impl" != "block_pow2_coalesced" && "$fp8_impl" != "block_ob_coalesced" ) || "$batch_size" != "256" ]] ||
+  die "--fp8-impl ${fp8_impl} supports batch sizes 32, 64, and 128"
 [[ "$compile_concurrency" =~ ^[1-8]$ ]] ||
   die "--compile-concurrency must be in [1, 8]"
 [[ -n "$cache_dir" ]] ||

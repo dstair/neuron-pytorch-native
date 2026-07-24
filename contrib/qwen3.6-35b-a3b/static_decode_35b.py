@@ -197,10 +197,11 @@ if MOE_FUSED_W8_FP8_IMPL not in (
     "dual",
     "block_pow2",
     "block_pow2_coalesced",
+    "block_ob_coalesced",
 ):
     raise RuntimeError(
         "MOE_FUSED_W8_FP8_IMPL must be 'row', 'dual', 'block_pow2', "
-        "or 'block_pow2_coalesced'"
+        "'block_pow2_coalesced', or 'block_ob_coalesced'"
     )
 USE_MOE_FUSED_W8_ROW_FP8 = (
     MOE_FUSED_W8 == "fp8" and MOE_FUSED_W8_FP8_IMPL == "row"
@@ -211,6 +212,17 @@ USE_MOE_FUSED_W8_DUAL_FP8 = (
 USE_MOE_FUSED_W8_BLOCK_COALESCED_FP8 = (
     MOE_FUSED_W8 == "fp8"
     and MOE_FUSED_W8_FP8_IMPL == "block_pow2_coalesced"
+)
+# Reduction B1: coarse per-output-block scales + PSUM-accumulate kernel.
+USE_MOE_FUSED_W8_BLOCK_OB_COALESCED_FP8 = (
+    MOE_FUSED_W8 == "fp8"
+    and MOE_FUSED_W8_FP8_IMPL == "block_ob_coalesced"
+)
+# Both share the coalesced weight layout, batch-size support, and kernel entry
+# family (the _ob variant only differs by post-accumulation scaling).
+USE_MOE_FUSED_W8_COALESCED_KERNEL = (
+    USE_MOE_FUSED_W8_BLOCK_COALESCED_FP8
+    or USE_MOE_FUSED_W8_BLOCK_OB_COALESCED_FP8
 )
 MOE_FUSED_W8_FP8_PROJECTIONS = os.environ.get(
     "MOE_FUSED_W8_FP8_PROJECTIONS", "all"
@@ -633,11 +645,11 @@ class StaticDecode35B(nn.Module):
                 "MOE_FUSED_W8 supports batch sizes 32, 64, 128, and 256"
             )
         if (
-            USE_MOE_FUSED_W8_BLOCK_COALESCED_FP8
+            USE_MOE_FUSED_W8_COALESCED_KERNEL
             and batch_size not in (32, 64, 128)
         ):
             raise RuntimeError(
-                "block_pow2_coalesced supports batch sizes 32, 64, and 128"
+                "coalesced block FP8 supports batch sizes 32, 64, and 128"
             )
         self.max_seq_len = max_seq_len
         self.world_size = world_size
@@ -971,8 +983,13 @@ class StaticDecode35B(nn.Module):
                 getattr(self, f"l{i}_w8_down_scale"),
                 affinities,
             )
-        elif USE_MOE_FUSED_W8_BLOCK_COALESCED_FP8:
-            local_routed = torch.ops.moe_w8.fused_fp8_block_coalesced(
+        elif USE_MOE_FUSED_W8_COALESCED_KERNEL:
+            coalesced_op = (
+                torch.ops.moe_w8.fused_fp8_block_coalesced_ob
+                if USE_MOE_FUSED_W8_BLOCK_OB_COALESCED_FP8
+                else torch.ops.moe_w8.fused_fp8_block_coalesced
+            )
+            local_routed = coalesced_op(
                 x2d.to(torch.bfloat16),
                 getattr(self, f"l{i}_w8_gate_up"),
                 getattr(self, f"l{i}_w8_down"),
