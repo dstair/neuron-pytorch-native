@@ -115,6 +115,45 @@ def make_coalesced_case(case):
     )
 
 
+def make_coalesced_ob_case(case):
+    """Coalesced case with input-independent (per-output-block) scales.
+
+    Reduction B1 requires s[i,o] == s[o]: the kernel post-scales the whole
+    PSUM-accumulated contraction with input-block 0's scale. Force the synthetic
+    grids constant across the input-block axis (hidden blocks for gate/up,
+    intermediate blocks for down) so the coalesced CPU reference — which applies
+    the per-block grid — agrees with the kernel.
+    """
+    (
+        hidden,
+        gate_up,
+        _gate_up_residual,
+        down,
+        _down_residual,
+        gate_up_scales,
+        down_scales,
+        affinities,
+    ) = case
+    # gate/up grid [E,2,I/128,H/128,128]; input axis is H/128 (dim 3).
+    gate_up_ob = gate_up_scales[:, :, :, :1, :].expand_as(gate_up_scales)
+    # down grid [E,H/128,I/128,128]; input axis is I/128 (dim 2).
+    down_ob = down_scales[:, :, :1, :].expand_as(down_scales)
+    gate_up_scale_table, down_scale_table = (
+        pack_coalesced_block_scales(
+            gate_up_ob[..., 0].contiguous(),
+            down_ob[..., 0].contiguous(),
+        )
+    )
+    return (
+        hidden,
+        gate_up.permute(0, 2, 1, 3).contiguous(),
+        down,
+        gate_up_scale_table,
+        down_scale_table,
+        affinities,
+    )
+
+
 def make_official_case(
     batch,
     checkpoint,
@@ -147,7 +186,7 @@ def make_official_case(
         reader.close()
     hidden_size = (
         converted["w8_gate_up"].shape[1]
-        if fp8_impl == "block_pow2_coalesced"
+        if fp8_impl in ("block_pow2_coalesced", "block_ob_coalesced")
         else converted["w8_gate_up"].shape[2]
     )
     hidden = torch.randn(batch, hidden_size).to(torch.bfloat16)
@@ -449,7 +488,12 @@ def main():
     parser.add_argument("--mode", choices=("fp8", "int8"), required=True)
     parser.add_argument(
         "--fp8-impl",
-        choices=("dual", "block_pow2", "block_pow2_coalesced"),
+        choices=(
+            "dual",
+            "block_pow2",
+            "block_pow2_coalesced",
+            "block_ob_coalesced",
+        ),
         default="dual",
     )
     parser.add_argument("--layout", choices=("weight", "token"), default="weight")
@@ -501,7 +545,9 @@ def main():
             "--drop-residual requires --mode fp8 --fp8-impl dual"
         )
     if args.mode == "fp8":
-        if args.fp8_impl == "block_pow2_coalesced":
+        if args.fp8_impl == "block_ob_coalesced":
+            op = torch.ops.moe_w8.fused_fp8_block_coalesced_ob
+        elif args.fp8_impl == "block_pow2_coalesced":
             op = torch.ops.moe_w8.fused_fp8_block_coalesced
         elif args.fp8_impl == "block_pow2" or args.drop_residual:
             op = torch.ops.moe_w8.fused_fp8_native
@@ -553,6 +599,11 @@ def main():
                 and args.fp8_impl == "block_pow2_coalesced"
             ):
                 case = make_coalesced_case(case)
+            elif (
+                args.mode == "fp8"
+                and args.fp8_impl == "block_ob_coalesced"
+            ):
+                case = make_coalesced_ob_case(case)
         expected = cpu_reference(
             case, args.mode, include_residual=not args.drop_residual
         )
@@ -585,6 +636,7 @@ def main():
         if args.mode == "fp8" and args.fp8_impl in (
             "block_pow2",
             "block_pow2_coalesced",
+            "block_ob_coalesced",
         ):
             assert cosine >= 0.9999
             assert normalized_rmse <= 0.01
