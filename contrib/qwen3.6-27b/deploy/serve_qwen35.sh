@@ -1,13 +1,24 @@
 #!/bin/bash
-# Serve the qwen3_5 plugin (fork) in the 28ce3c3 vLLM-Neuron image.
+# Serve the qwen3_5 plugin fork in the configured vLLM-Neuron image.
 # Args: $1=max_num_seqs (BS)  $2="extra env" (e.g. QWEN3_5_DELTANET_BATCHED=1)
 set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/common.sh"
+
 BS="${1:-1}"
 EXTRA_ENV="${2:-}"
-IMG=${ECR_REGISTRY}/concourse-release-28ce3c3:latest
+IMG="$QWEN27_VLLM_IMAGE"
 PLUGIN=/opt/conda/lib/python3.12/site-packages/vllm_neuron/model
-FORK=/home/ubuntu/qwen3_5_fork/vllm_neuron/model
-mkdir -p /mnt/nvme/vllm_compile_cache
+FORK="$QWEN27_VLLM_PLUGIN_DIR"
+require_env QWEN27_COMPILE_CACHE_DIR
+mkdir -p "$QWEN27_COMPILE_CACHE_DIR"
+CACHE_DIR="$(cd "$QWEN27_COMPILE_CACHE_DIR" && pwd)"
+
+EXTRA_ENV_ARGS=()
+if [[ -n "$EXTRA_ENV" ]]; then
+  EXTRA_ENV_ARGS=(-e "$EXTRA_ENV")
+fi
 
 docker rm -f qwen35_serve 2>/dev/null
 docker run -d --name qwen35_serve \
@@ -17,18 +28,18 @@ docker run -d --name qwen35_serve \
   -e VLLM_PLUGINS=neuron \
   -e QWEN3_5_KERNELS_DIR=/kernels \
   -e VLLM_NEURON_COMPILATION_TIMEOUT=1800 \
-  $( [ -n "$EXTRA_ENV" ] && echo "-e $EXTRA_ENV" ) \
-  -v /mnt/nvme/Qwen3.6-27B:/models/Qwen3.6-27B:ro \
-  -v /home/ubuntu/qwen3_6/kernels:/kernels:ro \
-  -v $FORK/qwen3_5:$PLUGIN/qwen3_5:ro \
-  -v $FORK/registry.py:$PLUGIN/registry.py:ro \
-  -v /mnt/nvme/vllm_compile_cache:/root/.cache/vllm/neuron/compile_cache \
+  "${EXTRA_ENV_ARGS[@]}" \
+  -v "$QWEN27_MODEL_DIR":/models/Qwen3.6-27B:ro \
+  -v "$QWEN27_SOURCE_DIR/kernels":/kernels:ro \
+  -v "$FORK/qwen3_5":"$PLUGIN/qwen3_5":ro \
+  -v "$FORK/registry.py":"$PLUGIN/registry.py":ro \
+  -v "$CACHE_DIR":/root/.cache/vllm/neuron/compile_cache \
   "$IMG" \
   python3 -m vllm.entrypoints.openai.api_server \
     --model /models/Qwen3.6-27B \
     --tensor-parallel-size 4 \
     --max-model-len 256 \
-    --max-num-seqs $BS \
+    --max-num-seqs "$BS" \
     --no-enable-prefix-caching \
     --port 8000
 echo "launched qwen35_serve BS=$BS"

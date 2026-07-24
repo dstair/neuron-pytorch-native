@@ -12,7 +12,7 @@ Checks:
 
 Usage:
     python3 kernels/tests/test_parity_vs_hf.py \
-        --model-path /mnt/nvme/tiny-qwen36-moe [--prompt-len 8] [--gen 6]
+        --model-path /models/tiny-qwen36-moe [--prompt-len 8] [--gen 6]
 """
 import argparse
 import os
@@ -32,7 +32,7 @@ import static_decode_35b as S
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-path", default="/mnt/nvme/tiny-qwen36-moe")
+    ap.add_argument("--model-path", default="/models/tiny-qwen36-moe")
     ap.add_argument("--prompt-len", type=int, default=8)
     ap.add_argument("--gen", type=int, default=6)
     ap.add_argument("--max-seq-len", type=int, default=64)

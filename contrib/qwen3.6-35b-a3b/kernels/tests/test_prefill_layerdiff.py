@@ -61,6 +61,7 @@ def main():
     ap.add_argument("--model-path", default="/models/Qwen3.5-35B-A3B")
     ap.add_argument("--seq", type=int, default=128)
     ap.add_argument("--max-seq-len", type=int, default=2048)
+    ap.add_argument("--num-layers", type=int, default=6)
     args = ap.parse_args()
 
     import torch_neuronx  # noqa: F401
@@ -69,6 +70,9 @@ def main():
     device = torch.neuron.current_device()
 
     D.load_from_config(os.path.join(args.model_path, "config.json"))
+    D.NUM_LAYERS = args.num_layers
+    D.NUM_GQA = sum(1 for i in range(D.NUM_LAYERS) if D.layer_type(i) == "gqa")
+    D.NUM_DELTANET = D.NUM_LAYERS - D.NUM_GQA
     weights = S.load_sharded_weights(args.model_path, rank, ws, num_layers=D.NUM_LAYERS)
     mod = S.StaticDecode35B(weights, args.max_seq_len, ws, batch_size=1, rank=rank).to(device).eval()
 

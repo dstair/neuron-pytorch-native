@@ -45,9 +45,9 @@ def reference(query, key, cos, sin):
 
 def main():
     torch.manual_seed(7)
-    query = torch.randn(Q_HEADS, CHUNK, HEAD_DIM, dtype=torch.bfloat16)
-    key = torch.randn(CHUNK, HEAD_DIM, dtype=torch.bfloat16)
-    value = torch.randn(CHUNK, HEAD_DIM, dtype=torch.bfloat16)
+    query = torch.randn(1, Q_HEADS, CHUNK, HEAD_DIM, dtype=torch.bfloat16)
+    key = torch.randn(1, CHUNK, HEAD_DIM, dtype=torch.bfloat16)
+    value = torch.randn(1, CHUNK, HEAD_DIM, dtype=torch.bfloat16)
     inv = 1.0 / (10_000_000.0 ** (torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM))
     freqs = torch.outer(torch.arange(KMAX).float(), inv)
     rope = torch.cat([freqs, freqs], dim=-1)
@@ -78,18 +78,18 @@ def main():
         )
         torch.neuron.synchronize()
         q_ref, k_ref = reference(
-            query.transpose(0, 1),
-            key,
+            query[0].transpose(0, 1),
+            key[0],
             cos[base : base + CHUNK, None, :],
             sin[base : base + CHUNK, None, :],
         )
         q_ref = q_ref.transpose(0, 1)
-        q_actual = out.cpu()
+        q_actual = out[0].cpu()
         kc_actual = kc.cpu()
         vc_actual = vc.cpu()
         assert torch.allclose(q_actual, q_ref, rtol=2e-2, atol=2e-2)
         assert torch.allclose(
-            key_out.cpu().float(),
+            key_out[0].cpu().float(),
             k_ref.float(),
             rtol=2e-2,
             atol=2e-2,
@@ -100,7 +100,7 @@ def main():
             rtol=2e-2,
             atol=2e-2,
         )
-        assert torch.equal(vc_actual[base : base + CHUNK], value)
+        assert torch.equal(vc_actual[base : base + CHUNK], value[0])
 
     assert torch.count_nonzero(kc.cpu()[128:256]) == 0
     assert torch.count_nonzero(kc.cpu()[384:]) == 0

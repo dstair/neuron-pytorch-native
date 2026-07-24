@@ -22,6 +22,9 @@ _DT = {
     "F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16,
     "F64": torch.float64, "I64": torch.int64, "I32": torch.int32,
     "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
+    # Keep FP8 tensors as raw bytes. The Native DLC may not expose a PyTorch
+    # FP8 dtype, and Trn2 needs legacy E4M3 rather than safetensors' E4M3FN.
+    "F8_E4M3": torch.uint8,
 }
 
 
@@ -39,9 +42,16 @@ class SafeReader:
     def keys(self):
         return [k for k in self.header if k != "__metadata__"]
 
+    def get_dtype(self, name):
+        """Return the safetensors dtype tag without translating it to torch."""
+        return self.header[name]["dtype"]
+
     def get_tensor(self, name):
         meta = self.header[name]
-        dt = _DT[meta["dtype"]]
+        dtype_tag = meta["dtype"]
+        if dtype_tag not in _DT:
+            raise TypeError(f"unsupported safetensors dtype {dtype_tag!r} for {name!r}")
+        dt = _DT[dtype_tag]
         b0, b1 = meta["data_offsets"]
         raw = self._mm[self._data_start + b0:self._data_start + b1]
         # bf16 needs the uint16 trick (frombuffer has no native bf16 on old torch)

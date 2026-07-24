@@ -47,8 +47,17 @@ def main():
     x = (torch.randn(1, Sq, H, device=device) * 0.2).float()
 
     def fresh():
-        dn = torch.zeros(D.NUM_DELTANET, 1, vh * KD, VD, device=device)
-        cv = torch.zeros(D.NUM_DELTANET, 1, qkv_dim, D.DN_CONV_KERNEL - 1, device=device)
+        # Match the production harness. Float32 here makes the .float() views in
+        # _deltanet_prefill alias mutable state inputs and tests different graph
+        # semantics than static_decode_35b.py's real prefill path.
+        dn = torch.zeros(
+            D.NUM_DELTANET, 1, vh * KD, VD,
+            dtype=torch.bfloat16, device=device,
+        )
+        cv = torch.zeros(
+            D.NUM_DELTANET, 1, qkv_dim, D.DN_CONV_KERNEL - 1,
+            dtype=torch.bfloat16, device=device,
+        )
         return dn, cv
 
     i = 0  # layer 0 is DeltaNet

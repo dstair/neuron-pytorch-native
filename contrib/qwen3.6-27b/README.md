@@ -139,11 +139,11 @@ headroom for larger batch, not per-step TPOT.
 ## Serving (vLLM-Neuron)
 
 `deploy/` contains scripts for serving the model through a vLLM-Neuron fork in
-three modes — baseline bf16, chunked-prefill, and EAGLE3 speculative decode. These
-target a container image and model weights referenced via `${ECR_REGISTRY}` / model
-mount paths; `source ../../.env` first (see the repo root README). The serving-side
-model plugin lives in a separate vLLM-Neuron fork and is not included here — these
-scripts document the runtime configuration (env flags, TP, mounts, EAGLE3 config).
+three modes — baseline bf16, chunked-prefill, and EAGLE3 speculative decode. They
+load the repository's ignored `.env` automatically; configure the image, model,
+plugin, and compile-cache locations using the `QWEN27_*` variables documented in
+`.env.example`. The serving-side model plugin lives in a separate vLLM-Neuron
+fork and is not included here.
 
 > The performance numbers above are all from the PyTorch-Native `static_decode.py`
 > harness. vLLM-Neuron serving throughput numbers are intentionally omitted.
