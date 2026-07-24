@@ -38,10 +38,12 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 | Phase | Best | Config | Recipe |
 |---|---|---|---|
 | **Prefill** | **2,276.9 agg prompt tok/s** | stable **C32**, BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+8.5% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
-| **Decode** | **343.6 tok/s @ BS=128** | FP8 `block_pow2_coalesced` MoE + tiled DeltaNet conv, TP=8/LNC=1, O2 (bit-identical to untiled) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
+| **Decode** | **442.1 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv, TP=8/LNC=1, O2 (bit-identical output) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
 
-Other reference points: latency-optimal decode **48.9 tok/s @ BS=1** (true-sparse
-MoE + `MOE_DECODE_TP`); BF16 full-graph decode **320.6 tok/s @ BS=32**.
+Other reference points: the prior FP8 `block_pow2_coalesced` decode **343.6 tok/s
+@ BS=128** (B1 is +28.7% over it, same `0cc59fb25112` gen hash); latency-optimal
+decode **48.9 tok/s @ BS=1** (true-sparse MoE + `MOE_DECODE_TP`); BF16 full-graph
+decode **320.6 tok/s @ BS=32**.
 
 Full methodology, ablations, per-optimization progression, HBM/DMA attribution,
 and the NxDI (XLA) reference comparison are in **[BENCHMARK.md](BENCHMARK.md)**.
@@ -92,7 +94,7 @@ unless noted; combine per the recipes.
 | `MOE_NKILIB=1` | nkilib fused MoE path (BF16) |
 | `MOE_FP8=1` | Older per-row FP8 grouped-matvec MoE path |
 | `MOE_FUSED_W8=fp8\|int8` | High-batch full-graph decode: fused all-expert path using the official block-scaled FP8 (or symmetric INT8) experts |
-| `MOE_FUSED_W8_FP8_IMPL=` | FP8 variant for `MOE_FUSED_W8`: `row` / `dual` / `block_pow2` / **`block_pow2_coalesced`** (the validated high-batch decode kernel) |
+| `MOE_FUSED_W8_FP8_IMPL=` | FP8 variant for `MOE_FUSED_W8`: `row` / `dual` / `block_pow2` / `block_pow2_coalesced` / **`block_ob_coalesced`** (Reduction B1: coarse per-128-output-block scale + PSUM-accumulate — the fastest decode kernel, 442.1 tok/s, bit-identical output) |
 | `MOE_FUSED_W8_FP8_LAYER_START`, `_LAYER_LIMIT` | Restrict FP8 experts to a layer range (defaults 0 / 40) — for A/B and layer-limited runs |
 | `MOE_W8_TENSOR_SCALE=1` | Experiment (**negative**, default off): dequant to BF16 with per-block scale + PSUM-accumulate; removes Vector scale-adds but is slower |
 | `MOE_W8_RESIDUAL_FP32=1` | Keep the routed accumulation residual in FP32 |
