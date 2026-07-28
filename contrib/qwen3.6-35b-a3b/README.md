@@ -37,7 +37,7 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 
 | Phase | Best | Config | Recipe |
 |---|---|---|---|
-| **Prefill** | **2,718.9 agg prompt tok/s** | stable **C32 + 4-stream block-diagonal pack** (`DN_PACK_C32=1 DN_PACK_N=4`), BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+19.4% over unpacked C32 @ 2,276.9; +30.1% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
+| **Prefill** | **2,738.0 agg prompt tok/s** | stable **C32 + 4-stream block-diagonal pack, SBUF-resident** (`DN_PACK_C32=1 DN_PACK_N=4`), BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+20.3% over unpacked C32 @ 2,276.9; +31.0% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
 | **Decode** | **442.1 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv, TP=8/LNC=1, O2 (bit-identical output) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
 
 Other reference points: the prior FP8 `block_pow2_coalesced` decode **343.6 tok/s

@@ -1,10 +1,11 @@
 # Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32, TP=4/LNC=2)
 
 Reproduces the fastest validated **prefill** configuration:
-**≈2,719 aggregate prompt tok/s** (BS=2, N=20000 tokens, query bucket 1024,
+**≈2,738 aggregate prompt tok/s** (BS=2, N=20000 tokens, query bucket 1024,
 TP=4 / LNC=2, DeltaNet **stable C32** block-diagonal inverse with **4-stream
-block-diagonal packing**, fused NKI route packer, optlevel-1) — **+19.4%** over
-unpacked C32 (≈2,277 tok/s) and **+30.1%** over the paired-C16 baseline (≈2,090).
+block-diagonal packing** and **SBUF-resident intermediates**, fused NKI route packer,
+optlevel-1) — **+20.3%** over unpacked C32 (≈2,277 tok/s) and **+31.0%** over the
+paired-C16 baseline (≈2,090).
 
 The packing (`DN_PACK_C32=1 DN_PACK_N=4`) folds four independent DeltaNet streams
 (4 of the 8 per-core V-heads) into one P=128 block-diagonal chunk tile, so the
@@ -125,7 +126,7 @@ batch ÷ prefill wall-time). References for the two configs:
 
 | Config | Wall time | Aggregate prompt tok/s |
 |---|---:|---:|
-| **Packed C32 ×4** (`DN_PACK_C32=1 DN_PACK_N=4`) — default | **14.712 s** | **2,718.9** |
+| **Packed C32 ×4, SBUF-resident** (`DN_PACK_C32=1 DN_PACK_N=4`) — default | **14.609 s** | **2,738.0** |
 | Packed C32 ×2 (`DN_PACK_N=2`) | 15.620 s | 2,560.9 |
 | Unpacked C32 (`DN_PACK_C32=0`) | 17.568 s | 2,276.9 |
 | Paired C16 | 19.141 s | 2,089.7 |
@@ -175,6 +176,13 @@ block-diagonal lower-left mask (16-wide sub-blocks). The intra-chunk matmuls thu
 **once on P=128 instead of four times on P=32** → ~4× fewer tiny-matmul instructions,
 full partition dim, ~19.4% faster. (Off-stream blocks are exactly zero, so each stream
 gets the identical baseline result.)
+
+**SBUF-resident intermediates.** The packed intra-chunk results
+(`k_c/g_cum/v_corr/k_cumdecay/intra/qSe`) stay in SBUF and are handed to the per-stream
+finish directly (extracted via on-chip `[row:row+C]` copy) instead of round-tripping
+through HBM scratch. Removes 6 HBM scratch buffers + their writes and cuts region HBM
+traffic ~0.5 GB; +0.7% (2,718.9 → 2,738.0), bit-identical. (The remaining prefill wall is
+Tensor-floor + MoE bound, not DMA — the scratch DMAs were largely overlapped.)
 
 **Correctness gate.** Both pack widths (n=2 and n=4) produce a **bit-identical** N=20000
 fingerprint to unpacked C32 — `sum=-3.12377031e+05 norm=1.20273230e+03
