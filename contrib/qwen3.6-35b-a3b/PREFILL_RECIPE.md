@@ -184,10 +184,14 @@ on identical logits + carried state is strong evidence the packing is numericall
 checks — finite warm≡timed fingerprint, final-token top-5, all-rank capture-replay cosine
 ≈ 1.0 / max_diff ~1e-6, and real-prompt coherence — so packed C32 inherits that lineage.)
 
-> Note: `deploy/run_coherence.sh` (iterative-prefill greedy continuation) currently hits
-> a pre-existing `_moe_cte` graph-break under `DNBATCHED_V2/MOE_SPARSE` on this build —
-> it fails identically with packing **off**, so it is unrelated to this change; the
-> bit-identical prefill fingerprint is the operative gate here.
+Real-prompt coherence (greedy generation, `--num-tokens`) also passes: packed C32 ×4
+produces a **token-identical** continuation to unpacked C32 — e.g. for prompt ids
+`760,6511,314,9338,369`, both emit `[11751, 369, 264, 3177, 314, 1880, 11, 10829, 11,
+321, 7431, 13, 1049, 369, 1048, 264, 3177]`. (This required a separate fix: `_moe`
+unconditionally used the context-encoding MoE kernel — a prefill-only kernel — during
+decode too, which graph-broke at T=1; `_moe` is now phase-aware and routes decode
+through `moe_tkg` on the same packed expert weights. That fix is independent of the
+DeltaNet packing.)
 
 **NKI implementation note.** The packer passes chunk base offsets as **named scalar
 arguments** (`base0..base3`), not a Python list — the NKI index specializer rejects a
