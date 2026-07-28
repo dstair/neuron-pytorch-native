@@ -522,31 +522,35 @@ def _chunk_pack4(
     qSe = nl.ndarray((P, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=qSe, data=qS, op0=nl.multiply, operand0=expg)
 
+    # Lever 2: transpose k_cumdecay/qSe ONCE on the packed [P,K_DIM] tile (-> [K_DIM,P])
+    # instead of 4x per-stream [C,K_DIM]. The finish free-slices [0:K_DIM, row:row+C].
+    kcd_T = _T(k_cumdecay, P, K_DIM)
+    qSe_T = _T(qSe, P, K_DIM)
     onesK = nl.ndarray((1, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=onesK, value=1.0)
     z11 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=z11, value=0.0)
-    _finish_paired_bank(
+    _finish_pack4_bank(
         s0, out, base0, 0,
-        k_cumdecay, qSe, intra,
+        kcd_T, qSe_T, intra,
         k_c, g_cum, v_corr,
         local_eye, local_zero, local_ones, onesK, z11, C,
     )
-    _finish_paired_bank(
+    _finish_pack4_bank(
         s1, out, base1, C,
-        k_cumdecay, qSe, intra,
+        kcd_T, qSe_T, intra,
         k_c, g_cum, v_corr,
         local_eye, local_zero, local_ones, onesK, z11, C,
     )
-    _finish_paired_bank(
+    _finish_pack4_bank(
         s2, out, base2, 2 * C,
-        k_cumdecay, qSe, intra,
+        kcd_T, qSe_T, intra,
         k_c, g_cum, v_corr,
         local_eye, local_zero, local_ones, onesK, z11, C,
     )
-    _finish_paired_bank(
+    _finish_pack4_bank(
         s3, out, base3, 3 * C,
-        k_cumdecay, qSe, intra,
+        kcd_T, qSe_T, intra,
         k_c, g_cum, v_corr,
         local_eye, local_zero, local_ones, onesK, z11, C,
     )
@@ -717,6 +721,54 @@ def _finish_paired_bank(
     nisa.activation(dst=tdmg, op=nl.exp, data=tdmg_arg, bias=zC1, scale=1.0)
     k_c = nl.ndarray((C, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=k_c, src=key_scratch[row:row + C, 0:K_DIM])
+    k_w = nl.ndarray((C, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=k_w, data=k_c, op0=nl.multiply, operand0=tdmg)
+    upd = _mm(k_w, v_new, K_DIM, V_DIM)
+    nisa.tensor_tensor(dst=s, data1=s, data2=upd, op=nl.add)
+
+
+def _finish_pack4_bank(
+    s, out, base, row,
+    kcd_T, qSe_T, intra, key, gcum, vcorr,
+    eye, zC1, onesC, onesK, z11, C,
+):
+    """Pack4 finish (Lever 2): kcd_T/qSe_T are the ALREADY-transposed packed tiles
+    [K_DIM, P] (transposed once in _chunk_pack4 instead of 4x per-stream on [C,K_DIM]).
+    Stream i's stationary is the free-axis column slice [0:K_DIM, row:row+C] — the
+    transpose of that stream's [C,K_DIM] block, so matmul results are identical. intra/
+    key/gcum/vcorr are the packed [P,*] SBUF tiles (per-stream [row:row+C] extracted on
+    chip). Removes 2 per-stream transposes + 2 DMA reads per bank vs _finish_paired_bank.
+    """
+    vprime = _mm(kcd_T[0:K_DIM, row:row + C], s, C, V_DIM)
+    v_corr = nl.ndarray((C, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=v_corr, src=vcorr[row:row + C, 0:V_DIM])
+    v_new = nl.ndarray((C, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=v_new, data1=v_corr, data2=vprime, op=nl.subtract)
+
+    attn_inter = _mm(qSe_T[0:K_DIM, row:row + C], s, C, V_DIM)
+    intra_c = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=intra_c, src=intra[row:row + C, row:row + C])
+    intra_T = _T(intra_c, C, C)
+    o_chunk = _mm(intra_T, v_new, C, V_DIM)
+    nisa.tensor_tensor(dst=o_chunk, data1=o_chunk, data2=attn_inter, op=nl.add)
+    nisa.dma_copy(dst=out[base:base + C, 0:V_DIM], src=o_chunk)
+
+    g_cum = nl.ndarray((C, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=g_cum, src=gcum[row:row + C, 0:1])
+    eye_last = eye[0:C, C - 1:C]
+    td = _mm(eye_last, g_cum, 1, 1)
+    exp_td = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=exp_td, op=nl.exp, data=td, bias=z11, scale=1.0)
+    exp_td_col = _mm(onesK, exp_td, K_DIM, 1)
+    nisa.tensor_scalar(dst=s, data=s, op0=nl.multiply, operand0=exp_td_col)
+
+    td_C = _mm(onesC, td, C, 1)
+    tdmg_arg = nl.ndarray((C, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=tdmg_arg, data1=td_C, data2=g_cum, op=nl.subtract)
+    tdmg = nl.ndarray((C, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=tdmg, op=nl.exp, data=tdmg_arg, bias=zC1, scale=1.0)
+    k_c = nl.ndarray((C, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=k_c, src=key[row:row + C, 0:K_DIM])
     k_w = nl.ndarray((C, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=k_w, data=k_c, op0=nl.multiply, operand0=tdmg)
     upd = _mm(k_w, v_new, K_DIM, V_DIM)
