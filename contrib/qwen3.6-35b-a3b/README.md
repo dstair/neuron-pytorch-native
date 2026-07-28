@@ -37,7 +37,7 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 
 | Phase | Best | Config | Recipe |
 |---|---|---|---|
-| **Prefill** | **2,276.9 agg prompt tok/s** | stable **C32**, BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+8.5% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
+| **Prefill** | **2,718.9 agg prompt tok/s** | stable **C32 + 4-stream block-diagonal pack** (`DN_PACK_C32=1 DN_PACK_N=4`), BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+19.4% over unpacked C32 @ 2,276.9; +30.1% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
 | **Decode** | **343.6 tok/s @ BS=128** | FP8 `block_pow2_coalesced` MoE + tiled DeltaNet conv, TP=8/LNC=1, O2 (bit-identical to untiled) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
 
 Other reference points: latency-optimal decode **48.9 tok/s @ BS=1** (true-sparse
@@ -64,7 +64,10 @@ unless noted; combine per the recipes.
 | `DN_TILED_CONV=1` | Tiled conv-state layout + coalesced `mixed_qkv` DMA (decode) — ~+15–19% at BS=32/128, bit-identical |
 | `DN_CHUNK_NKI=1` | Chunked DeltaNet **prefill** NKI kernel (stable long-context) |
 | `CHUNK_SIZE=16\|32` | DeltaNet prefill chunk size (default 16). `32` = the faster stable-C32 path (pair with `DN_STABLE_C32=0`) |
-| `DN_STABLE_C32=0` | Use the numerically-stable block-diagonal C32 inverse (the +8.5% prefill path). Default `1` |
+| `DN_STABLE_C32=0` | Use the numerically-stable block-diagonal C32 inverse (the C32 prefill path). Default `1` |
+| `DN_PACK_C32=1` | Pack N independent C32 streams into one P=N·32 block-diagonal tile — fewer/larger intra-chunk matmuls, fills the PE partition dim. **The fastest prefill path**; bit-identical to unpacked C32. Requires `DN_STABLE_C32=0` |
+| `DN_PACK_N=2\|4` | C32 pack width (default `4` = P=128, the ceiling; `4`→+19.4%, `2`→+12.5% vs unpacked C32) |
+| `DN_STREAM_WINDOW=N` | Prefill stream software-pipeline width (default `1`). Kept for experiments; no throughput win at O1/O3 (compiler declines to overlap unrolled streams) |
 | `DN_PAIRED_BATCH=1` | Paired two-prompt C16 DeltaNet batching (the C16 prefill baseline path) |
 | `DN_WIDE_CONV=1` | Wide-convolution DeltaNet variant |
 | `DN_K_HEADS`, `DN_V_HEADS` | Override per-rank DeltaNet K/V head counts (topology/sharding) |

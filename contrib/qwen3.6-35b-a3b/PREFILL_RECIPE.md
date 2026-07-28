@@ -1,14 +1,18 @@
-# Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (stable C32, TP=4/LNC=2)
+# Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32, TP=4/LNC=2)
 
 Reproduces the fastest validated **prefill** configuration:
-**≈2,277 aggregate prompt tok/s** (BS=2, N=20000 tokens, query bucket 1024,
-TP=4 / LNC=2, DeltaNet **stable C32** block-diagonal inverse, fused NKI route
-packer, optlevel-1) — **+8.5%** over the paired-C16 baseline (≈2,090 tok/s).
+**≈2,719 aggregate prompt tok/s** (BS=2, N=20000 tokens, query bucket 1024,
+TP=4 / LNC=2, DeltaNet **stable C32** block-diagonal inverse with **4-stream
+block-diagonal packing**, fused NKI route packer, optlevel-1) — **+19.4%** over
+unpacked C32 (≈2,277 tok/s) and **+30.1%** over the paired-C16 baseline (≈2,090).
 
-C16 remains the compiled-in default and the reliable fallback; **C32 is the
-opt-in faster path** (`DN_STABLE_C32=0 CHUNK_SIZE=32`) and is validated as
-numerically equivalent to C16 (see §6). Both configs use identical shapes,
-topology, and the fused NKI route packer.
+The packing (`DN_PACK_C32=1 DN_PACK_N=4`) folds four independent DeltaNet streams
+(4 of the 8 per-core V-heads) into one P=128 block-diagonal chunk tile, so the
+tiny 32×32 intra-chunk matmuls/transposes run once on a P=128 tile instead of four
+times on P=32 — far fewer instructions and the full PE partition dimension used.
+It is validated **bit-identical** to unpacked C32 (see §6). C16 remains the
+compiled-in default and reliable fallback; **packed C32 is the opt-in fastest
+path**. All configs use identical shapes, topology, and the fused NKI route packer.
 
 All host/path values live in `.env` — copy `.env.example` to `.env` and fill in.
 This recipe references: `QWEN35_NATIVE_IMAGE`, `QWEN35_MODEL_DIR` (BF16 — prefill
@@ -34,11 +38,12 @@ the Trn2** and benches in the same run. No device-to-device transfer step.
 | Container | internal Neuron DLC (`QWEN35_NATIVE_IMAGE`) with host Neuron lib available |
 
 The compile is split into 4 regions of 10 layers (`--splits 4`) to keep per-region
-peak RAM manageable. The stable C32 inverse (`_tri_inverse_blockdiag`) is in
-`kernels/deltanet_chunked_prefill_35b.py`, and `compile_prefill_trn2.sh` now
-**defaults to stable C32** (`CHUNK_SIZE=32 DN_STABLE_C32=0 DN_PAIRED_BATCH=0`);
-the paired-C16 fallback is one env override (§3b). The fused NKI route packer
-(`MOE_CTE_NKI_PACK=1`) is set inside the compile script.
+peak RAM manageable. The stable C32 inverse (`_tri_inverse_blockdiag`) and the
+4-stream packer (`_chunk_pack4`) are in `kernels/deltanet_chunked_prefill_35b.py`,
+and `compile_prefill_trn2.sh` now **defaults to packed C32**
+(`CHUNK_SIZE=32 DN_STABLE_C32=0 DN_PAIRED_BATCH=0 DN_PACK_C32=1 DN_PACK_N=4`);
+the unpacked-C32 and paired-C16 fallbacks are one env override each (§3b). The
+fused NKI route packer (`MOE_CTE_NKI_PACK=1`) is set inside the compile script.
 
 ---
 
@@ -58,32 +63,43 @@ swapon --show   # confirm ~16G available
 **and** runs the throughput benchmark (`--prefill-bench 20000`) + fingerprints, in
 a single native run.
 
-### 3a. Fastest — stable C32 (≈2,277 tok/s, +8.5%) — default
+### 3a. Fastest — packed C32 (≈2,719 tok/s, +19.4%) — default
 
-The script defaults to stable C32; no flags or edits needed:
+The script defaults to packed C32 (`DN_PACK_C32=1 DN_PACK_N=4`); no flags or edits
+needed:
 
 ```bash
 source .env
 deploy/compile_prefill_trn2.sh \
   --tp 4 --lnc 2 --layers 40 --splits 4 --bucket 1024 --optlevel 1 \
-  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c32"
+  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c32pack4"
 ```
 
-### 3b. Reliable fallback — paired C16 (≈2,090 tok/s)
+### 3b. Fallbacks — unpacked C32 (≈2,277), 2-stream pack (≈2,561), or paired C16 (≈2,090)
 
-Override the chunk config via environment (one distinct `--cache-dir`):
+Override via environment; each config changes the traced graph, so give each its own
+`--cache-dir`:
 
 ```bash
 source .env
-CHUNK_SIZE=16 DN_STABLE_C32=1 DN_PAIRED_BATCH=1 \
+# unpacked C32
+DN_PACK_C32=0 deploy/compile_prefill_trn2.sh \
+  --tp 4 --lnc 2 --layers 40 --splits 4 --bucket 1024 --optlevel 1 \
+  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c32"
+# 2-stream pack (P=64)
+DN_PACK_N=2 deploy/compile_prefill_trn2.sh \
+  --tp 4 --lnc 2 --layers 40 --splits 4 --bucket 1024 --optlevel 1 \
+  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c32pack2"
+# paired C16
+CHUNK_SIZE=16 DN_STABLE_C32=1 DN_PAIRED_BATCH=1 DN_PACK_C32=0 \
 deploy/compile_prefill_trn2.sh \
   --tp 4 --lnc 2 --layers 40 --splits 4 --bucket 1024 --optlevel 1 \
   --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c16"
 ```
 
-`CHUNK_SIZE` changes the traced graph, so **each config needs its own
-`--cache-dir`** — C32 will not (and must not) cache-hit a C16 cache root, and the
-script's metadata guard refuses to mix them.
+`CHUNK_SIZE` / `DN_PACK_*` change the traced graph, so **each config needs its own
+`--cache-dir`** — configs will not (and must not) cache-hit each other's cache root,
+and the script's metadata guard refuses to mix them.
 
 - Both paths need `QWEN35_NATIVE_IMAGE`, `QWEN35_MODEL_DIR` (BF16), `QWEN35_NKILIB_DIR`.
 - The script pins `DN_CHUNK_NKI=1`, `MOE_CTE=1 MOE_CTE_NKI_PACK=1`, batch-size 2,
@@ -94,7 +110,7 @@ script's metadata guard refuses to mix them.
 ```bash
 nohup bash -c 'deploy/compile_prefill_trn2.sh \
   --tp 4 --lnc 2 --layers 40 --splits 4 --bucket 1024 --optlevel 1 \
-  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c32"' \
+  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c32pack4"' \
   > /mnt/nvme/runlog/prefill_bench.log 2>&1 &
 # poll: grep -E 'tok/s|prompt|throughput|compiled|Error' /mnt/nvme/runlog/prefill_bench.log
 ```
@@ -109,8 +125,10 @@ batch ÷ prefill wall-time). References for the two configs:
 
 | Config | Wall time | Aggregate prompt tok/s |
 |---|---:|---:|
-| **Stable C32** (`DN_STABLE_C32=0 CHUNK_SIZE=32`) | **17.568 s** | **2,276.9** |
-| Paired C16 (default) | 19.141 s | 2,089.7 |
+| **Packed C32 ×4** (`DN_PACK_C32=1 DN_PACK_N=4`) — default | **14.712 s** | **2,718.9** |
+| Packed C32 ×2 (`DN_PACK_N=2`) | 15.620 s | 2,560.9 |
+| Unpacked C32 (`DN_PACK_C32=0`) | 17.568 s | 2,276.9 |
+| Paired C16 | 19.141 s | 2,089.7 |
 
 A per-run token-ID/state fingerprint is printed for correctness; the warm and
 timed fingerprints must be identical and finite. Compare across builds to confirm
@@ -124,28 +142,54 @@ identical output.
   aggregate tok/s (paired C16). BS=1 single-prompt best is 1,482.8 tok/s.
 - **FP8 prefill** is a future lever (nkilib `moe_cte` MX variant), not yet
   integrated — this recipe is BF16.
-- Do **not** raise optlevel; O2/O3 do not finish in reasonable time/RAM here.
+- Do **not** raise optlevel; O2/O3 do not finish in reasonable time/RAM here, and
+  O3 does not extract any extra prefill throughput (measured flat at 2,273.5 tok/s
+  after a ~3h45m compile, and it perturbs numerics slightly).
+- **`DN_STREAM_WINDOW`** (software-pipelining the independent-stream loop) was tried
+  and is a **negative lever** — flat at O1 and O3 (the compiler declines to overlap
+  the unrolled streams). Left in, default `1`. The win came from *packing* (fewer,
+  larger matmuls) rather than *overlap*.
 
 ---
 
-## 6. Why C32 is safe (and why not the naïve C32)
+## 6. Why packed C32 is safe (and why the packing helps)
 
-C32 halves the DeltaNet chunk count, which is where the +8.5% comes from, but it
-required a **numerically stable chunk-matrix inverse**. `_tri_inverse_blockdiag`
-splits the 32×32 chunk matrix into two 16×16 diagonal blocks plus a coupling term
-and inverts the blocks by doubling:
+**Stable C32 inverse.** C32 halves the DeltaNet chunk count vs C16, but it requires a
+**numerically stable chunk-matrix inverse**. `_tri_inverse_blockdiag` splits the 32×32
+chunk matrix into two 16×16 diagonal blocks plus a coupling term and inverts the blocks
+by doubling:
 
 - the naïve **full-32 doubling** overflows on near-1-decay streams → NaN at bs2
-  (root-caused to layer 18 / near-1 `T` entries); **unusable** (~2,408 tok/s if it
-  were finite);
-- a **Horner series** is stable but ~4× costlier → 2,037.5 tok/s (**−2.9%**), so
-  it is not used;
-- the shipped **block-diagonal doubling** is both stable and cheap → 2,276.9 tok/s
-  (**+8.5%**).
+  (root-caused to layer 18 / near-1 `T` entries); **unusable**;
+- a **Horner series** is stable but ~4× costlier → −2.9%, so it is not used;
+- the shipped **block-diagonal doubling** is both stable and cheap → 2,276.9 tok/s.
 
-C32 correctness was gated on all four checks and passed: finite warm≡timed
-fingerprint; final-token top-5 matching the C16 baseline; **all-rank
-capture-replay vs the CPU reference at deep context (cosine ≈ 1.0, max_diff ~1e-6
-on all four TP ranks)**; and real-prompt coherence identical to C16 (bit-identical
-greedy continuation via iterative prefill). A cheaper stable inverse that closes
-the remaining gap toward the theoretical +14.7% (~2,408 tok/s) is a future lever.
+**4-stream packing.** The prefill wall was ~50% a serialization gap: the DeltaNet
+intra-chunk inverse issues a huge number of *tiny* 32×32 matmuls/transposes (P=32, so
+1/4 of the PE partition dim) whose per-instruction + weight-load overhead — not FLOPs —
+dominates (MFU ~3.5%). `_chunk_pack4` folds four independent streams (4 of the 8 per-core
+V-heads) into one **P=128 block-diagonal** tile: block-diagonal masks
+(`pack_m_incl`/`pack_m_strict`/`pack_eye`) zero every cross-stream term, so each 32-row
+bank is an independent solve, and the packed inverse uses `_tri_inverse_blockdiag` with a
+block-diagonal lower-left mask (16-wide sub-blocks). The intra-chunk matmuls thus run
+**once on P=128 instead of four times on P=32** → ~4× fewer tiny-matmul instructions,
+full partition dim, ~19.4% faster. (Off-stream blocks are exactly zero, so each stream
+gets the identical baseline result.)
+
+**Correctness gate.** Both pack widths (n=2 and n=4) produce a **bit-identical** N=20000
+fingerprint to unpacked C32 — `sum=-3.12377031e+05 norm=1.20273230e+03
+top5=[517,607,261,290,294]`, all finite, warm≡timed. Two independent pack widths landing
+on identical logits + carried state is strong evidence the packing is numerically exact.
+(The unpacked C32 path itself was previously gated against the C16 baseline on all four
+checks — finite warm≡timed fingerprint, final-token top-5, all-rank capture-replay cosine
+≈ 1.0 / max_diff ~1e-6, and real-prompt coherence — so packed C32 inherits that lineage.)
+
+> Note: `deploy/run_coherence.sh` (iterative-prefill greedy continuation) currently hits
+> a pre-existing `_moe_cte` graph-break under `DNBATCHED_V2/MOE_SPARSE` on this build —
+> it fails identically with packing **off**, so it is unrelated to this change; the
+> bit-identical prefill fingerprint is the operative gate here.
+
+**NKI implementation note.** The packer passes chunk base offsets as **named scalar
+arguments** (`base0..base3`), not a Python list — the NKI index specializer rejects a
+slice offset sourced from a list of symints ("unsupported expression"). Hence the
+explicit 4-way `_chunk_pack4` rather than a list-driven loop.
