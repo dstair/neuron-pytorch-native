@@ -163,7 +163,10 @@ def nki_deltanet_chunked_prefill_v2(
     if C == 32 and not STABLE_C32:
         ll_mask = _lowerleft_mask(eye_s, onesC, C, C // 2)
 
-    if PAIRED_BATCH and batch_size % 2 == 0 and C == 16:
+    if batch_size % 2 == 0 and (
+        (PAIRED_BATCH and C == 16)
+        or (PACK_C32 and C == 32 and not STABLE_C32 and PACK_N == 2)
+    ):
         pair_rows = 2 * C
         pair_m_incl = nl.ndarray(
             (pair_rows, pair_rows), dtype=nl.float32, buffer=nl.sbuf
@@ -293,12 +296,13 @@ def nki_deltanet_chunked_prefill_v2(
                     ],
                     src=s1,
                 )
-    elif PACK_C32 and C == 32 and not STABLE_C32 and num_streams % PACK_N == 0:
-        # Lever B: pack PACK_N independent C32 streams into one P=PACK_N*C
-        # block-diagonal tile. Block-diagonal masks zero all cross-stream terms so
-        # each C-row bank is an independent solve; the packed inverse uses the stable
-        # blockdiag split (pack_ll_mask, 16-wide sub-blocks). PACK_N=4 fills P=128.
-        n_pack = PACK_N
+    elif (PACK_C32 and C == 32 and not STABLE_C32 and PACK_N == 4
+          and V_HEADS % 4 == 0):
+        # Lever B (n_pack=4): pack 4 independent C32 streams into one P=128
+        # block-diagonal tile (fills the full PE partition dim). Block-diagonal masks
+        # zero all cross-stream terms so each C-row bank is an independent solve; the
+        # packed inverse uses the stable blockdiag split (pack_ll_mask, 16-wide blocks).
+        n_pack = 4
         pack_rows = n_pack * C
         pack_m_incl = nl.ndarray(
             (pack_rows, pack_rows), dtype=nl.float32, buffer=nl.sbuf
@@ -346,44 +350,49 @@ def nki_deltanet_chunked_prefill_v2(
         pack_intra_scratch = nl.ndarray(
             (pack_rows, pack_rows), dtype=nl.float32, buffer=nl.shared_hbm
         )
-        for grp in nl.sequential_range(num_streams // n_pack):
-            states = []
-            for j in range(n_pack):
-                stream = grp * n_pack + j
-                batch = stream // V_HEADS
-                head = stream % V_HEADS
-                s = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.dma_copy(
-                    dst=s,
-                    src=state[
-                        batch, head * K_DIM:(head + 1) * K_DIM, 0:V_DIM
-                    ],
-                )
-                states.append(s)
-            for c in nl.sequential_range(num_chunks):
-                bases = [
-                    (grp * n_pack + j) * S + c * C for j in range(n_pack)
-                ]
-                _chunk_packed(
-                    states, out, bases,
-                    query, key, value, g, beta,
-                    pack_m_incl, pack_m_strict, pack_eye, eye_s,
-                    pack_eps, pack_zero, pack_ones,
-                    pack_key_scratch, pack_gcum_scratch,
-                    pack_vcorr_scratch, pack_kcd_scratch,
-                    pack_qse_scratch, pack_intra_scratch,
-                    zC1, onesC, C, Q_SCALE, pack_ll_mask,
-                )
-            for j in range(n_pack):
-                stream = grp * n_pack + j
-                batch = stream // V_HEADS
-                head = stream % V_HEADS
-                nisa.dma_copy(
-                    dst=new_state[
-                        batch, head * K_DIM:(head + 1) * K_DIM, 0:V_DIM
-                    ],
-                    src=states[j],
-                )
+        # Pack 4 consecutive v-heads of one batch element (V_HEADS % 4 == 0). Nested
+        # batch/head-group loops keep batch/head-group as direct loop vars, and row
+        # offsets are hoisted out of the chunk loop so each base is a NAMED scalar
+        # affine in c alone (index symints must be named scalars, never list-sourced).
+        groups_per_batch = V_HEADS // 4
+        for batch in nl.sequential_range(batch_size):
+            for hg in nl.sequential_range(groups_per_batch):
+                head0 = hg * 4
+                s0 = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
+                s1 = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
+                s2 = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
+                s3 = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
+                h0 = head0
+                h1 = head0 + 1
+                h2 = head0 + 2
+                h3 = head0 + 3
+                nisa.dma_copy(dst=s0, src=state[batch, h0 * K_DIM:(h0 + 1) * K_DIM, 0:V_DIM])
+                nisa.dma_copy(dst=s1, src=state[batch, h1 * K_DIM:(h1 + 1) * K_DIM, 0:V_DIM])
+                nisa.dma_copy(dst=s2, src=state[batch, h2 * K_DIM:(h2 + 1) * K_DIM, 0:V_DIM])
+                nisa.dma_copy(dst=s3, src=state[batch, h3 * K_DIM:(h3 + 1) * K_DIM, 0:V_DIM])
+                r0 = (batch * V_HEADS + h0) * S
+                r1 = (batch * V_HEADS + h1) * S
+                r2 = (batch * V_HEADS + h2) * S
+                r3 = (batch * V_HEADS + h3) * S
+                for c in nl.sequential_range(num_chunks):
+                    base0 = r0 + c * C
+                    base1 = r1 + c * C
+                    base2 = r2 + c * C
+                    base3 = r3 + c * C
+                    _chunk_pack4(
+                        s0, s1, s2, s3, out, base0, base1, base2, base3,
+                        query, key, value, g, beta,
+                        pack_m_incl, pack_m_strict, pack_eye, eye_s,
+                        pack_eps, pack_zero, pack_ones,
+                        pack_key_scratch, pack_gcum_scratch,
+                        pack_vcorr_scratch, pack_kcd_scratch,
+                        pack_qse_scratch, pack_intra_scratch,
+                        zC1, onesC, C, Q_SCALE, pack_ll_mask,
+                    )
+                nisa.dma_copy(dst=new_state[batch, h0 * K_DIM:(h0 + 1) * K_DIM, 0:V_DIM], src=s0)
+                nisa.dma_copy(dst=new_state[batch, h1 * K_DIM:(h1 + 1) * K_DIM, 0:V_DIM], src=s1)
+                nisa.dma_copy(dst=new_state[batch, h2 * K_DIM:(h2 + 1) * K_DIM, 0:V_DIM], src=s2)
+                nisa.dma_copy(dst=new_state[batch, h3 * K_DIM:(h3 + 1) * K_DIM, 0:V_DIM], src=s3)
     else:
         # Independent-stream loop, software-pipelined W streams at a time.
         # Streams (batch, v-head) are independent; chunks within a stream are
@@ -431,39 +440,50 @@ def nki_deltanet_chunked_prefill_v2(
     return out, new_state
 
 
-def _chunk_packed(
-    states, out, bases, query, key, value, g, beta,
+def _chunk_pack4(
+    s0, s1, s2, s3, out, base0, base1, base2, base3,
+    query, key, value, g, beta,
     m_incl, m_strict, pair_eye, local_eye, eps, zero, pair_ones,
     key_scratch, gcum_scratch, vcorr_scratch, kcd_scratch,
     qse_scratch, intra_scratch, local_zero, local_ones, C, Q_SCALE,
     ll_mask=None,
 ):
-    """Run n_pack independent chunks as one P=n_pack*C block-diagonal row tile.
+    """Run 4 independent C32 chunks as one P=4*C=128 block-diagonal row tile.
 
-    Generalizes _chunk_pair_c16 from 2 to n_pack streams (n_pack = len(bases),
-    P = n_pack*C <= 128). The intra-chunk solve runs once on the packed [P,P] tile;
-    the block-diagonal masks (m_incl/m_strict/pair_eye) zero all cross-stream terms,
-    so each C-row bank is an independent solve. Only the recurrent-state finish
-    (already [K_DIM,V_DIM] per stream) is split per bank. ll_mask (block-diagonal
-    lower-left) selects the stable blockdiag inverse (16-wide sub-blocks) for C32;
-    None keeps plain doubling (stable for C16 span=16).
+    Explicit 4-way form (bases passed as named scalars, not a list — the NKI index
+    specializer rejects slice offsets sourced from a Python list). The intra-chunk
+    solve runs once on the packed [128,128] tile; block-diagonal masks zero all
+    cross-stream terms so each C-row bank is an independent solve. Only the recurrent
+    state finish is split per bank. ll_mask (block-diagonal lower-left) selects the
+    stable blockdiag inverse (16-wide sub-blocks) for C32.
     """
-    n_pack = len(bases)
-    P = n_pack * C
+    P = 4 * C
 
     q_in = nl.ndarray((P, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     k_in = nl.ndarray((P, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     v_c = nl.ndarray((P, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
     g_c = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     b_c = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-    for i in range(n_pack):
-        r = i * C
-        bi = bases[i]
-        nisa.dma_copy(dst=q_in[r:r + C, 0:K_DIM], src=query[bi:bi + C, 0:K_DIM])
-        nisa.dma_copy(dst=k_in[r:r + C, 0:K_DIM], src=key[bi:bi + C, 0:K_DIM])
-        nisa.dma_copy(dst=v_c[r:r + C, 0:V_DIM], src=value[bi:bi + C, 0:V_DIM])
-        nisa.dma_copy(dst=g_c[r:r + C, 0:1], src=g[bi:bi + C, 0:1])
-        nisa.dma_copy(dst=b_c[r:r + C, 0:1], src=beta[bi:bi + C, 0:1])
+    nisa.dma_copy(dst=q_in[0:C, 0:K_DIM], src=query[base0:base0 + C, 0:K_DIM])
+    nisa.dma_copy(dst=q_in[C:2 * C, 0:K_DIM], src=query[base1:base1 + C, 0:K_DIM])
+    nisa.dma_copy(dst=q_in[2 * C:3 * C, 0:K_DIM], src=query[base2:base2 + C, 0:K_DIM])
+    nisa.dma_copy(dst=q_in[3 * C:4 * C, 0:K_DIM], src=query[base3:base3 + C, 0:K_DIM])
+    nisa.dma_copy(dst=k_in[0:C, 0:K_DIM], src=key[base0:base0 + C, 0:K_DIM])
+    nisa.dma_copy(dst=k_in[C:2 * C, 0:K_DIM], src=key[base1:base1 + C, 0:K_DIM])
+    nisa.dma_copy(dst=k_in[2 * C:3 * C, 0:K_DIM], src=key[base2:base2 + C, 0:K_DIM])
+    nisa.dma_copy(dst=k_in[3 * C:4 * C, 0:K_DIM], src=key[base3:base3 + C, 0:K_DIM])
+    nisa.dma_copy(dst=v_c[0:C, 0:V_DIM], src=value[base0:base0 + C, 0:V_DIM])
+    nisa.dma_copy(dst=v_c[C:2 * C, 0:V_DIM], src=value[base1:base1 + C, 0:V_DIM])
+    nisa.dma_copy(dst=v_c[2 * C:3 * C, 0:V_DIM], src=value[base2:base2 + C, 0:V_DIM])
+    nisa.dma_copy(dst=v_c[3 * C:4 * C, 0:V_DIM], src=value[base3:base3 + C, 0:V_DIM])
+    nisa.dma_copy(dst=g_c[0:C, 0:1], src=g[base0:base0 + C, 0:1])
+    nisa.dma_copy(dst=g_c[C:2 * C, 0:1], src=g[base1:base1 + C, 0:1])
+    nisa.dma_copy(dst=g_c[2 * C:3 * C, 0:1], src=g[base2:base2 + C, 0:1])
+    nisa.dma_copy(dst=g_c[3 * C:4 * C, 0:1], src=g[base3:base3 + C, 0:1])
+    nisa.dma_copy(dst=b_c[0:C, 0:1], src=beta[base0:base0 + C, 0:1])
+    nisa.dma_copy(dst=b_c[C:2 * C, 0:1], src=beta[base1:base1 + C, 0:1])
+    nisa.dma_copy(dst=b_c[2 * C:3 * C, 0:1], src=beta[base2:base2 + C, 0:1])
+    nisa.dma_copy(dst=b_c[3 * C:4 * C, 0:1], src=beta[base3:base3 + C, 0:1])
 
     k_c = _l2norm_rows(k_in, P, K_DIM, eps, zero)
     qn = _l2norm_rows(q_in, P, K_DIM, eps, zero)
@@ -528,13 +548,30 @@ def _chunk_packed(
     nisa.memset(dst=onesK, value=1.0)
     z11 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=z11, value=0.0)
-    for i in range(n_pack):
-        _finish_paired_bank(
-            states[i], out, bases[i], i * C,
-            kcd_scratch, qse_scratch, intra_scratch,
-            key_scratch, gcum_scratch, vcorr_scratch,
-            local_eye, local_zero, local_ones, onesK, z11, C,
-        )
+    _finish_paired_bank(
+        s0, out, base0, 0,
+        kcd_scratch, qse_scratch, intra_scratch,
+        key_scratch, gcum_scratch, vcorr_scratch,
+        local_eye, local_zero, local_ones, onesK, z11, C,
+    )
+    _finish_paired_bank(
+        s1, out, base1, C,
+        kcd_scratch, qse_scratch, intra_scratch,
+        key_scratch, gcum_scratch, vcorr_scratch,
+        local_eye, local_zero, local_ones, onesK, z11, C,
+    )
+    _finish_paired_bank(
+        s2, out, base2, 2 * C,
+        kcd_scratch, qse_scratch, intra_scratch,
+        key_scratch, gcum_scratch, vcorr_scratch,
+        local_eye, local_zero, local_ones, onesK, z11, C,
+    )
+    _finish_paired_bank(
+        s3, out, base3, 3 * C,
+        kcd_scratch, qse_scratch, intra_scratch,
+        key_scratch, gcum_scratch, vcorr_scratch,
+        local_eye, local_zero, local_ones, onesK, z11, C,
+    )
 
 
 def _chunk_pair_c16(
