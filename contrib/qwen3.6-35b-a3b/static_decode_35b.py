@@ -346,7 +346,9 @@ if USE_MOE_FUSED_W8 or USE_MOE_OFFICIAL_FP8_REFERENCE:
 
 if USE_MOE_FP8:
     import fp8_group_matvec_ops  # registers torch.ops.fp8moe.group_matvec
-if USE_MOE_NKILIB:
+if USE_MOE_NKILIB or USE_MOE_CTE:
+    # moe_tkg is also the decode MoE for the CTE config: CTE is a prefill-only
+    # kernel, so decode reuses the same packed k-weights via moe_tkg (see _moe).
     from nkilib.core.moe.moe_tkg.moe_tkg import moe_tkg as _nkilib_moe_tkg
     from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
 if USE_MOE_CTE:
@@ -875,8 +877,14 @@ class StaticDecode35B(nn.Module):
             not USE_MOE_FUSED_W8_ROW_FP8 or uses_row_fp8_layer(i)
         ):
             return self._moe_fused_w8(i, x2d, lead).to(x.dtype)
-        if USE_MOE_CTE and prefill:
-            return self._moe_cte(i, x2d, lead).to(x.dtype)
+        if USE_MOE_CTE:
+            if prefill:
+                return self._moe_cte(i, x2d, lead).to(x.dtype)
+            # Decode: the context-encoding kernel can't meta-specialize T=1, and the
+            # sparse/reference tail below needs the plain per-expert weights that the
+            # CTE config frees. moe_tkg reuses the SAME packed k-weights and has a
+            # selective (T<16) mode, so it is the correct CTE-config decode path.
+            return self._moe_nkilib(i, x2d, lead).to(x.dtype)
         if USE_MOE_NKILIB:
             # moe_tkg maps tokens to the NKI partition dimension (max 128).
             # Prefill buckets are larger, so invoke the opaque kernel in fixed
