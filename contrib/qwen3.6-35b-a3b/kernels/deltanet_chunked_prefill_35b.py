@@ -332,24 +332,8 @@ def nki_deltanet_chunked_prefill_v2(
         nisa.memset(dst=pack_zero, value=0.0)
         pack_ones = nl.ndarray((1, pack_rows), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=pack_ones, value=1.0)
-        pack_key_scratch = nl.ndarray(
-            (pack_rows, K_DIM), dtype=nl.float32, buffer=nl.shared_hbm
-        )
-        pack_gcum_scratch = nl.ndarray(
-            (pack_rows, 1), dtype=nl.float32, buffer=nl.shared_hbm
-        )
-        pack_vcorr_scratch = nl.ndarray(
-            (pack_rows, V_DIM), dtype=nl.float32, buffer=nl.shared_hbm
-        )
-        pack_kcd_scratch = nl.ndarray(
-            (pack_rows, K_DIM), dtype=nl.float32, buffer=nl.shared_hbm
-        )
-        pack_qse_scratch = nl.ndarray(
-            (pack_rows, K_DIM), dtype=nl.float32, buffer=nl.shared_hbm
-        )
-        pack_intra_scratch = nl.ndarray(
-            (pack_rows, pack_rows), dtype=nl.float32, buffer=nl.shared_hbm
-        )
+        # Lever 1: intermediates stay in SBUF inside _chunk_pack4; the finish extracts
+        # per-stream [row:row+C] blocks via on-chip SBUF->SBUF copy. No HBM scratch.
         # Pack 4 consecutive v-heads of one batch element (V_HEADS % 4 == 0). Nested
         # batch/head-group loops keep batch/head-group as direct loop vars, and row
         # offsets are hoisted out of the chunk loop so each base is a NAMED scalar
@@ -384,9 +368,6 @@ def nki_deltanet_chunked_prefill_v2(
                         query, key, value, g, beta,
                         pack_m_incl, pack_m_strict, pack_eye, eye_s,
                         pack_eps, pack_zero, pack_ones,
-                        pack_key_scratch, pack_gcum_scratch,
-                        pack_vcorr_scratch, pack_kcd_scratch,
-                        pack_qse_scratch, pack_intra_scratch,
                         zC1, onesC, C, Q_SCALE, pack_ll_mask,
                     )
                 nisa.dma_copy(dst=new_state[batch, h0 * K_DIM:(h0 + 1) * K_DIM, 0:V_DIM], src=s0)
@@ -444,8 +425,7 @@ def _chunk_pack4(
     s0, s1, s2, s3, out, base0, base1, base2, base3,
     query, key, value, g, beta,
     m_incl, m_strict, pair_eye, local_eye, eps, zero, pair_ones,
-    key_scratch, gcum_scratch, vcorr_scratch, kcd_scratch,
-    qse_scratch, intra_scratch, local_zero, local_ones, C, Q_SCALE,
+    local_zero, local_ones, C, Q_SCALE,
     ll_mask=None,
 ):
     """Run 4 independent C32 chunks as one P=4*C=128 block-diagonal row tile.
@@ -456,6 +436,10 @@ def _chunk_pack4(
     cross-stream terms so each C-row bank is an independent solve. Only the recurrent
     state finish is split per bank. ll_mask (block-diagonal lower-left) selects the
     stable blockdiag inverse (16-wide sub-blocks) for C32.
+
+    The packed intermediates stay in SBUF and are handed to the finish directly; the
+    per-stream [row:row+C] extraction is an on-chip SBUF->SBUF copy, not an HBM scratch
+    round-trip (which dominated the Sync engine — profiled 45k ops). Numerics identical.
     """
     P = 4 * C
 
@@ -489,11 +473,9 @@ def _chunk_pack4(
     qn = _l2norm_rows(q_in, P, K_DIM, eps, zero)
     qS = nl.ndarray((P, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=qS, data=qn, op0=nl.multiply, operand0=Q_SCALE)
-    nisa.dma_copy(dst=key_scratch, src=k_c)
 
     mi_T = _T(m_incl, P, P)
     g_cum = _mm(mi_T, g_c, P, 1)
-    nisa.dma_copy(dst=gcum_scratch, src=g_cum)
     g_cum_row = _T(g_cum, P, 1)
     gA = _mm(g_cum_row, pair_ones, P, P)
     gB = _mm(pair_ones, g_cum_row, P, P)
@@ -526,23 +508,19 @@ def _chunk_pack4(
         A = _tri_inverse_doubling(A_str, pair_eye, P, C)
     A_T = _T(A, P, P)
     v_corr = _mm(A_T, v_beta, P, V_DIM)
-    nisa.dma_copy(dst=vcorr_scratch, src=v_corr)
     expg = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=expg, op=nl.exp, data=g_cum, bias=zero, scale=1.0)
     kbexp = nl.ndarray((P, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=kbexp, data=k_beta, op0=nl.multiply, operand0=expg)
     k_cumdecay = _mm(A_T, kbexp, P, K_DIM)
-    nisa.dma_copy(dst=kcd_scratch, src=k_cumdecay)
 
     qS_T = _T(qS, P, K_DIM)
     qk = _mm(qS_T, kc_T, P, P)
     intra = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=intra, data1=qk, data2=dm, op=nl.multiply)
     nisa.tensor_tensor(dst=intra, data1=intra, data2=m_incl, op=nl.multiply)
-    nisa.dma_copy(dst=intra_scratch, src=intra)
     qSe = nl.ndarray((P, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=qSe, data=qS, op0=nl.multiply, operand0=expg)
-    nisa.dma_copy(dst=qse_scratch, src=qSe)
 
     onesK = nl.ndarray((1, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=onesK, value=1.0)
@@ -550,26 +528,26 @@ def _chunk_pack4(
     nisa.memset(dst=z11, value=0.0)
     _finish_paired_bank(
         s0, out, base0, 0,
-        kcd_scratch, qse_scratch, intra_scratch,
-        key_scratch, gcum_scratch, vcorr_scratch,
+        k_cumdecay, qSe, intra,
+        k_c, g_cum, v_corr,
         local_eye, local_zero, local_ones, onesK, z11, C,
     )
     _finish_paired_bank(
         s1, out, base1, C,
-        kcd_scratch, qse_scratch, intra_scratch,
-        key_scratch, gcum_scratch, vcorr_scratch,
+        k_cumdecay, qSe, intra,
+        k_c, g_cum, v_corr,
         local_eye, local_zero, local_ones, onesK, z11, C,
     )
     _finish_paired_bank(
         s2, out, base2, 2 * C,
-        kcd_scratch, qse_scratch, intra_scratch,
-        key_scratch, gcum_scratch, vcorr_scratch,
+        k_cumdecay, qSe, intra,
+        k_c, g_cum, v_corr,
         local_eye, local_zero, local_ones, onesK, z11, C,
     )
     _finish_paired_bank(
         s3, out, base3, 3 * C,
-        kcd_scratch, qse_scratch, intra_scratch,
-        key_scratch, gcum_scratch, vcorr_scratch,
+        k_cumdecay, qSe, intra,
+        k_c, g_cum, v_corr,
         local_eye, local_zero, local_ones, onesK, z11, C,
     )
 
