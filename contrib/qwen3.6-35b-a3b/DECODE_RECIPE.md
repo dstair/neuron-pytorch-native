@@ -1,9 +1,15 @@
 # Max Decode Throughput Recipe — Qwen3.6-35B-A3B (BS=128 FP8, tiled)
 
 Reproduces the fastest validated **decode** configuration:
-**343.6 tok/s at BS=128** (372.5 ms/token, TP=8 / LNC=1, FP8 MoE
-`block_pow2_coalesced` + tiled DeltaNet conv, optlevel-2). Bit-identical to the
-untiled path; the tiled conv layout is a ~+15% throughput win at this batch size.
+**442.1 tok/s at BS=128** (289.5 ms/token, TP=8 / LNC=1, FP8 MoE
+`block_ob_coalesced` + tiled DeltaNet conv, optlevel-2). This is **Reduction B1**
+(coarse per-128-output-block FP8 scale + PSUM-accumulate) stacked on the tiled
+DeltaNet conv: **+28.7%** over `block_pow2_coalesced` (343.6 tok/s, 372.5 ms/tok),
+with **bit-identical output** (gen hash `0cc59fb25112`). The tiled conv layout is
+itself ~+15% over untiled; B1 adds ~−83 ms/tok on top by removing the
+per-128x128-block MoE Vector scale-adds. `block_ob_coalesced` re-quantizes the
+routed experts to coarse per-output-block scales at load time (no separate
+checkpoint — just the env below); it needs the same official FP8 checkpoint.
 
 All host/path values live in `.env` — copy `.env.example` to `.env` and fill in.
 This recipe references: `QWEN35_NATIVE_IMAGE`, `QWEN35_MODEL_DIR` (BF16),
@@ -16,8 +22,8 @@ This recipe references: `QWEN35_NATIVE_IMAGE`, `QWEN35_MODEL_DIR` (BF16),
 
 | Step | Host | Requirement |
 |---|---|---|
-| Compile **and** run (recommended, self-contained) | **Trn2.3xlarge** (`QWEN35_RUN_HOST`) | Native TP=8/LNC=1 (8 cores via `NEURON_LOGICAL_NC_CONFIG=1`). Compiles on the first decode step (~35–40 min cold) then benches in the same process. ~64 GB host RAM is plenty; the fullgraph NEFF is ~66 MB. |
-| Compile only (optional, faster) | **Trn1.32xlarge** (`QWEN35_COMPILE_HOST`) | 128 vCPU / **512 GB RAM** for concurrency-8 parallel `neuronx-cc` (~6 min). Cross-compiles a Trn2 NEFF; can't execute it. See §4 caveat. |
+| Compile **and** run (required for tiled, self-contained) | **Trn2.3xlarge** (`QWEN35_RUN_HOST`) | Native TP=8/LNC=1 (8 cores via `NEURON_LOGICAL_NC_CONFIG=1`). Compiles on the first decode step (~40–45 min cold for `block_ob_coalesced`+tiled) then benches in the same process. ~64 GB host RAM is plenty; the fullgraph NEFF is ~60 MB. |
+| Compile only (untiled validation, faster) | **Trn1.32xlarge** (`QWEN35_COMPILE_HOST`) | 128 vCPU / **512 GB RAM** for concurrency-8 parallel `neuronx-cc`. Cross-compiles a Trn2 NEFF; can't execute it. **Untiled only** — see §4 caveat. |
 
 The FP8 MoE decode graph is Trn2 TP=8/LNC=1. **optlevel-2 is optimal** — optlevel-3
 gives no gain, optlevel-1 is ~13% slower. Don't override optlevel.
@@ -38,7 +44,7 @@ and then benchmarks it. Run inside the DLC on the Trn2 (`QWEN35_RUN_HOST`):
 source .env   # QWEN35_* from your environment
 docker run --rm --privileged --device=/dev/neuron0 \
   -v /opt/aws/neuron/lib:/host_neuron_lib:ro \
-  -e MOE_FUSED_W8=fp8 -e MOE_FUSED_W8_FP8_IMPL=block_pow2_coalesced \
+  -e MOE_FUSED_W8=fp8 -e MOE_FUSED_W8_FP8_IMPL=block_ob_coalesced \
   -e DN_NKI=1 -e DNBATCHED_V2=1 -e DN_DIRECT_STATE_OUT=1 -e DN_TILED_CONV=1 \
   -e DN_K_HEADS=2 -e DN_V_HEADS=4 -e GQA_Q_HEADS=2 \
   -e GQATAIL=1 -e GQA_STATEFUL_KV=1 -e DECODE_FULLGRAPH=1 -e DECODE_SHARDED_LM_HEAD=1 \
@@ -72,15 +78,18 @@ nohup bash run_decode_bench.sh > /mnt/nvme/runlog/decode_bench.log 2>&1 &
 
 ## 3. Reading the result
 
-Success line (last, after ~35–40 min cold / seconds cache-hot):
+Success line (last, after ~40–45 min cold / seconds cache-hot):
 ```
-BENCH BS=128 seq=256: TPOT 372.51 ms/tok (synced, 20 iter) | throughput 343.6 tok/s
+BENCH BS=128 seq=256: TPOT 289.53 ms/tok (synced, 20 iter) | throughput 442.1 tok/s
 gen hash(row0): 0cc59fb25112
 gen hash(row127): 0cc59fb25112
 ```
 - **throughput tok/s** is the headline decode number (batch × 1/TPOT).
-- **gen hash** is a bit-exactness fingerprint; `0cc59fb25112` is the reference for
-  this config — a match means numerically identical output.
+- **gen hash** is a bit-exactness fingerprint; `0cc59fb25112` is the reference — it
+  is the SAME hash as `block_pow2_coalesced`, i.e. B1's coarse quant produces
+  numerically identical generated tokens (zero quality change).
+- The prior `block_pow2_coalesced` config gives 372.51 ms/tok / 343.6 tok/s with
+  the same hash — use it as the A/B baseline.
 
 ---
 
@@ -104,3 +113,11 @@ then run §2.
 traced graph than `static_decode --bench`, so it **won't cache-hit** the §2
 bench. Use §4 to validate/profile the graph quickly; use §2 (Trn2 native) for the
 canonical throughput number. Match optlevel across any A/B (default O2).
+
+**Tiled is §2-only.** `DN_TILED_CONV=1` does **not** trace under
+`test_decode_fullgraph_device.py` (it fails with a DeltaNet `cv_states` reshape
+error, "expand: too few dimensions"), so §4 cannot produce a tiled cache that
+runs — and `static_decode --bench` hangs on the Trn1 cross-compile host. There is
+therefore **no fast cross-compile path for the tiled (max-throughput) config**:
+the 442.1 tok/s number above must be compiled via §2 on Trn2 (~40–45 min cold).
+§4 is only for untiled (`DN_TILED_CONV=0`) fullgraph validation/profiling.
