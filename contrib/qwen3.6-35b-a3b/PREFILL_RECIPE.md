@@ -1,10 +1,10 @@
 # Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32, TP=4/LNC=2)
 
 Reproduces the fastest validated **prefill** configuration:
-**≈2,738 aggregate prompt tok/s** (BS=2, N=20000 tokens, query bucket 1024,
+**≈2,776 aggregate prompt tok/s** (BS=2, N=20000 tokens, query bucket 1024,
 TP=4 / LNC=2, DeltaNet **stable C32** block-diagonal inverse with **4-stream
 block-diagonal packing** and **SBUF-resident intermediates**, fused NKI route packer,
-optlevel-1) — **+20.3%** over unpacked C32 (≈2,277 tok/s) and **+31.0%** over the
+optlevel-1) — **+21.9%** over unpacked C32 (≈2,277 tok/s) and **+32.8%** over the
 paired-C16 baseline (≈2,090).
 
 The packing (`DN_PACK_C32=1 DN_PACK_N=4`) folds four independent DeltaNet streams
@@ -64,7 +64,7 @@ swapon --show   # confirm ~16G available
 **and** runs the throughput benchmark (`--prefill-bench 20000`) + fingerprints, in
 a single native run.
 
-### 3a. Fastest — packed C32 (≈2,719 tok/s, +19.4%) — default
+### 3a. Fastest — packed C32 (≈2,776 tok/s, +21.9%) — default
 
 The script defaults to packed C32 (`DN_PACK_C32=1 DN_PACK_N=4`); no flags or edits
 needed:
@@ -126,7 +126,7 @@ batch ÷ prefill wall-time). References for the two configs:
 
 | Config | Wall time | Aggregate prompt tok/s |
 |---|---:|---:|
-| **Packed C32 ×4, SBUF-resident** (`DN_PACK_C32=1 DN_PACK_N=4`) — default | **14.609 s** | **2,738.0** |
+| **Packed C32 ×4, SBUF-resident + transpose-once finish** (`DN_PACK_C32=1 DN_PACK_N=4`) — default | **14.411 s** | **2,775.6** |
 | Packed C32 ×2 (`DN_PACK_N=2`) | 15.620 s | 2,560.9 |
 | Unpacked C32 (`DN_PACK_C32=0`) | 17.568 s | 2,276.9 |
 | Paired C16 | 19.141 s | 2,089.7 |
@@ -183,6 +183,13 @@ finish directly (extracted via on-chip `[row:row+C]` copy) instead of round-trip
 through HBM scratch. Removes 6 HBM scratch buffers + their writes and cuts region HBM
 traffic ~0.5 GB; +0.7% (2,718.9 → 2,738.0), bit-identical. (The remaining prefill wall is
 Tensor-floor + MoE bound, not DMA — the scratch DMAs were largely overlapped.)
+
+**Transpose-once finish.** The per-stream finish transposed `k_cumdecay`/`qSe` 4× on
+`[C,K_DIM]` tiles (P=32, 1/4 of the PE array). `_finish_pack4_bank` instead transposes
+the packed `[P,K_DIM]` tile ONCE (→`[K_DIM,P]`) in `_chunk_pack4`; each stream free-slices
+`[0:K_DIM, row:row+C]` as its matmul stationary (the transpose of that stream's block, so
+results are identical). Removes 2 transposes + 2 DMA reads per stream. +1.4%
+(2,738.0 → 2,775.6), bit-identical.
 
 **Correctness gate.** Both pack widths (n=2 and n=4) produce a **bit-identical** N=20000
 fingerprint to unpacked C32 — `sum=-3.12377031e+05 norm=1.20273230e+03
