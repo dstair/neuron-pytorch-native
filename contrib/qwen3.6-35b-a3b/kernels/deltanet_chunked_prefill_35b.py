@@ -54,6 +54,21 @@ V_HEADS = int(_os.environ.get("DN_V_HEADS", "8"))
 RMS_EPS = 1e-6
 STABLE_C32 = _os.environ.get("DN_STABLE_C32", "1") == "1"
 PAIRED_BATCH = _os.environ.get("DN_PAIRED_BATCH", "0") == "1"
+# Lever B: pack 2 independent C32 streams (the 2 batch elements of a head) into one
+# P=64 block-diagonal token tile, halving the count of tiny [32,32] intra-chunk
+# matmuls/transposes (:458/:467) and filling the PE partition dim (32->64). Uses the
+# STABLE blockdiag inverse (16-wide sub-blocks) on the packed tile so numerics are
+# identical to the per-stream C32 baseline (full-C32 doubling overflows deep context —
+# see _tri_inverse_blockdiag). Requires DN_STABLE_C32=0, even batch. Default off.
+PACK_C32 = _os.environ.get("DN_PACK_C32", "0") == "1"
+# Software-pipeline width for the independent-stream loop (C32 generic path).
+# Streams (batch*V_HEADS) are independent; chunks within a stream are recurrent
+# (must stay sequential). DN_STREAM_WINDOW>1 unrolls W independent streams into
+# an affine_range group so the compiler can overlap stream N's Vector PSUM->SBUF
+# copies (:460/:469) with stream N+1's Tensor matmuls (:458/:467) — the prefill
+# serialization gap. Groups stay sequential to cap concurrent SBUF working set.
+# W=1 reproduces the strictly-sequential baseline.
+STREAM_WINDOW = int(_os.environ.get("DN_STREAM_WINDOW", "1"))
 
 
 @nki.jit
@@ -145,7 +160,10 @@ def nki_deltanet_chunked_prefill_v2(
     if C == 32 and not STABLE_C32:
         ll_mask = _lowerleft_mask(eye_s, onesC, C, C // 2)
 
-    if PAIRED_BATCH and batch_size % 2 == 0 and C == 16:
+    if batch_size % 2 == 0 and (
+        (PAIRED_BATCH and C == 16)
+        or (PACK_C32 and C == 32 and not STABLE_C32)
+    ):
         pair_rows = 2 * C
         pair_m_incl = nl.ndarray(
             (pair_rows, pair_rows), dtype=nl.float32, buffer=nl.sbuf
@@ -208,6 +226,22 @@ def nki_deltanet_chunked_prefill_v2(
         pair_intra_scratch = nl.ndarray(
             (pair_rows, pair_rows), dtype=nl.float32, buffer=nl.shared_hbm
         )
+        # For C32 packing, the packed inverse must use the stable blockdiag split
+        # (16-wide sub-blocks) — full-C doubling on a 32-nilpotent block overflows in
+        # deep context. Build a block-diagonal lower-left mask so each stream's inverse
+        # is solved with identical numerics to the per-stream C32 baseline. C16 packing
+        # keeps the plain doubling (span=16 is already stable), so ll_mask stays None.
+        if C == 32:
+            pair_ll_mask = nl.ndarray(
+                (pair_rows, pair_rows), dtype=nl.float32, buffer=nl.sbuf
+            )
+            nisa.memset(dst=pair_ll_mask, value=0.0)
+            nisa.dma_copy(dst=pair_ll_mask[0:C, 0:C], src=ll_mask)
+            nisa.dma_copy(
+                dst=pair_ll_mask[C:pair_rows, C:pair_rows], src=ll_mask
+            )
+        else:
+            pair_ll_mask = None
         # Each pair iteration retains two independent recurrent states. The
         # token-local solve is block diagonal across their C16 row banks.
         for head in nl.sequential_range(V_HEADS):
@@ -245,7 +279,7 @@ def nki_deltanet_chunked_prefill_v2(
                         pair_key_scratch, pair_gcum_scratch,
                         pair_vcorr_scratch, pair_kcd_scratch,
                         pair_qse_scratch, pair_intra_scratch,
-                        zC1, onesC, C, Q_SCALE,
+                        zC1, onesC, C, Q_SCALE, pair_ll_mask,
                     )
                 nisa.dma_copy(
                     dst=new_state[
@@ -260,35 +294,48 @@ def nki_deltanet_chunked_prefill_v2(
                     src=s1,
                 )
     else:
-        for stream in nl.sequential_range(num_streams):
-            batch = stream // V_HEADS
-            head = stream % V_HEADS
-            s = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(
-                dst=s,
-                src=state[
-                    batch, head * K_DIM:(head + 1) * K_DIM, 0:V_DIM
-                ],
-            )
-            row0 = stream * S
-            for c in nl.sequential_range(num_chunks):
-                base = row0 + c * C
-                _chunk(
-                    s, out, base,
-                    query, key, value, g, beta,
-                    m_incl_s, m_strict_s, eye_s,
-                    eps1, zC1, zCC, onesC, c32_key_scratch,
-                    c32_q_scratch, c32_vprime_scratch,
-                    c32_inverse_scratch, c32_vcorr_scratch,
-                    c32_state_scratch, c32_row_scratch, C, Q_SCALE,
-                    ll_mask,
+        # Independent-stream loop, software-pipelined W streams at a time.
+        # Streams (batch, v-head) are independent; chunks within a stream are
+        # recurrent -> the inner chunk loop stays sequential. Grouping W streams
+        # under an affine_range lets the compiler overlap stream N's Vector
+        # PSUM->SBUF copies with stream N+1's Tensor matmuls (the prefill
+        # serialization gap); groups stay sequential to cap concurrent SBUF.
+        W = STREAM_WINDOW
+        assert num_streams % W == 0, (
+            f"DN_STREAM_WINDOW={W} must divide num_streams={num_streams}"
+        )
+        n_groups = num_streams // W
+        for grp in nl.sequential_range(n_groups):
+            for w in nl.affine_range(W):
+                stream = grp * W + w
+                batch = stream // V_HEADS
+                head = stream % V_HEADS
+                s = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=s,
+                    src=state[
+                        batch, head * K_DIM:(head + 1) * K_DIM, 0:V_DIM
+                    ],
                 )
-            nisa.dma_copy(
-                dst=new_state[
-                    batch, head * K_DIM:(head + 1) * K_DIM, 0:V_DIM
-                ],
-                src=s,
-            )
+                row0 = stream * S
+                for c in nl.sequential_range(num_chunks):
+                    base = row0 + c * C
+                    _chunk(
+                        s, out, base,
+                        query, key, value, g, beta,
+                        m_incl_s, m_strict_s, eye_s,
+                        eps1, zC1, zCC, onesC, c32_key_scratch,
+                        c32_q_scratch, c32_vprime_scratch,
+                        c32_inverse_scratch, c32_vcorr_scratch,
+                        c32_state_scratch, c32_row_scratch, C, Q_SCALE,
+                        ll_mask,
+                    )
+                nisa.dma_copy(
+                    dst=new_state[
+                        batch, head * K_DIM:(head + 1) * K_DIM, 0:V_DIM
+                    ],
+                    src=s,
+                )
 
     return out, new_state
 
@@ -298,8 +345,15 @@ def _chunk_pair_c16(
     m_incl, m_strict, pair_eye, local_eye, eps, zero, pair_ones,
     key_scratch, gcum_scratch, vcorr_scratch, kcd_scratch,
     qse_scratch, intra_scratch, local_zero, local_ones, C, Q_SCALE,
+    ll_mask=None,
 ):
-    """Run two independent C16 chunks as one block-diagonal row tile."""
+    """Run two independent chunks as one block-diagonal row tile.
+
+    ll_mask is None for C16 packing (plain doubling with span=C=16 is stable). For
+    C32 packing it is the block-diagonal lower-left mask, selecting the stable
+    blockdiag inverse (16-wide sub-blocks) so packed numerics match the per-stream
+    C32 baseline; plain span-32 doubling would overflow in deep context.
+    """
     P = 2 * C
 
     q_in = nl.ndarray((P, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
@@ -350,8 +404,14 @@ def _chunk_pair_c16(
     nisa.tensor_tensor(dst=A_str, data1=A_str, data2=m_strict, op=nl.multiply)
 
     # Each diagonal block is C16 nilpotent, so only the C16 doubling depth is
-    # required even though both blocks occupy a P=32 tile.
-    A = _tri_inverse_doubling(A_str, pair_eye, P, C)
+    # required even though both blocks occupy a P=32 tile. For C32 packing the
+    # per-stream block is 32-nilpotent: full span-32 doubling overflows deep context,
+    # so use the stable blockdiag split (span = C//2 = 16 sub-blocks) on the packed
+    # tile — off-stream blocks are zero, so each stream gets the exact baseline result.
+    if ll_mask is not None:
+        A = _tri_inverse_blockdiag(A_str, pair_eye, ll_mask, P, C // 2)
+    else:
+        A = _tri_inverse_doubling(A_str, pair_eye, P, C)
     A_T = _T(A, P, P)
     v_corr = _mm(A_T, v_beta, P, V_DIM)
     nisa.dma_copy(dst=vcorr_scratch, src=v_corr)
