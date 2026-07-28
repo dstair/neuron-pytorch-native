@@ -860,15 +860,22 @@ class StaticDecode35B(nn.Module):
         self.register_buffer("rope_sin", emb.sin().unsqueeze(0).unsqueeze(0))
 
     # ── MoE helper bound to a layer index ──
-    def _moe(self, i, x):
-        """x: [B, 1, H] (decode) or [1, S, H] (prefill). Returns same shape."""
+    def _moe(self, i, x, prefill=False):
+        """x: [B, 1, H] (decode) or [1, S, H] (prefill). Returns same shape.
+
+        ``prefill`` is a compile-time constant per graph (prefill and decode compile
+        separately), so branching on it is a static branch — no dynamo/symbolic-shape
+        issue. The context-encoding kernel (MOE_CTE) is a many-token *prefill* kernel;
+        it cannot meta-specialize the single-token (T=1) decode shape, so decode must
+        fall through to the sparse/reference path below. Only prefill uses CTE.
+        """
         lead = x.shape[:-1]
         x2d = x.reshape(-1, D.HIDDEN)
         if USE_MOE_FUSED_W8 and (
             not USE_MOE_FUSED_W8_ROW_FP8 or uses_row_fp8_layer(i)
         ):
             return self._moe_fused_w8(i, x2d, lead).to(x.dtype)
-        if USE_MOE_CTE:
+        if USE_MOE_CTE and prefill:
             return self._moe_cte(i, x2d, lead).to(x.dtype)
         if USE_MOE_NKILIB:
             # moe_tkg maps tokens to the NKI partition dimension (max 128).
@@ -1794,7 +1801,7 @@ class StaticDecode35B(nn.Module):
             else:
                 hidden = hidden + self._gqa_prefill(i, normed, S, kv_k, kv_v)
             normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
-            hidden = hidden + self._moe(i, normed)
+            hidden = hidden + self._moe(i, normed, prefill=True)
 
         hidden = rms_norm(hidden, self.final_norm)
         logits = self._lin("lm_head_w", hidden[:, -1:, :])
@@ -2109,7 +2116,7 @@ class StaticDecode35B(nn.Module):
                 hidden = hidden + self._gqa_prefill_chunk(i, normed, q_base, chunk, kv_k, kv_v)
             _lt("attn", i, hidden)
             normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
-            hidden = hidden + self._moe(i, normed)
+            hidden = hidden + self._moe(i, normed, prefill=True)
             _lt("moe", i, hidden)
         return hidden
 
