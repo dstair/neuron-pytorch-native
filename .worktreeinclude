@@ -1,0 +1,3 @@
+# Gitignored files to copy into each new `claude --worktree` worktree.
+# .env holds this project's instance IDs / paths that deploy scripts `source`.
+.env

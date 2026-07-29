@@ -222,3 +222,7 @@ __marimo__/
 
 # Local Qwen model experiment records (may contain instance paths and logs)
 contrib/qwen3.6-35b-a3b/experiments/
+
+# Claude Code worktrees + local settings
+.claude/worktrees/
+.claude/settings.local.json
