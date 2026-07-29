@@ -45,7 +45,7 @@ cannot load there; inspect per-rank logs and replay the cache on Trn2.
 
 DeltaNet chunking defaults to the fastest validated config, stable C32 with
 4-stream block-diagonal packing (CHUNK_SIZE=32, DN_STABLE_C32=0, DN_PAIRED_BATCH=0,
-DN_PACK_C32=1, DN_PACK_N=4; ~2,719 agg prompt tok/s, +19.4% over unpacked C32).
+DN_PACK_C32=1, DN_PACK_N=4; ~2,792 agg prompt tok/s, +22.6% over unpacked C32).
 Override via environment for the unpacked-C32 (~2,277) or paired-C16 (~2,090) paths:
   DN_PACK_C32=0 compile_prefill_trn2.sh ...                               # unpacked C32
   DN_PACK_N=2 compile_prefill_trn2.sh ...                                 # 2-stream pack (~2,561)
