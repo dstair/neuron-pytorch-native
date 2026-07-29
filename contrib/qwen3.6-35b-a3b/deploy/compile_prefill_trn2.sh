@@ -52,6 +52,15 @@ Override via environment for the unpacked-C32 (~2,277) or paired-C16 (~2,090) pa
   CHUNK_SIZE=16 DN_STABLE_C32=1 DN_PAIRED_BATCH=1 DN_PACK_C32=0 compile_prefill_trn2.sh ...  # C16
 CHUNK_SIZE / DN_PACK_* change the traced graph, so use a distinct --cache-dir per
 config; the metadata guard refuses to mix cache roots.
+
+At --lnc 1 the two replicated [V,H] vocab tensors (~1.02 GB/rank each) are
+vocab-sharded at load time by default (PREFILL_SHARDED_LM_HEAD=1,
+PREFILL_SHARDED_EMBED=1) to fit the ~12 GB/rank budget — the fastest prefill
+(~3,457 tok/s, +24.5%). LNC=1 also needs the moe_cte LNC=1 patch (applied above).
+Both default OFF at --lnc 2 (preserving the exact replicated cache identity of the
+2,776 tok/s record). These flags change the traced graph — they are part of the
+cache identity, so LNC=1 and LNC=2 already require distinct --cache-dirs anyway.
+Override with PREFILL_SHARDED_LM_HEAD=/PREFILL_SHARDED_EMBED= if needed.
 EOF
 }
 
@@ -109,7 +118,7 @@ done
 [[ -d /opt/aws/neuron/lib ]] ||
   die "host Neuron runtime is missing: /opt/aws/neuron/lib"
 
-for command in docker sha256sum; do
+for command in docker sha256sum git; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 
@@ -117,6 +126,28 @@ cache_dir="$(mkdir -p "$cache_dir" && cd "$cache_dir" && pwd)"
 model_dir="$(cd "$QWEN35_MODEL_DIR" && pwd)"
 nkilib_dir="$(cd "$QWEN35_NKILIB_DIR" && pwd)"
 source_dir="$QWEN35_SOURCE_DIR"
+
+# nkilib's shard-on-I context-encoding MoE kernel hard-asserts NUM_SHARDS == 2, which
+# blocks TP=8/LNC=1 at compile time with [NCC_INKI016]. Apply the in-repo patch to the
+# nkilib checkout on the HOST -- the container mounts /nki-library read-only, so it
+# cannot be patched from inside. Applied at both LNC settings: every hunk is a no-op at
+# NUM_SHARDS == 2, and patching unconditionally keeps LNC=1 and LNC=2 runs honest A/Bs
+# against identical kernel source. Never silently compile an unpatched kernel.
+nkilib_patch="$source_dir/patches/nkilib-lnc1-moe-cte.patch"
+[[ -f "$nkilib_patch" ]] || die "missing nkilib LNC=1 patch: $nkilib_patch"
+if git -C "$nkilib_dir" apply --check -p1 "$nkilib_patch" 2>/dev/null; then
+  git -C "$nkilib_dir" apply -p1 "$nkilib_patch" ||
+    die "failed to apply nkilib LNC=1 moe_cte patch to $nkilib_dir"
+  printf 'applied nkilib LNC=1 moe_cte patch to %s\n' "$nkilib_dir"
+elif git -C "$nkilib_dir" apply --reverse --check -p1 "$nkilib_patch" 2>/dev/null; then
+  printf 'nkilib LNC=1 moe_cte patch already applied to %s\n' "$nkilib_dir"
+else
+  die "nkilib LNC=1 moe_cte patch neither applies to nor is already applied to $nkilib_dir
+  expected nkilib revision 1ee625782cb1bf91b40bccab741a82c726445080; found $(
+    git -C "$nkilib_dir" rev-parse HEAD 2>/dev/null || echo 'not a git checkout'
+  )
+  check for conflicting local edits to src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py"
+fi
 log_name="${log_name:-tp${tp}-lnc${lnc}-l${layers}-s${splits}-b${bucket}-o${optlevel}}"
 log_dir="$cache_dir/compile_logs/$log_name"
 mkdir -p "$log_dir"
@@ -195,6 +226,18 @@ export DN_STABLE_C32="${DN_STABLE_C32:-0}"
 export DN_PAIRED_BATCH="${DN_PAIRED_BATCH:-0}"
 export DN_PACK_C32="${DN_PACK_C32:-1}"
 export DN_PACK_N="${DN_PACK_N:-4}"
+# Vocab-shard both replicated [V,H] tensors at LOAD time. Each is ~1.02 GB/rank
+# (V=248320 * H=2048 * BF16); replicated they blow the ~12 GB/rank TP=8/LNC=1
+# budget. Sharding is bit-identical (disjoint ranges, zero-pad + sum-all-reduce).
+# Default ON at LNC=1 (required to fit 40L), OFF at LNC=2 (24 GB/core has room and
+# keeping it off preserves the exact replicated cache identity of the record).
+if [[ "$lnc" == "1" ]]; then
+  export PREFILL_SHARDED_LM_HEAD="${PREFILL_SHARDED_LM_HEAD:-1}"
+  export PREFILL_SHARDED_EMBED="${PREFILL_SHARDED_EMBED:-1}"
+else
+  export PREFILL_SHARDED_LM_HEAD="${PREFILL_SHARDED_LM_HEAD:-0}"
+  export PREFILL_SHARDED_EMBED="${PREFILL_SHARDED_EMBED:-0}"
+fi
 export MOE_CTE_BLOCK=512
 export NEURON_CC_FLAGS="--target trn2 --lnc $lnc --optlevel $optlevel --hbm-scratchpad-page-size $scratchpad_page_size_mb"
 export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
@@ -202,7 +245,7 @@ export QWEN35_PLATFORM_TARGET_SHIM_DEBUG="${QWEN35_PLATFORM_TARGET_SHIM_DEBUG:-0
 export QWEN35_COMPILE_HOST="${QWEN35_COMPILE_HOST:-$(hostname)}"
 export QWEN35_COMPILE_REGION="${QWEN35_COMPILE_REGION:-unknown}"
 
-command_text="NEURON_CC_FLAGS=$NEURON_CC_FLAGS NEURON_PLATFORM_TARGET_OVERRIDE=$NEURON_PLATFORM_TARGET_OVERRIDE QWEN35_CACHE_PLATFORM_TARGET=$QWEN35_CACHE_PLATFORM_TARGET CHUNK_SIZE=$CHUNK_SIZE DN_STABLE_C32=$DN_STABLE_C32 DN_PAIRED_BATCH=$DN_PAIRED_BATCH DN_PACK_C32=$DN_PACK_C32 DN_PACK_N=$DN_PACK_N LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so torchrun --nproc-per-node=$tp static_decode_35b.py --model-path /models/Qwen3.5-35B-A3B --batch-size 2 --num-layers $layers --max-seq-len 20480 --prefill-bench 20000 --bucket-chunk $bucket --bucket-compile 1 --prefill-splits $splits --skip-compile"
+command_text="NEURON_CC_FLAGS=$NEURON_CC_FLAGS NEURON_PLATFORM_TARGET_OVERRIDE=$NEURON_PLATFORM_TARGET_OVERRIDE QWEN35_CACHE_PLATFORM_TARGET=$QWEN35_CACHE_PLATFORM_TARGET CHUNK_SIZE=$CHUNK_SIZE DN_STABLE_C32=$DN_STABLE_C32 DN_PAIRED_BATCH=$DN_PAIRED_BATCH DN_PACK_C32=$DN_PACK_C32 DN_PACK_N=$DN_PACK_N PREFILL_SHARDED_LM_HEAD=$PREFILL_SHARDED_LM_HEAD PREFILL_SHARDED_EMBED=$PREFILL_SHARDED_EMBED LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so torchrun --nproc-per-node=$tp static_decode_35b.py --model-path /models/Qwen3.5-35B-A3B --batch-size 2 --num-layers $layers --max-seq-len 20480 --prefill-bench 20000 --bucket-chunk $bucket --bucket-compile 1 --prefill-splits $splits --skip-compile"
 export QWEN35_COMPILE_COMMAND_SHA256="$(
   printf '%s' "$command_text" | sha256sum | awk '{print $1}'
 )"
@@ -228,6 +271,7 @@ fi
     QWEN35_BATCH_SIZE QWEN35_NUM_LAYERS QWEN35_MAX_SEQ_LEN QWEN35_PREFILL_TOKENS \
     QWEN35_BUCKET_CHUNK QWEN35_PREFILL_SPLITS QWEN35_COMPILE_COMMAND_SHA256 \
     CHUNK_SIZE DN_STABLE_C32 DN_PAIRED_BATCH DN_PACK_C32 DN_PACK_N MOE_CTE_BLOCK NEURON_CC_FLAGS \
+    PREFILL_SHARDED_LM_HEAD PREFILL_SHARDED_EMBED \
     NEURON_PLATFORM_TARGET_OVERRIDE QWEN35_PLATFORM_TARGET_SHIM_DEBUG
   do
     printf 'export %s=%q\n' "$name" "${!name:-unknown}"
@@ -261,6 +305,8 @@ docker run -d --name "$container_name" --privileged \
   -e DN_CHUNK_NKI=1 -e CHUNK_SIZE="$CHUNK_SIZE" \
   -e DN_STABLE_C32="$DN_STABLE_C32" -e DN_PAIRED_BATCH="$DN_PAIRED_BATCH" \
   -e DN_PACK_C32="$DN_PACK_C32" -e DN_PACK_N="$DN_PACK_N" \
+  -e PREFILL_SHARDED_LM_HEAD="$PREFILL_SHARDED_LM_HEAD" \
+  -e PREFILL_SHARDED_EMBED="$PREFILL_SHARDED_EMBED" \
   -e DN_NKI=1 -e GQATAIL=1 -e PREFILL_FINGERPRINT=1 \
   -e DN_K_HEADS="$dn_k_heads" -e DN_V_HEADS="$dn_v_heads" \
   -e GQA_Q_HEADS="$gqa_q_heads" \

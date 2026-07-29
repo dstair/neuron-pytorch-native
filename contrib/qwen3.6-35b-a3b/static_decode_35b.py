@@ -440,6 +440,33 @@ USE_DECODE_FULLGRAPH = os.environ.get("DECODE_FULLGRAPH", "0") == "1"
 USE_DECODE_SHARDED_LM_HEAD = (
     os.environ.get("DECODE_SHARDED_LM_HEAD", "0") == "1"
 )
+# Vocab-shard the LM head at LOAD time, so each rank holds only [V/TP, H] instead
+# of the full [V, H]. This is a resident-HBM lever, unlike
+# DECODE_SHARDED_LM_HEAD, which keeps the full weight and only slices it at
+# runtime (that one saves the [B, V] logits tensor and the all-reduce, not the
+# weight). At V=248320 / H=2048 / BF16 the full head is ~1.02 GB per rank; TP=8
+# leaves ~0.13 GB. Needed to fit 40-layer prefill in the ~12 GB/rank TP=8/LNC=1
+# budget. Prefill needs logits for exactly one token position, so reconstructing
+# the full-vocab logits costs one ~2 MB all-reduce -- the fingerprint and top-k
+# stay bit-comparable to the replicated path.
+USE_PREFILL_SHARDED_LM_HEAD = (
+    os.environ.get("PREFILL_SHARDED_LM_HEAD", "0") == "1"
+)
+# The other replicated [V, H] tensor, ~1.02 GB per rank at V=248320/H=2048/BF16.
+# Vocab-shard it the same way: each rank owns a contiguous id range, masks the ids
+# outside it to zero rows, and one sum-all-reduce reassembles the exact embedding
+# (ranges are disjoint, so this adds no rounding). Costs one [B, chunk, H]
+# all-reduce per prefill chunk -- minor next to the ~40 MoE all-reduces per chunk --
+# and unlike shrinking the query bucket it does not change the step count.
+USE_PREFILL_SHARDED_EMBED = (
+    os.environ.get("PREFILL_SHARDED_EMBED", "0") == "1"
+)
+if USE_PREFILL_SHARDED_LM_HEAD and USE_DECODE_SHARDED_LM_HEAD:
+    raise RuntimeError(
+        "PREFILL_SHARDED_LM_HEAD=1 and DECODE_SHARDED_LM_HEAD=1 are mutually "
+        "exclusive: the former shards lm_head at load time, the latter slices a "
+        "replicated lm_head at runtime, so combining them double-shards"
+    )
 if USE_DN_DIRECT_STATE_OUT and not USE_DECODE_FULLGRAPH:
     raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DECODE_FULLGRAPH=1")
 if USE_GQA_STATEFUL_KV and not USE_DECODE_FULLGRAPH:
@@ -852,6 +879,45 @@ class StaticDecode35B(nn.Module):
         w = getattr(self, name)
         return F.linear(x.to(w.dtype), w)
 
+    def _embed_tokens(self, ids):
+        """Embedding lookup, whether `embed` is replicated or vocab-sharded.
+
+        With PREFILL_SHARDED_EMBED each rank owns ids [rank*V/TP, (rank+1)*V/TP).
+        Out-of-range ids are clamped to a safe row and then masked to zero, so each
+        token's real row is contributed by exactly one rank and the sum-all-reduce
+        reconstructs it exactly (adding zeros introduces no rounding).
+        """
+        if not USE_PREFILL_SHARDED_EMBED:
+            return F.embedding(ids, self.embed)
+        per_rank = self.embed.shape[0]
+        local_ids = ids - self.rank * per_rank
+        in_range = (local_ids >= 0) & (local_ids < per_rank)
+        # Clamp before the gather: an out-of-range index is undefined on device even
+        # though the row is discarded by the mask below.
+        safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
+        rows = F.embedding(safe_ids, self.embed)
+        rows = rows * in_range.unsqueeze(-1).to(rows.dtype)
+        return functional_all_reduce(rows, "sum", self.tp_group)
+
+    def _lm_head_logits(self, x):
+        """Full-vocab logits, whether lm_head_w is replicated or vocab-sharded.
+
+        With PREFILL_SHARDED_LM_HEAD each rank owns a contiguous [V/TP, H] slice,
+        so the local logits cover [rank*V/TP, (rank+1)*V/TP). Zero-pad each rank's
+        slice out to the full vocab and sum-reduce: the ranges are disjoint, so the
+        sum reconstructs the exact replicated result with no extra rounding. Only
+        worth doing because prefill needs a single token position -- the padded
+        tensor is ~2 MB, not ~127 MB as it would be for a BS=128 decode step.
+        """
+        if not USE_PREFILL_SHARDED_LM_HEAD:
+            return self._lin("lm_head_w", x)
+        local = self._lin("lm_head_w", x)
+        per_rank = local.shape[-1]
+        lo = self.rank * per_rank
+        return functional_all_reduce(
+            F.pad(local, (lo, D.VOCAB - lo - per_rank)), "sum", self.tp_group
+        )
+
     def _init_rope(self, max_seq_len):
         rd = D.ROPE_DIM
         inv_freq = 1.0 / (D.ROPE_THETA ** (torch.arange(0, rd, 2).float() / rd))
@@ -1217,7 +1283,7 @@ class StaticDecode35B(nn.Module):
 
     def _decode_hidden(self, input_id, position, deltanet_states, conv_states,
                        kv_cache_k, kv_cache_v):
-        hidden = F.embedding(input_id, self.embed).unsqueeze(1)   # [B,1,H]
+        hidden = self._embed_tokens(input_id).unsqueeze(1)   # [B,1,H]
         if USE_MOE_W8_RESIDUAL_FP32:
             hidden = hidden.float()
         if USE_DN_DIRECT_STATE_OUT:
@@ -1264,7 +1330,7 @@ class StaticDecode35B(nn.Module):
         hidden, dn_states, cv_states, kv_k, kv_v = self._decode_hidden(
             input_id, position, deltanet_states, conv_states, kv_cache_k, kv_cache_v
         )
-        logits = self._lin("lm_head_w", hidden)   # [B,1,V]
+        logits = self._lm_head_logits(hidden)   # [B,1,V]
         return logits.squeeze(1), dn_states, cv_states, kv_k, kv_v
 
     def decode_step(self, input_id, position, deltanet_states, conv_states,
@@ -1355,7 +1421,7 @@ class StaticDecode35B(nn.Module):
                 "decode_step_diagnostics requires DECODE_SHARDED_LM_HEAD=1"
             )
 
-        hidden = F.embedding(input_id, self.embed).unsqueeze(1)
+        hidden = self._embed_tokens(input_id).unsqueeze(1)
         if USE_MOE_W8_RESIDUAL_FP32:
             hidden = hidden.float()
         if USE_DN_DIRECT_STATE_OUT:
@@ -1796,7 +1862,7 @@ class StaticDecode35B(nn.Module):
         if input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
         B, S = input_ids.shape
-        hidden = F.embedding(input_ids, self.embed).float()                # [B,S,H]
+        hidden = self._embed_tokens(input_ids).float()                # [B,S,H]
         dn_states = deltanet_states.clone()
         cv_states = conv_states.clone()
         kv_k = kv_cache_k.clone()
@@ -1812,7 +1878,7 @@ class StaticDecode35B(nn.Module):
             hidden = hidden + self._moe(i, normed, prefill=True)
 
         hidden = rms_norm(hidden, self.final_norm)
-        logits = self._lin("lm_head_w", hidden[:, -1:, :])
+        logits = self._lm_head_logits(hidden[:, -1:, :])
         return logits.squeeze(1), dn_states, cv_states, kv_k, kv_v
 
     def _deltanet_prefill(self, i, x, dn_states, cv_states, valid_len=None):
@@ -2132,7 +2198,7 @@ class StaticDecode35B(nn.Module):
         self, chunk_ids, q_base, valid_len, dn_states, cv_states, kv_k, kv_v
     ):
         """All layers for one prompt chunk."""
-        hidden = F.embedding(chunk_ids, self.embed).float()
+        hidden = self._embed_tokens(chunk_ids).float()
         return self._prefill_chunk_layer_range(
             hidden, q_base, valid_len, dn_states, cv_states, kv_k, kv_v,
             0, D.NUM_LAYERS,
@@ -2254,7 +2320,7 @@ class StaticDecode35B(nn.Module):
                 )
                 report_finite(c, 0)
             else:
-                last_hidden = F.embedding(ids, self.embed).float()
+                last_hidden = self._embed_tokens(ids).float()
                 for segment_idx, segment_fn in enumerate(segment_fns):
                     last_hidden = segment_fn(
                         last_hidden, q_base_arg, valid_len_arg,
@@ -2266,7 +2332,7 @@ class StaticDecode35B(nn.Module):
         self._prefill_chunk_index = -1
 
         hidden = rms_norm(last_hidden, self.final_norm)
-        logits = self._lin("lm_head_w", hidden[:, last_valid - 1:last_valid, :])
+        logits = self._lm_head_logits(hidden[:, last_valid - 1:last_valid, :])
         return logits.squeeze(1), dn_states, cv_states, kv_k, kv_v
 
 
@@ -2430,10 +2496,37 @@ def load_sharded_weights(
         }
 
     w8_stats = QuantizationStats()
+
+    def get_lm_head():
+        w = get(LMHEAD_K) if LMHEAD_K is not None else get(EMBED_K)
+        if not USE_PREFILL_SHARDED_LM_HEAD:
+            return w
+        # Rowwise (vocab-dim) shard. Contiguous ranges so the rank's logit slice
+        # is [rank * V/TP, (rank + 1) * V/TP) -- see _lm_head_logits().
+        if w.shape[0] % world_size:
+            raise RuntimeError(
+                f"PREFILL_SHARDED_LM_HEAD requires vocab {w.shape[0]} divisible "
+                f"by TP {world_size}"
+            )
+        per_rank = w.shape[0] // world_size
+        return w[rank * per_rank:(rank + 1) * per_rank].clone()
+
+    def get_embed():
+        w = get(EMBED_K)
+        if not USE_PREFILL_SHARDED_EMBED:
+            return w
+        if w.shape[0] % world_size:
+            raise RuntimeError(
+                f"PREFILL_SHARDED_EMBED requires vocab {w.shape[0]} divisible "
+                f"by TP {world_size}"
+            )
+        per_rank = w.shape[0] // world_size
+        return w[rank * per_rank:(rank + 1) * per_rank].clone()
+
     weights = {
-        "embed": get(EMBED_K),
+        "embed": get_embed(),
         "final_norm": get(NORM_K),
-        "lm_head": get(LMHEAD_K) if LMHEAD_K is not None else get(EMBED_K),
+        "lm_head": get_lm_head(),
         "layers": [],
     }
 
@@ -2646,7 +2739,14 @@ def main():
     mod = mod.to(device).eval()
     if rank == 0:
         mem = sum(b.numel() * b.element_size() for b in mod.buffers()) / 1e9
-        print(f"  module on device: {mem:.2f} GB/core")
+        lm_head_mode = (
+            "vocab-sharded" if USE_PREFILL_SHARDED_LM_HEAD else "replicated"
+        )
+        print(
+            f"  module on device: {mem:.2f} GB/core "
+            f"(lm_head {lm_head_mode}: "
+            f"{mod.lm_head_w.numel() * mod.lm_head_w.element_size() / 1e9:.2f} GB)"
+        )
 
     B = args.batch_size
     dtype = torch.bfloat16 if not args.cpu else torch.float32

@@ -364,13 +364,98 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   logical-NeuronCore config that trn1 hardware cannot bring up (the harness inits
   the physical device before compiling, even under the cross-target shim). Compile
   it natively on trn2 (124 GB fits the 4×10 CTE compile with ~11 GB swap).
-- **FP8 CTE prefill lever (scoped 2026-07-23).** To make TP=8/LNC=1 40L prefill
-  loadable (weight-bound OOM at 12–13 GB/core) the experts must be resident FP8 and
-  dequantized in-kernel; `MOE_CTE` is BF16-only today. nkilib `moe_cte`
-  @`1ee625782` ships an MX (block-scaled FP8) variant (`bwmm_shard_on_{I,block}_mx`,
-  `gate_up_projection_mx`, `down_projection_mx`, `moe_cte_mx_utils`) = the natural
-  integration point, but MX microscaling (E8M0) ≠ the official 128×128 E4M3FN
-  scaling, so it needs a scale bridge + an all-rank 20k gate.
+- **TP=8/LNC=1 prefill: the `moe_cte` blocker was a shard-count guard, not a
+  rewrite (2026-07-29).** The old verdict ("the CTE MoE kernel only works at LNC=2,
+  needs a rewrite") was a misdiagnosis of
+  `kernel_assert(dims.NUM_SHARDS == 2, "shard-on-I with dynamic control flow only
+  work on TRN2")` in nkilib `bwmm_shard_on_I.py`. That message conflates *TRN2
+  hardware* with a *2-shard LNC=2 logical core* — we are on TRN2 either way, so it
+  guards shard count, not hardware. The real fix is ~30 **additive** lines, carried
+  as `patches/nkilib-lnc1-moe-cte.patch` (pinned nkilib rev `1ee625782`) and applied
+  host-side by `deploy/compile_prefill_trn2.sh` (idempotent; the container mounts
+  `/nki-library:ro`). Every hunk is inert at `NUM_SHARDS == 2`, so the LNC=2 record is
+  untouched. At 1 shard: relax the assert, drop the three `core_barrier(..., (0,1))`
+  calls (no peer core exists), and in `compute_down_proj_shard_on_intermediate`
+  **alias** `block_new_lnc_recv_sbuf_lst = block_new_lst` and skip the peer
+  `sendrecv` — the peer index `b + NUM_B_TILES_SHARDED * (1 - shard_id)` would run
+  off the end of the list. Aliasing rather than copying also saves
+  `NUM_B_TILES * TILE_SIZE * H` of SBUF, which matters because SBUF per core halves
+  at LNC=1. `kernels/moe_cte_35b.py` needed no change — already LNC1-ready.
+  Gate it in ~30 s with `test_moe_cte_nki_pack.py --backend device --distributed
+  both` before spending a ~25-min prefill compile; verified PASS at LNC=1 patched,
+  FAIL with `[NCC_INKI016]` at LNC=1 unpatched, PASS at LNC=2 patched.
+- **TP=8/LNC=1 40L prefill HBM: ~200 MB short with a replicated LM head, fixed by
+  sharding it (2026-07-29).** Measured, not estimated: the 40L run reached NEFF load
+  and died with `Failed to allocate DEVICE memory (67108864 bytes)` →
+  `NRT_RESOURCE in nrt_load_util` — one 64 MB shared-scratchpad page. Breakdown at
+  the ceiling (TOTAL 12.146 GB): Tensors 10.834 GB, shared scratchpad 1.000 GB,
+  *overflow* scratchpad 175 MB, DMA-ring spill 49.9 MB, collectives 56.1 MB, code
+  32.9 MB. So this is **not** weight-bound by gigabytes, and it does **not** require
+  FP8 experts. `PREFILL_SHARDED_LM_HEAD=1` shards `lm_head` at **load** time
+  (1.02 GB → 0.13 GB/rank; measured 10.73 → 9.84 GB/core). Note
+  `DECODE_SHARDED_LM_HEAD` does *not* do this — it loads the full head (`:2436`,
+  registered `:718`) and only slices at runtime (`:1285`), so its win is the `[B,V]`
+  logits tensor and the all-reduce, not resident HBM. Prefill needs logits for one
+  token position, so `_lm_head_logits()` zero-pads each rank's disjoint vocab slice
+  and sum-reduces to rebuild full-vocab logits for ~2 MB; verified bit-identical to
+  the replicated path across 8 simulated ranks, so fingerprints stay comparable.
+- **Scratchpad page size trades overflow against pool rounding — the runtime's
+  own `=512` recommendation is nearly a wash (2026-07-29).** Do not take
+  `tdrv_scratchpad_recommend_page_size` at face value; it optimizes the overflow term
+  only. Measured at 40L/TP=8/LNC=1 with a sharded LM head, same graph, page size the
+  only variable:
+
+  | Term | pg64 | pg512 |
+  |---|---|---|
+  | Overflow scratchpad | 687 MB | **1.5 MB** |
+  | Shared scratchpad | 1.062 GB | 1.500 GB |
+  | DMA ring spill | 123 MB | 247 MB |
+  | Model code | 65 MB | 128 MB |
+  | **TOTAL** | 11.988 GB | 11.947 GB |
+
+  So `=512` removed 685 MB of overflow and gave back ~438 MB to pool rounding
+  (1.5 GB = exactly three 512 MB pages) plus ~124 MB of extra ring spill: net ~40 MB.
+  It did get materially further, though — the failure moved from NEFF staging to
+  `nrt_tensor_allocate` (`usage: tensors`), i.e. all four 10-layer segments loaded and
+  it died on runtime I/O tensors, 16 MB short of 11.947 GB (0.13%). Intermediate page
+  sizes are the interesting region: big enough to keep >64 MB variables out of
+  overflow, small enough not to round the shared pool up by half a gigabyte. **256 MiB
+  is the sweet spot** for this graph: shared 1.250 GB (5 pages) + overflow 201 MB =
+  TOTAL 11.785 GB, the lowest of the three.
+- **TP=8/LNC=1 prefill = 3,456.8 agg prompt tok/s, +24.5% over the LNC=2 record
+  (2026-07-29).** 40L, BS=2, N=20,000, bucket 1024, O1, packed C32
+  (`DN_PACK_C32=1 DN_PACK_N=4`), `--hbm-scratchpad-page-size 256`, **both** vocab
+  tensors load-time sharded (`PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1`).
+  11,571.5 ms timed; fingerprint warm ≡ timed and all-finite,
+  `sum=-3.17835375e+05 norm=1.20818213e+03 top5=[517,607,261,294,15089]`.
+  Module resident 8.95 GB/core, down from 10.73 GB replicated — the two [V,H] tensors
+  are ~1.02 GB *each* at V=248320/H=2048/BF16, and sharding both is what made the fit
+  work. Fingerprints are **not** bit-identical across topologies (different TP
+  reduction order); agreement gate is finite + sane magnitude + top-k overlap: norm
+  1208.18 vs the LNC=2 record's 1202.73 (0.45%), sum within 1.7%, top-1 and top-3
+  identical, 4 of 5 top-5 shared.
+  **Both non-negotiable gates passed (2026-07-29):** (a) LNC=2 40L prefill with the
+  patched nkilib reproduces the record fingerprint **bit-identically**
+  (`sum=-3.12377031e+05 norm=1.20273230e+03 top5=[517,607,261,290,294]`, 2,773.5 tok/s
+  = record within run-noise) → the additive LNC=1 patch is proven inert at 2 shards;
+  (b) LNC=1 greedy coherence (`PREFILL_GEN=1`, prompt `760,6511,314,9338,369`) emits
+  `[11751,13,198,760,6511,314,...]` — **token-identical** to the C32/C16 baseline
+  continuation.
+  **Getting here took four 40L attempts; the order that matters is: shard both vocab
+  tensors first, then tune page size.** Sharding only the LM head is *not* enough —
+  it freed 0.83 GB but the loader got further and overflow scratchpad grew
+  175 MB → 687 MB, absorbing the gain. Levers never needed, so still untested: bucket
+  512, and N=10,000 (which would also require a matched LNC=2 re-baseline, since agg
+  tok/s is seq-length-sensitive and a 20k-vs-10k cross-topology comparison is
+  meaningless).
+- **FP8 CTE prefill lever (scoped 2026-07-23; no longer needed for LNC=1).** Kept
+  for reference only — the LNC=1 fit was solved by LM-head sharding above, so do not
+  start this for that reason. To make experts resident FP8 and dequantized in-kernel
+  (`MOE_CTE` is BF16-only today), nkilib `moe_cte` @`1ee625782` ships an MX
+  (block-scaled FP8) variant (`bwmm_shard_on_{I,block}_mx`, `gate_up_projection_mx`,
+  `down_projection_mx`, `moe_cte_mx_utils`) = the natural integration point, but MX
+  microscaling (E8M0) ≠ the official 128×128 E4M3FN scaling, so it needs a scale
+  bridge + an all-rank 20k gate.
 - **Split compiled prefill into coarse 10-layer NEFFs.** A monolithic 20-layer
   CTE graph generated 5,440,131 instructions and failed the compiler's 5,000,000
   limit. `--prefill-splits 2` compiled and loaded two 10-layer segments; use

@@ -37,7 +37,8 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 
 | Phase | Best | Config | Recipe |
 |---|---|---|---|
-| **Prefill** | **2,775.6 agg prompt tok/s** | stable **C32 + 4-stream block-diagonal pack, SBUF-resident, transpose-once finish** (`DN_PACK_C32=1 DN_PACK_N=4`), BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+21.9% over unpacked C32 @ 2,276.9; +32.8% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
+| **Prefill** | **3,456.8 agg prompt tok/s** | same packed **C32 n=4** path at **TP=8/LNC=1**, both vocab tensors load-time sharded (`PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1`), `--scratchpad-page-size-mb 256`, BS=2, N=20,000, bucket 1024, O1 (**+24.5%** over the TP=4/LNC=2 record below) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
+| Prefill (TP=4/LNC=2) | 2,775.6 agg prompt tok/s | stable **C32 + 4-stream block-diagonal pack, SBUF-resident, transpose-once finish** (`DN_PACK_C32=1 DN_PACK_N=4`), BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+21.9% over unpacked C32 @ 2,276.9; +32.8% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
 | **Decode** | **442.1 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv, TP=8/LNC=1, O2 (bit-identical output) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
 
 Other reference points: the prior FP8 `block_pow2_coalesced` decode **343.6 tok/s
@@ -118,6 +119,8 @@ unless noted; combine per the recipes.
 | `BUCKET_COMPILE=1` | Compile the bucketed prefill graph (vs eager). Default on |
 | `PREFILL_GEN=1` | Iterative-prefill generation (re-prefills the growing sequence each step; used for C32 coherence checks) |
 | `PREFILL_FINGERPRINT=1` | Print a per-run token-ID/state fingerprint for correctness comparison |
+| `PREFILL_SHARDED_EMBED=1` | Vocab-shard the token embedding at **load** time (~1.02 GB → 0.13 GB per rank). Each rank owns a contiguous id range and masks the rest to zero rows; one sum-all-reduce per chunk reassembles the exact embedding, bit-identical to the replicated path. Pairs with `PREFILL_SHARDED_LM_HEAD` to fit 40-layer prefill at TP=8/LNC=1 without shrinking the query bucket |
+| `PREFILL_SHARDED_LM_HEAD=1` | Vocab-shard the LM head at **load** time (~1.02 GB → 0.13 GB per rank); full-vocab logits are rebuilt with one ~2 MB all-reduce, bit-identical to the replicated path. Required to fit 40-layer prefill in the ~12 GB/rank TP=8/LNC=1 budget. Distinct from `DECODE_SHARDED_LM_HEAD`, which keeps the full weight resident and only slices at runtime; the two are mutually exclusive |
 
 ### Precision / topology / runtime
 | Flag | Effect |

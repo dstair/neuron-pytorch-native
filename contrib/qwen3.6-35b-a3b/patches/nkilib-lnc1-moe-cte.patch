@@ -1,0 +1,146 @@
+Enable the nkilib shard-on-I context-encoding MoE kernel at LNC=1 (NUM_SHARDS=1).
+
+Target: nkilib rev 1ee625782cb1bf91b40bccab741a82c726445080
+Apply from the nkilib repo root:  git apply -p1 nkilib-lnc1-moe-cte.patch
+Applied automatically by contrib/qwen3.6-35b-a3b/deploy/compile_prefill_trn2.sh.
+
+Why: prefill's MoE calls blockwise_mm_baseline_shard_intermediate_hybrid, which
+hard-asserted NUM_SHARDS == 2 with the message "shard-on-I with dynamic control
+flow only work on TRN2". That message conflates TRN2 *hardware* with a 2-shard
+LNC=2 *logical core* -- we are on TRN2 hardware at either LNC setting, so it is a
+shard-count guard, not a hardware one. Blocked TP=8/LNC=1 prefill at compile time
+with [NCC_INKI016].
+
+Four changes, all no-ops at NUM_SHARDS == 2 (LNC=2 codegen is unaffected):
+
+  1. blockwise_mm_baseline_shard_intermediate: drop the 1-shard core_barrier over
+     a single-core group; only barrier when there is actually a peer core.
+  2. blockwise_mm_baseline_shard_intermediate_hybrid (the prefill entry point):
+     accept NUM_SHARDS in (1, 2), and make the three (0, 1) core_barriers -- two
+     on `output`, one on the shared dynamic-loop counter -- conditional on having
+     a peer core. nl.dynamic_range itself is not shard-dependent.
+  3. compute_down_proj_shard_on_intermediate (shared by all three entry points):
+     at NUM_SHARDS == 1 there is no peer to sendrecv the down-proj partials with,
+     and the peer source index b + NUM_B_TILES_SHARDED * (1 - shard_id) runs off
+     the end of block_new_lst. Alias block_new_lnc_recv_sbuf_lst to block_new_lst
+     (identical length/shape/dtype at 1 shard) and skip the exchange+reduce
+     entirely. Also saves NUM_B_TILES * TILE_SIZE * H of SBUF versus allocating a
+     second tile set and copying into it -- SBUF per core is halved at LNC=1, so
+     this is not just cosmetic. Safe because nothing reads block_new_lst after the
+     reduction loop.
+  4. blockwise_mm_shard_intermediate_dropping: same 1-shard barrier relaxation as
+     (1). Not on the prefill path; kept consistent across the three entry points.
+
+If the aliasing in (3) ever proves problematic, the fallback is to keep the
+separate allocation and nisa.activation(op=nl.copy) the local tile into it.
+
+diff --git a/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py b/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py
+index c4e6913..3e490f3 100644
+--- a/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py
++++ b/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py
+@@ -364,11 +364,10 @@ def blockwise_mm_baseline_shard_intermediate(
+         output_initialization(output)
+     for block_idx in nl.sequential_range(N):
+         compute_one_block(block_idx, dims, inps, outs, configs, SHARD_ID)
+-        if dims.NUM_SHARDS == 1:
+-            nisa.core_barrier(output, (0))
+-        elif dims.NUM_SHARDS == 2:
++        if dims.NUM_SHARDS == 2:
+             nisa.core_barrier(output, (0, 1))
+-        else:
++        elif dims.NUM_SHARDS != 1:
++            # NUM_SHARDS == 1 needs no cross-core barrier: there is no peer core.
+             kernel_assert(False, "unsupported NUM_SHARDS")
+ 
+     if _acc_upcast:
+@@ -621,11 +620,18 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
+             print("num_static_block is less than T//B, this may lead to performance degradation")
+     else:
+         NUM_STATIC_BLOCKS = N - E
+-    kernel_assert(dims.NUM_SHARDS == 2, "shard-on-I with dynamic control flow only work on TRN2")
++    kernel_assert(
++        dims.NUM_SHARDS == 1 or dims.NUM_SHARDS == 2,
++        f"shard-on-I with dynamic control flow supports 1 or 2 shards, found {dims.NUM_SHARDS}",
++    )
++    # NOTE on the barriers below: they exist to keep the two physical cores of an LNC=2
++    # logical core in lockstep (both on `output` writes and on the shared dynamic-loop
++    # counter). At NUM_SHARDS == 1 there is no peer core, so they are omitted entirely.
+     # step 1: static loop over the non-padded blocks
+     for block_idx in nl.sequential_range(NUM_STATIC_BLOCKS):
+         compute_one_block(block_idx, dims, inps, outs, configs, SHARD_ID)
+-        nisa.core_barrier(output, (0, 1))
++        if dims.NUM_SHARDS == 2:
++            nisa.core_barrier(output, (0, 1))
+     # step 2: dynamic loop over the padded blocks
+     configs.use_dynamic_while = True
+     dynamic_start_index = NUM_STATIC_BLOCKS
+@@ -640,9 +646,11 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
+     nisa.memset(block_idx, value=NUM_STATIC_BLOCKS)
+     for i in nl.dynamic_range(NUM_STATIC_BLOCKS, cond_reg):
+         compute_one_block(block_idx, dims, inps, outs, configs, SHARD_ID)
+-        nisa.core_barrier(output, (0, 1))
++        if dims.NUM_SHARDS == 2:
++            nisa.core_barrier(output, (0, 1))
+         nisa.tensor_scalar(dst=block_idx, data=block_idx, op0=nl.add, operand0=1)
+-        nisa.core_barrier(block_idx, (0, 1))
++        if dims.NUM_SHARDS == 2:
++            nisa.core_barrier(block_idx, (0, 1))
+     return output
+ 
+ 
+@@ -1942,9 +1950,18 @@ def compute_down_proj_shard_on_intermediate(
+     for b_tile_idx in range(dims.NUM_B_TILES):
+         block_new_lst.append(nl.ndarray((TILE_SIZE, dims.H), dtype=_bn_dtype, buffer=nl.sbuf))
+ 
+-    block_new_lnc_recv_sbuf_lst = []
+-    for b_tile_idx in range(dims.NUM_B_TILES_SHARDED):
+-        block_new_lnc_recv_sbuf_lst.append(nl.ndarray((TILE_SIZE, dims.H), dtype=_bn_dtype, buffer=nl.sbuf))
++    if dims.NUM_SHARDS == 1:
++        # Single shard: there is no peer core to exchange down-proj partials with, so
++        # NUM_B_TILES_SHARDED == NUM_B_TILES and the "received/reduced" result is just the
++        # locally computed one. Alias the list instead of allocating a second set of
++        # (TILE_SIZE, H) tiles and copying into them -- saves NUM_B_TILES * TILE_SIZE * H
++        # of SBUF and NUM_B_TILES copies per block. Nothing reads block_new_lst after the
++        # reduction loop below, so the aliasing is safe.
++        block_new_lnc_recv_sbuf_lst = block_new_lst
++    else:
++        block_new_lnc_recv_sbuf_lst = []
++        for b_tile_idx in range(dims.NUM_B_TILES_SHARDED):
++            block_new_lnc_recv_sbuf_lst.append(nl.ndarray((TILE_SIZE, dims.H), dtype=_bn_dtype, buffer=nl.sbuf))
+ 
+     GUP_N_TILES = div_ceil(dims.I_TP_sharded, TILE_SIZE)
+     H_tile_size = min(1024, dims.H)
+@@ -2249,7 +2266,11 @@ def compute_down_proj_shard_on_intermediate(
+     N_B_TILES_OFFSET = dims.NUM_B_TILES_SHARDED * shard_id
+ 
+     for b_shard_tile_idx in range(dims.NUM_B_TILES_SHARDED):
+-        if _acc_upcast:
++        if dims.NUM_SHARDS == 1:
++            # No peer shard to reduce against. block_new_lnc_recv_sbuf_lst aliases
++            # block_new_lst, so this tile's down-proj result is already in place.
++            pass
++        elif _acc_upcast:
+             # Send the peer partial directly in the accumulator dtype and reduce in
+             # accumulator precision (avoids a separate io-dtype downcast before the exchange).
+             block_new_acc_recv = nl.ndarray((TILE_SIZE, dims.H), dtype=_acc_dtype, buffer=nl.sbuf)
+@@ -2751,17 +2772,13 @@ def blockwise_mm_shard_intermediate_dropping(
+ 
+     for block_idx in nl.sequential_range(N):
+         compute_one_block_dropping(block_idx, dims, inps, outs, configs, SHARD_ID)
+-        if dims.NUM_SHARDS == 1:
+-            nisa.core_barrier(output, (0))
+-            nisa.core_barrier(gate_up_activations_T, (0))
+-            if not configs.expert_affinity_multiply_on_I:
+-                nisa.core_barrier(down_activations, (0))
+-        elif dims.NUM_SHARDS == 2:
++        if dims.NUM_SHARDS == 2:
+             nisa.core_barrier(output, (0, 1))
+             nisa.core_barrier(gate_up_activations_T, (0, 1))
+             if not configs.expert_affinity_multiply_on_I:
+                 nisa.core_barrier(down_activations, (0, 1))
+-        else:
++        elif dims.NUM_SHARDS != 1:
++            # NUM_SHARDS == 1 needs no cross-core barriers: there is no peer core.
+             kernel_assert(False, "Only 1 or 2 shards are supported")
+ 
+     if configs.expert_affinity_multiply_on_I:
