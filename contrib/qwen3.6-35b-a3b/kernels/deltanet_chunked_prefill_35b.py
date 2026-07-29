@@ -326,6 +326,9 @@ def nki_deltanet_chunked_prefill_v2(
             nisa.dma_copy(dst=pack_m_strict[r:r + C, r:r + C], src=m_strict_s)
             nisa.dma_copy(dst=pack_eye[r:r + C, r:r + C], src=eye_s)
             nisa.dma_copy(dst=pack_ll_mask[r:r + C, r:r + C], src=ll_mask)
+        # Constant across every chunk. Hoisting this P=128 transpose avoids one
+        # TensorE instruction for each recurrent chunk in every packed group.
+        pack_m_incl_T = _T(pack_m_incl, pack_rows, pack_rows)
         pack_eps = nl.ndarray((pack_rows, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=pack_eps, value=RMS_EPS)
         pack_zero = nl.ndarray((pack_rows, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -366,7 +369,7 @@ def nki_deltanet_chunked_prefill_v2(
                     _chunk_pack4(
                         s0, s1, s2, s3, out, base0, base1, base2, base3,
                         query, key, value, g, beta,
-                        pack_m_incl, pack_m_strict, pack_eye, eye_s,
+                        pack_m_incl, pack_m_incl_T, pack_m_strict, pack_eye, eye_s,
                         pack_eps, pack_zero, pack_ones,
                         zC1, onesC, C, Q_SCALE, pack_ll_mask,
                     )
@@ -424,7 +427,7 @@ def nki_deltanet_chunked_prefill_v2(
 def _chunk_pack4(
     s0, s1, s2, s3, out, base0, base1, base2, base3,
     query, key, value, g, beta,
-    m_incl, m_strict, pair_eye, local_eye, eps, zero, pair_ones,
+    m_incl, m_incl_T, m_strict, pair_eye, local_eye, eps, zero, pair_ones,
     local_zero, local_ones, C, Q_SCALE,
     ll_mask=None,
 ):
@@ -474,8 +477,7 @@ def _chunk_pack4(
     qS = nl.ndarray((P, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=qS, data=qn, op0=nl.multiply, operand0=Q_SCALE)
 
-    mi_T = _T(m_incl, P, P)
-    g_cum = _mm(mi_T, g_c, P, 1)
+    g_cum = _mm(m_incl_T, g_c, P, 1)
     g_cum_row = _T(g_cum, P, 1)
     gA = _mm(g_cum_row, pair_ones, P, P)
     gB = _mm(pair_ones, g_cum_row, P, P)
@@ -519,6 +521,10 @@ def _chunk_pack4(
     intra = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=intra, data1=qk, data2=dm, op=nl.multiply)
     nisa.tensor_tensor(dst=intra, data1=intra, data2=m_incl, op=nl.multiply)
+    # The four diagonal blocks were previously copied and transposed separately
+    # in each finish. Transpose the packed block-diagonal tile once, then only
+    # reposition each diagonal CxC block to partition zero in the finish.
+    intra_T = _T(intra, P, P)
     qSe = nl.ndarray((P, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=qSe, data=qS, op0=nl.multiply, operand0=expg)
 
@@ -526,33 +532,33 @@ def _chunk_pack4(
     # instead of 4x per-stream [C,K_DIM]. The finish free-slices [0:K_DIM, row:row+C].
     kcd_T = _T(k_cumdecay, P, K_DIM)
     qSe_T = _T(qSe, P, K_DIM)
-    onesK = nl.ndarray((1, K_DIM), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=onesK, value=1.0)
-    z11 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=z11, value=0.0)
     _finish_pack4_bank(
         s0, out, base0, 0,
-        kcd_T, qSe_T, intra,
+        kcd_T, qSe_T, intra_T,
         k_c, g_cum, v_corr,
-        local_eye, local_zero, local_ones, onesK, z11, C,
+        local_eye, local_zero, local_ones, pair_ones,
+        local_zero[0:1, 0:1], C,
     )
     _finish_pack4_bank(
         s1, out, base1, C,
-        kcd_T, qSe_T, intra,
+        kcd_T, qSe_T, intra_T,
         k_c, g_cum, v_corr,
-        local_eye, local_zero, local_ones, onesK, z11, C,
+        local_eye, local_zero, local_ones, pair_ones,
+        local_zero[0:1, 0:1], C,
     )
     _finish_pack4_bank(
         s2, out, base2, 2 * C,
-        kcd_T, qSe_T, intra,
+        kcd_T, qSe_T, intra_T,
         k_c, g_cum, v_corr,
-        local_eye, local_zero, local_ones, onesK, z11, C,
+        local_eye, local_zero, local_ones, pair_ones,
+        local_zero[0:1, 0:1], C,
     )
     _finish_pack4_bank(
         s3, out, base3, 3 * C,
-        kcd_T, qSe_T, intra,
+        kcd_T, qSe_T, intra_T,
         k_c, g_cum, v_corr,
-        local_eye, local_zero, local_ones, onesK, z11, C,
+        local_eye, local_zero, local_ones, pair_ones,
+        local_zero[0:1, 0:1], C,
     )
 
 
@@ -729,15 +735,17 @@ def _finish_paired_bank(
 
 def _finish_pack4_bank(
     s, out, base, row,
-    kcd_T, qSe_T, intra, key, gcum, vcorr,
+    kcd_T, qSe_T, intra_T, key, gcum, vcorr,
     eye, zC1, onesC, onesK, z11, C,
 ):
     """Pack4 finish (Lever 2): kcd_T/qSe_T are the ALREADY-transposed packed tiles
     [K_DIM, P] (transposed once in _chunk_pack4 instead of 4x per-stream on [C,K_DIM]).
     Stream i's stationary is the free-axis column slice [0:K_DIM, row:row+C] — the
-    transpose of that stream's [C,K_DIM] block, so matmul results are identical. intra/
-    key/gcum/vcorr are the packed [P,*] SBUF tiles (per-stream [row:row+C] extracted on
-    chip). Removes 2 per-stream transposes + 2 DMA reads per bank vs _finish_paired_bank.
+    transpose of that stream's [C,K_DIM] block, so matmul results are identical.
+    intra_T is also transposed once at pack width; its diagonal block is repositioned
+    to partition zero with an on-chip copy. key/gcum/vcorr are packed [P,*] SBUF
+    tiles. Removes 3 per-stream transposes + 2 DMA reads per bank vs
+    _finish_paired_bank.
     """
     vprime = _mm(kcd_T[0:K_DIM, row:row + C], s, C, V_DIM)
     v_corr = nl.ndarray((C, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
@@ -746,10 +754,11 @@ def _finish_pack4_bank(
     nisa.tensor_tensor(dst=v_new, data1=v_corr, data2=vprime, op=nl.subtract)
 
     attn_inter = _mm(qSe_T[0:K_DIM, row:row + C], s, C, V_DIM)
-    intra_c = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=intra_c, src=intra[row:row + C, row:row + C])
-    intra_T = _T(intra_c, C, C)
-    o_chunk = _mm(intra_T, v_new, C, V_DIM)
+    intra_T_c = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(
+        dst=intra_T_c, src=intra_T[row:row + C, row:row + C]
+    )
+    o_chunk = _mm(intra_T_c, v_new, C, V_DIM)
     nisa.tensor_tensor(dst=o_chunk, data1=o_chunk, data2=attn_inter, op=nl.add)
     nisa.dma_copy(dst=out[base:base + C, 0:V_DIM], src=o_chunk)
 

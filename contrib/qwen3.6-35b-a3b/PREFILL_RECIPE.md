@@ -1,11 +1,11 @@
 # Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32, TP=4/LNC=2)
 
 Reproduces the fastest validated **prefill** configuration:
-**≈2,776 aggregate prompt tok/s** (BS=2, N=20000 tokens, query bucket 1024,
+**≈2,792 aggregate prompt tok/s** (BS=2, N=20000 tokens, query bucket 1024,
 TP=4 / LNC=2, DeltaNet **stable C32** block-diagonal inverse with **4-stream
-block-diagonal packing** and **SBUF-resident intermediates**, fused NKI route packer,
-optlevel-1) — **+21.9%** over unpacked C32 (≈2,277 tok/s) and **+32.8%** over the
-paired-C16 baseline (≈2,090).
+block-diagonal packing**, **SBUF-resident intermediates**, and hoisted packed
+transposes, fused NKI route packer, optlevel-1) — **+22.6%** over unpacked C32
+(≈2,277 tok/s) and **+33.6%** over the paired-C16 baseline (≈2,090).
 
 The packing (`DN_PACK_C32=1 DN_PACK_N=4`) folds four independent DeltaNet streams
 (4 of the 8 per-core V-heads) into one P=128 block-diagonal chunk tile, so the
@@ -126,7 +126,7 @@ batch ÷ prefill wall-time). References for the two configs:
 
 | Config | Wall time | Aggregate prompt tok/s |
 |---|---:|---:|
-| **Packed C32 ×4, SBUF-resident + transpose-once finish** (`DN_PACK_C32=1 DN_PACK_N=4`) — default | **14.411 s** | **2,775.6** |
+| **Packed C32 ×4, SBUF-resident + hoisted-transpose finish** (`DN_PACK_C32=1 DN_PACK_N=4`) — default | **14.328 s** | **2,791.7** |
 | Packed C32 ×2 (`DN_PACK_N=2`) | 15.620 s | 2,560.9 |
 | Unpacked C32 (`DN_PACK_C32=0`) | 17.568 s | 2,276.9 |
 | Paired C16 | 19.141 s | 2,089.7 |
@@ -190,6 +190,22 @@ the packed `[P,K_DIM]` tile ONCE (→`[K_DIM,P]`) in `_chunk_pack4`; each stream
 `[0:K_DIM, row:row+C]` as its matmul stationary (the transpose of that stream's block, so
 results are identical). Removes 2 transposes + 2 DMA reads per stream. +1.4%
 (2,738.0 → 2,775.6), bit-identical.
+
+**Constant/intra transpose hoists.** The packed inclusive-mask transpose is constant,
+so it is now built once outside the recurrent chunk loop. The packed block-diagonal
+`intra` tile is also transposed once at P=128; each finish copies its diagonal C32 block
+to partition zero instead of issuing four C32 transposes. Existing one/zero tiles are
+reused as well. A repeated production-shape profile improved 2.5156 → 2.4435 ms
+(+2.87%) and reduced matmul/transpose instructions 6,792 → 6,537. Confirmed with a
+matched full 40-layer same-host A/B on the reference Trn2 (BS=2, N=20000, bucket
+1024, cache-hot): baseline **2,774.1** → candidate **2,791.7** aggregate tok/s
+(**+0.63%**, 14.419 s → 14.328 s), warm≡timed fingerprints **bit-identical** to the
+reference below (`sum=-3.12377031e+05 norm=1.20273230e+03 top5=[517,607,261,290,294]`).
+The table headline now reflects the candidate (2,791.7). An earlier A/B on a
+persistently slower host reproduced the same direction and magnitude (cold-after-
+compile 2,427.4 → 2,447.1, +0.81%; cache-hot 2,432.7 → 2,450.4, +0.73%) — a
+same-host A/B cancels host speed, so those deltas hold, but their absolutes are
+host-specific and are not the headline.
 
 **Correctness gate.** Both pack widths (n=2 and n=4) produce a **bit-identical** N=20000
 fingerprint to unpacked C32 — `sum=-3.12377031e+05 norm=1.20273230e+03
