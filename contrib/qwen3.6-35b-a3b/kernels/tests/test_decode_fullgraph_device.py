@@ -607,6 +607,13 @@ def capture(args):
         )
     if args.initial_token_dir:
         initial_token_capture = _load_capture(args.initial_token_dir, rank)
+    # DN_TILED_CONV: convert conv_states to tile-partition-major once (matches the
+    # static_decode decode-loop conversion) so the tiled kernel path is exercised.
+    if getattr(S, "USE_DN_TILED_CONV", False):
+        state_cpu = (
+            state_cpu[0], S._conv_cm_to_tiled(state_cpu[1]),
+            state_cpu[2], state_cpu[3],
+        )
     state = tuple(tensor.to(device) for tensor in state_cpu)
     if S.USE_GQA_STATEFUL_KV:
         model.decode_kv_k.copy_(state[2])

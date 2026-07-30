@@ -16,8 +16,10 @@ top-8 mixture of experts, and targets a fixed long-context (20,000-token) regime
 The whole 40-layer decode model compiles to a single NEFF via
 `torch.compile(fullgraph=True, backend="neuron")`. The validated long-context
 prefill path uses four coarse 10-layer regions. With compiler 2.25 and DGE
-enabled, a single 40-layer prefill region also cross-compiles, although the
-TP=8/LNC=1 artifact does not fit this workload in `trn2.3xlarge` HBM.
+enabled, a single 40-layer prefill region also cross-compiles. The fastest
+prefill runs at **TP=8/LNC=1** once both replicated `[V, H]` vocab tensors are
+load-time sharded to fit the ~12 GB/rank budget (3,456.8 tok/s, +24.5%; see the
+prefill throughput table and the TP=8/LNC=1 resolution below).
 
 ## Architecture
 
@@ -405,9 +407,10 @@ transpose, reductions, and dynamic offsets. The driver does not force
 `dge_mode=none`; precomputing every static descriptor would increase NEFF/HBM
 footprint and is not a workaround for this descriptor cap.
 
-Trn2 replay established a separate HBM limit for TP=8/LNC=1. The base module
-loaded at 10.73 GB/core, but lazy loading of the compiled prefill regions failed
-for every tested matched compiler/runtime scratchpad page size:
+Trn2 replay initially hit an HBM wall for TP=8/LNC=1 (superseded — see the
+resolution below). With a **replicated** LM head, the base module loaded at 10.73
+GB/core and lazy loading of the compiled prefill regions failed for every matched
+compiler/runtime scratchpad page size:
 
 | Regions | Page size | HBM at failure | Decisive allocation failure |
 |---:|---:|---:|---|
@@ -418,9 +421,39 @@ for every tested matched compiler/runtime scratchpad page size:
 | 4 | 512 MiB | 11.352 GB | second aligned 512 MiB page |
 
 With LNC=1, pairs of ranks share each 24 GiB HBM bank, so these per-rank
-allocations exhaust the bank even though the weights alone fit. This fixed
-BS=2/N=20,000 workload therefore has no TP=8/LNC=1 throughput result on
-`trn2.3xlarge`; the TP=4/LNC=2 result below remains the validated baseline.
+allocations exhaust the bank while the module is replicated.
+
+#### Resolution (2026-07-29): TP=8/LNC=1 fits and is now the fastest prefill
+
+The wall was resident HBM, not the kernel. Two `[V, H]` tensors are replicated at
+~1.02 GB/rank each (vocab 248,320 × hidden 2048 × BF16): the LM head **and** the
+token embedding. Sharding both across TP at **load** time
+(`PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1`) drops the module from 10.73
+→ 8.95 GB/core; combined with `--scratchpad-page-size-mb 256` (the sweet spot: 5×
+256 MiB pool + tiny overflow, TOTAL ≈ 11.785 GB at the last failing step) the 40L
+graph loads with headroom. Full progression:
+
+| Step | Lever | Module | Overflow SP | TOTAL | Outcome |
+|---|---|---:|---:|---:|---|
+| a | replicated, pg64 | 10.73 | 175 MB | 12.146 | OOM |
+| b | lm_head sharded, pg64 | 9.84 | 687 MB | 11.988 | OOM |
+| c | + pg512 | 9.84 | 1.5 MB | 11.947 | OOM |
+| d | + pg256 | 9.84 | 201 MB | 11.785 | OOM (200 MB intermediate) |
+| e | **+ embed sharded, pg256** | **8.95** | — | — | **loads → 3,456.8 tok/s** |
+
+Both shards reconstruct the replicated result exactly (disjoint contiguous vocab
+ranges, zero-padded and sum-all-reduced — no extra rounding; proven bit-identical
+on CPU across 8 simulated ranks before any compile). The LM-head all-reduce is
+~2 MB (prefill needs logits for one token position); the embedding adds one
+`[B, chunk, H]` all-reduce per chunk and does not change the step count. Sharding
+only one tensor is insufficient — the freed space is reabsorbed by scratchpad
+growth. Result: **3,456.8 aggregate prompt tok/s** (TIMED 11.572 s),
+`sum=-3.17835375e+05 norm=1.20818213e+03`, warm≡timed and all-finite — **+24.5%**
+over the TP=4/LNC=2 record below. The `moe_cte` shard-on-I kernel needed only a
+~30-line additive LNC=1 patch (see `patches/nkilib-lnc1-moe-cte.patch`); with the
+patch applied the TP=4/LNC=2 fingerprint stays **bit-identical**
+(`sum=-3.12377031e+05 norm=1.20273230e+03 top5=[517,607,261,290,294]`), proving
+it inert at 2 shards.
 
 The `trn2-3xl-bs4-c16-s20000-tp4-b512-fused-direct512` artifact was validated
 as a complete 3.4 GiB cache root (664 files, 66 NEFFs). A separately restored
@@ -638,6 +671,8 @@ historical results in this section must not be attributed to it.
 
 | Test | Framework | Config | Latency | Prompt tok/s |
 |---|---|---|---|---|
+| **Packed DeltaNet C32 n=4 + vocab-sharded head/embed, TP=8/LNC=1** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256 | **11.572 s** | **3,456.8 aggregate** |
+| Packed DeltaNet C32 n=4 (SBUF-resident + transpose-once), TP=4/LNC=2 | PyTorch Native | BS=2, N=20000 each, bucket=1024 | 14.411 s | 2,775.6 aggregate |
 | **Batched compiled CTE-GQA + fused NKI-routed CTE-MoE + stable DeltaNet C32 (block-diagonal)** | PyTorch Native | BS=2, N=20000 each, bucket=1024 | **17.568 s** | **2,276.9 aggregate** |
 | Batched compiled CTE-GQA + fused NKI-routed CTE-MoE + paired DeltaNet C16 | PyTorch Native | BS=2, N=20000 each, bucket=1024 | 19.141 s | 2,089.7 aggregate |
 | Batched compiled CTE-GQA + fused NKI-routed CTE-MoE + paired DeltaNet C16 | PyTorch Native | BS=4, N=20000 each, bucket=512 | 39.788 s | 2010.6 aggregate |
@@ -753,6 +788,47 @@ K/V cache. Preserve
 `NEURON_COMPILE_CACHE_URL` on NVMe: the first CTE-GQA run, including four segment
 compiles and the 20k warm pass, took 861.6 seconds; cached execution is 17.9
 seconds.
+
+### Prefill — context-length scaling (current best build)
+
+Measured on the current fastest prefill build — packed DeltaNet **C32 n=4**
+(`DN_PACK_C32=1 DN_PACK_N=4`) with SBUF-resident intermediates + transpose-once
+finish (Levers 1+2) — BS=2, 1024-token buckets, four compiled 10-layer segments,
+TP=4/LNC=2, runtime bucket offsets/valid lengths. This is the 2,775.6 tok/s @20k
+configuration (the +21.9% successor to the 2,276.9 C32-block-diagonal row above).
+
+| Context length | Latency (BS=2) | Aggregate prompt tok/s |
+|---|---|---|
+| 5,000 | 3.567 s | **2,803.6** |
+| 10,000 | 7.167 s | **2,790.6** |
+| 20,000 (customer p95) | 14.411 s | **2,775.6** |
+
+**Throughput is essentially flat across the customer's whole context range**, in
+fact ~1% *higher* at shorter lengths (2,803.6 @5k vs 2,775.6 @20k). Because the
+prefill tiles the prompt into fixed 1024-token chunks driven by a single compiled
+graph set (runtime `q_base`/`valid_len` scalars), per-token cost is nearly
+constant; shorter prompts accumulate less DeltaNet/KV history, so the per-chunk
+GQA is marginally cheaper. **Wall-clock latency scales ~linearly** with length
+(3.6 → 7.2 → 14.4 s), which is the number that sets time-to-first-token at each
+size. All three lengths returned finite logits and carried state. No recompile is
+needed to change context length — the one 1024-chunk graph set serves any prompt
+length (10k ran 10 chunks, 5k ran 5) off the same compiled cache.
+
+**Bucket (chunk) size re-validation (2026-07-28).** The earlier chunk-size sweep
+picked bucket=1024 on pre-packing code; re-running it on the current packn4 build
+(BS=2, N=20000) confirms 1024 is still optimal:
+
+| Bucket | Latency (BS=2, N=20000) | Aggregate prompt tok/s |
+|---|---|---|
+| 512 | 18.251 s | 2,191.7 |
+| **1024** | **14.411 s** | **2,775.6** |
+| 2048 | — | runtime `NRT_TIMEOUT` at BS=2 (not viable) |
+
+512-token buckets are −21% vs 1024 (more per-chunk fixed overhead / more chunks).
+2048-token buckets compiled but the warm execution hit the 30 s per-NEFF runtime
+watchdog on every core (`FATAL-RT-UNDEFINED-STATE`) at BS=2 — the doubled
+per-chunk working set is not viable at this batch (historically 2048 only ran at
+BS=1, 969.4 tok/s). **1024 remains the recommended prefill bucket.**
 
 ## Reference
 

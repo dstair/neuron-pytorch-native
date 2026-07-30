@@ -1,11 +1,21 @@
-# Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32, TP=4/LNC=2)
+# Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32)
 
-Reproduces the fastest validated **prefill** configuration:
-**≈2,792 aggregate prompt tok/s** (BS=2, N=20000 tokens, query bucket 1024,
-TP=4 / LNC=2, DeltaNet **stable C32** block-diagonal inverse with **4-stream
-block-diagonal packing**, **SBUF-resident intermediates**, and hoisted packed
-transposes, fused NKI route packer, optlevel-1) — **+22.6%** over unpacked C32
-(≈2,277 tok/s) and **+33.6%** over the paired-C16 baseline (≈2,090).
+Reproduces the fastest validated **prefill** configuration. The current best is
+**≈3,457 aggregate prompt tok/s** at **TP=8/LNC=1** (§3c) — **+23.8%** over the
+TP=4/LNC=2 configuration. Both use the identical packed-C32 DeltaNet kernel; LNC=1
+just gives twice the tensor engines. LNC=1 additionally requires both replicated
+`[V, H]` vocab tensors to be **load-time vocab-sharded** to fit the ~12 GB/rank
+budget, and the ~30-line `moe_cte` LNC=1 patch (§3c). The LNC=1 number was measured
+before the hoisted packed transposes landed, so it has not yet been re-baselined
+with them.
+
+The TP=4/LNC=2 configuration (§3a) is **≈2,792 aggregate prompt tok/s** (BS=2,
+N=20000 tokens, query bucket 1024, DeltaNet **stable C32** block-diagonal inverse
+with **4-stream block-diagonal packing**, **SBUF-resident intermediates**, and
+hoisted packed transposes, fused NKI route packer, optlevel-1) — **+22.6%** over
+unpacked C32 (≈2,277 tok/s) and **+33.6%** over the paired-C16 baseline (≈2,090).
+It remains the simplest to reproduce (no vocab sharding, no nkilib patch) and is
+the reliable fallback.
 
 The packing (`DN_PACK_C32=1 DN_PACK_N=4`) folds four independent DeltaNet streams
 (4 of the 8 per-core V-heads) into one P=128 block-diagonal chunk tile, so the
@@ -117,6 +127,45 @@ nohup bash -c 'deploy/compile_prefill_trn2.sh \
 ```
 Re-runs are cache-hot from the matching `--cache-dir` (skip §2/compile).
 
+### 3c. Fastest — TP=8/LNC=1 (≈3,457 tok/s, +24.5%)
+
+Same packed-C32 kernel, but at TP=8/LNC=1 (8 logical cores → twice the tensor
+engines). Two extra requirements:
+
+1. **The `moe_cte` LNC=1 patch.** `deploy/compile_prefill_trn2.sh` applies
+   `patches/nkilib-lnc1-moe-cte.patch` to the mounted nkilib host-side, idempotently
+   (`git apply --check` / `--reverse --check`), and fails loudly if it cannot. The
+   patch is ~30 additive lines that relax a `NUM_SHARDS == 2` shard-count guard (the
+   old `[NCC_INKI016] ... only work on TRN2` error was a mislabeled shard guard, not
+   a hardware one) and skip the peer `sendrecv` at one shard — all inert at LNC=2
+   (proven: the LNC=2 fingerprint is bit-identical with the patch applied).
+2. **Vocab-sharded head + embedding**, ON by default at `--lnc 1`
+   (`PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1`). The two replicated `[V, H]`
+   tensors are ~1.02 GB/rank each; sharded across TP they drop the module 10.73 →
+   8.95 GB/core, which is what makes 40L fit the ~12 GB/rank budget. Both reconstruct
+   the replicated result exactly (disjoint contiguous ranges, zero-pad + sum-reduce).
+3. **`--scratchpad-page-size-mb 256`** — the sweet spot (5× 256 MiB pool + tiny
+   overflow); pg64 and pg512 both OOM at 40L.
+
+```bash
+source .env
+deploy/compile_prefill_trn2.sh \
+  --tp 8 --lnc 1 --layers 40 --splits 4 --bucket 1024 --optlevel 1 \
+  --scratchpad-page-size-mb 256 \
+  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/tp8-lnc1-c32pack4"
+```
+
+Measured **3,456.8 aggregate prompt tok/s** (TIMED 11.572 s), warm≡timed
+fingerprint `sum=-3.17835375e+05 norm=1.20818213e+03 top5=[517,607,261,294,15089]`,
+all-finite. The fingerprint is **not** bit-identical to LNC=2 (different TP
+reduction order — norm 0.45% / sum 1.7% apart, top-1/top-3 identical, 4/5 top-5
+shared, all finite + sane magnitude), but the greedy coherence continuation is
+**token-identical** to the LNC=2 baseline: prompt `760,6511,314,9338,369` → first
+tokens `[11751, 13, 198, 760, 6511, 314, ...]`, matching the C32/C16 baseline.
+
+Its own `--cache-dir` is mandatory — topology + the sharding flags change the
+traced graph, and the metadata guard refuses to mix it with the LNC=2 cache.
+
 ---
 
 ## 4. Reading the result
@@ -126,10 +175,12 @@ batch ÷ prefill wall-time). References for the two configs:
 
 | Config | Wall time | Aggregate prompt tok/s |
 |---|---:|---:|
-| **Packed C32 ×4, SBUF-resident + hoisted-transpose finish** (`DN_PACK_C32=1 DN_PACK_N=4`) — default | **14.328 s** | **2,791.7** |
-| Packed C32 ×2 (`DN_PACK_N=2`) | 15.620 s | 2,560.9 |
-| Unpacked C32 (`DN_PACK_C32=0`) | 17.568 s | 2,276.9 |
-| Paired C16 | 19.141 s | 2,089.7 |
+| **Packed C32 ×4, TP=8/LNC=1** (§3c, vocab-sharded head+embed, pg256; pre-hoisted-transpose) | **11.572 s** | **3,456.8** |
+| Packed C32 ×4, SBUF-resident + hoisted-transpose finish, TP=4/LNC=2 (`DN_PACK_C32=1 DN_PACK_N=4`) — LNC=2 default | 14.328 s | 2,791.7 |
+| Packed C32 ×4, SBUF-resident + transpose-once finish, TP=4/LNC=2 | 14.411 s | 2,775.6 |
+| Packed C32 ×2 (`DN_PACK_N=2`), TP=4/LNC=2 | 15.620 s | 2,560.9 |
+| Unpacked C32 (`DN_PACK_C32=0`), TP=4/LNC=2 | 17.568 s | 2,276.9 |
+| Paired C16, TP=4/LNC=2 | 19.141 s | 2,089.7 |
 
 A per-run token-ID/state fingerprint is printed for correctness; the warm and
 timed fingerprints must be identical and finite. Compare across builds to confirm
