@@ -448,6 +448,20 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   512, and N=10,000 (which would also require a matched LNC=2 re-baseline, since agg
   tok/s is seq-length-sensitive and a 20k-vs-10k cross-topology comparison is
   meaningless).
+- **beta-4 container = 3,889.4 agg prompt tok/s, +12.5% over 3,456.8, source-identical
+  (2026-08-03).** Swap the DLC only (`sha256:9d37a773…` → `sha256:ad7f7bbcd468…`);
+  same recipe, same flags, 10,284.3 ms vs 11,571.5 ms. **Module resident unchanged at
+  8.95 GB/core** — pure compiler scheduling, no memory trade. Fingerprint is *not*
+  bit-identical: `sum=-3.29478219e+05 norm=1.22990430e+03 top5=[517,607,15089,258,261]`
+  vs the LNC=1 reference (norm +1.80%, sum +3.66%, top-1/top-2 identical, 4/5 top-5
+  shared). That drift is bigger than any previously accepted same-topology drift, so
+  **the coherence continuation is what certifies it** — and it passed token-identically
+  (`[11751,13,198,760,6511,314,...]`). Note the continuation *looks* degenerate (it
+  cycles the prompt); that is the reference prompt's documented behaviour, not a bug —
+  do not re-flag it. **Decode on beta-4 is blocked upstream of the device:** two
+  ~48-min compiles died with `[F137] neuronx-cc was forcibly killed` even with 159 GB
+  of swap. Rank-count reduction is not available (the LNC=1 fit needs 8 shards), so the
+  untried fallback is **`--graph-splits 2`**.
 - **FP8 CTE prefill lever (scoped 2026-07-23; no longer needed for LNC=1).** Kept
   for reference only — the LNC=1 fit was solved by LM-head sharding above, so do not
   start this for that reason. To make experts resident FP8 and dequantized in-kernel

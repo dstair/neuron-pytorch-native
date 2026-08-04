@@ -19,7 +19,9 @@ prefill path uses four coarse 10-layer regions. With compiler 2.25 and DGE
 enabled, a single 40-layer prefill region also cross-compiles. The fastest
 prefill runs at **TP=8/LNC=1** once both replicated `[V, H]` vocab tensors are
 load-time sharded to fit the ~12 GB/rank budget (3,456.8 tok/s, +24.5%; see the
-prefill throughput table and the TP=8/LNC=1 resolution below).
+prefill throughput table and the TP=8/LNC=1 resolution below). On the **beta-4
+container** the identical build measures **3,889.4 tok/s** (+12.5%) with no source
+change — see "beta-4 container" below.
 
 ## Architecture
 
@@ -671,6 +673,7 @@ historical results in this section must not be attributed to it.
 
 | Test | Framework | Config | Latency | Prompt tok/s |
 |---|---|---|---|---|
+| **Same build on the beta-4 container (compiler-only win)** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256 | **10.284 s** | **3,889.4 aggregate** |
 | **Packed DeltaNet C32 n=4 + vocab-sharded head/embed, TP=8/LNC=1** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256 | **11.572 s** | **3,456.8 aggregate** |
 | Packed DeltaNet C32 n=4 (SBUF-resident + transpose-once), TP=4/LNC=2 | PyTorch Native | BS=2, N=20000 each, bucket=1024 | 14.411 s | 2,775.6 aggregate |
 | **Batched compiled CTE-GQA + fused NKI-routed CTE-MoE + stable DeltaNet C32 (block-diagonal)** | PyTorch Native | BS=2, N=20000 each, bucket=1024 | **17.568 s** | **2,276.9 aggregate** |
@@ -830,6 +833,49 @@ watchdog on every core (`FATAL-RT-UNDEFINED-STATE`) at BS=2 — the doubled
 per-chunk working set is not viable at this batch (historically 2048 only ran at
 BS=1, 969.4 tok/s). **1024 remains the recommended prefill bucket.**
 
+### beta-4 container (2026-08-03): +12.5% prefill for free, decode still blocked
+
+Swapping only the PyTorch-Native DLC — no source change, same flags, same cache
+key inputs — moved 20k prefill from **3,456.8 → 3,889.4 aggregate prompt tok/s**
+(11,571.5 → 10,284.3 ms, **+12.5%**). Config is the recipe verbatim: 40L, BS=2,
+N=20,000, bucket 1024, O1, `DN_PACK_C32=1 DN_PACK_N=4`,
+`--scratchpad-page-size-mb 256`, `PREFILL_SHARDED_LM_HEAD=1
+PREFILL_SHARDED_EMBED=1`, TP=8/LNC=1. **Module resident stayed 8.95 GB/core**, so
+the win is pure compiler scheduling, not a memory-headroom trade.
+
+| Image | Digest | TIMED (BS=2, N=20000) | Aggregate prompt tok/s |
+|---|---|---:|---:|
+| previous | `sha256:9d37a773…` | 11,571.5 ms | 3,456.8 |
+| **beta-4** | `sha256:ad7f7bbcd468…` | **10,284.3 ms** | **3,889.4** |
+
+**Numerics: gate passed, but the fingerprint is not bit-identical.** beta-4 gives
+`sum=-3.29478219e+05 norm=1.22990430e+03 top5=[517,607,15089,258,261]` (warm ≡
+timed, all-finite across logits/deltanet/conv/kv_k/kv_v) against the recorded
+LNC=1 reference `sum=-3.17835375e+05 norm=1.20818213e+03
+top5=[517,607,261,294,15089]`. Drift is norm **+1.80%**, sum **+3.66%**, top-1 and
+top-2 identical, 4 of 5 top-5 shared (`294`→`258` substituted, `15089` moved rank
+5→3). This is the same class of fp-reordering artifact a compiler change produces
+(cf. the O3 run at `sum=-3.19872438e+05`, 0.3% norm drift) — but it is **larger
+than any previously accepted same-topology drift**, so magnitude alone does not
+certify it.
+
+The decisive gate is the greedy coherence continuation, and it **passed
+token-identically**: prompt `760,6511,314,9338,369` →
+`[11751, 13, 198, 760, 6511, 314, 9338, 369, 11751, 13, 198, …]`, matching the
+reference continuation `[11751, 13, 198, 760, 6511, 314, …]` documented in
+`PREFILL_RECIPE.md` for exactly this LNC=1 config. The apparent "degenerate
+repetition" is the expected behaviour of that reference prompt (it is a cyclic
+prompt), not a failure — the LNC=2/C16/C32 baselines produce the same cycle.
+
+**Decode on beta-4 is blocked by host OOM, not by the device.** Two full-graph
+decode compiles died after ~48 min each with
+`[F137] neuronx-cc was forcibly killed` (exit 70) — 2026-08-03T18:29:52Z (rank6)
+and 2026-08-03T20:40:57Z (rank5). **159 GB of swap across three swapfiles was
+insufficient**; the compiler is killed while the graph is still one region.
+Reducing rank count is *not* an option (the LNC=1 fit depends on 8 shards), so the
+viable fallback is **`--graph-splits 2`**, trading one region for two smaller
+compiles. Untried as of this entry.
+
 ## Reference
 
 The validated NxDI implementation
@@ -838,3 +884,27 @@ The validated NxDI implementation
 token-match vs CPU, BS=1 54.3 tok/s / 18.4 ms/tok on the same hardware. Its MoE uses
 an NxDI library module and is not portable, which is why this implementation carries
 its own MoE kernels and CPU oracle.
+
+### vLLM-Neuron port (different regime — not a ranking)
+
+A separate vLLM-Neuron port of this model exists and was validated by its authors
+(`/home/dstair/dev/vllm-neuron`, `origin/add-qwen36-moe` @ `65ef8b7`). Its measured
+numbers, for reference:
+
+| Metric | vLLM-Neuron port | Config |
+|---|---:|---|
+| GSM8K-CoT exact-match (flexible) | 93.0% ± 2.6% | BS=1, 100 q, 4-shot |
+| Output throughput @ concurrency 1 | 22.57 tok/s | 256-in / 128-out |
+| Output throughput @ concurrency 4 | 74.37 tok/s | 256-in / 128-out |
+| Output throughput @ concurrency 8 | 123.78 tok/s | 256-in / 128-out |
+
+**These rows are not comparable to the numbers above and must not be read as a
+ranking.** They were measured on a **trn2.48xlarge** (16 chips / TP8/EP8) versus a
+single-chip trn2.3xlarge here; at `max_model_len=1024` with ≤512-token GDN prefill
+segments versus our 20,000-token prefill; and under continuous batching versus our
+fixed batch. In particular our prefill headline (3,456.8 agg prompt tok/s at 20k
+tokens) has **no counterpart** in that port, whose context is capped at 1,024.
+
+Full analysis — file inventory, reproduction blockers, GDN kernel comparison, seam
+analysis, and a numerical finding in their draft chunked prefill kernel — is in
+**[VLLM_NEURON_ASSESSMENT.md](VLLM_NEURON_ASSESSMENT.md)**.

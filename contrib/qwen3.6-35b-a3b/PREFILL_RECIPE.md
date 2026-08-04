@@ -163,6 +163,23 @@ shared, all finite + sane magnitude), but the greedy coherence continuation is
 **token-identical** to the LNC=2 baseline: prompt `760,6511,314,9338,369` → first
 tokens `[11751, 13, 198, 760, 6511, 314, ...]`, matching the C32/C16 baseline.
 
+> **The continuation cycles the prompt, and that is correct.** The full emission is
+> `[11751, 13, 198, 760, 6511, 314, 9338, 369, 11751, 13, 198, …]` — it re-enters the
+> prompt tokens because the reference prompt is itself cyclic. Every validated build
+> (C16, C32, LNC=2, LNC=1, beta-4) produces this same cycle. Do not read it as
+> degenerate output or as a failed gate.
+
+**beta-4 container (2026-08-03): same recipe, 3,889.4 tok/s (+12.5%).** Swapping only
+the DLC (`sha256:9d37a773…` → `sha256:ad7f7bbcd468…`) with no source or flag change
+measures 10,284.3 ms / **3,889.4 aggregate prompt tok/s** at an unchanged 8.95 GB/core.
+Its fingerprint is `sum=-3.29478219e+05 norm=1.22990430e+03
+top5=[517,607,15089,258,261]` — norm +1.80% / sum +3.66% off the LNC=1 reference
+above, i.e. a larger fp-reordering drift than any previously accepted same-topology
+change, so **certify beta-4 on the coherence continuation (which passes
+token-identically), not on the fingerprint.** Use this as the LNC=1 beta-4 reference
+fingerprint for future A/Bs. Full-graph *decode* does not yet compile on beta-4
+(`[F137]` host OOM at 159 GB swap; try `--graph-splits 2`) — see `BENCHMARK.md`.
+
 Its own `--cache-dir` is mandatory — topology + the sharding flags change the
 traced graph, and the metadata guard refuses to mix it with the LNC=2 cache.
 
