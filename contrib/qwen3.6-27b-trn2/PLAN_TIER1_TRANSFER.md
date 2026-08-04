@@ -238,12 +238,80 @@ and the padded-tensor concern of step 4 did not bite at BS≤16.
   correct reading is the opposite: BS=16 is where the untiled path is already doing well,
   and where T1a's wide-DMA trade stops paying.
 
+## Workstream T1c — TP=8 / LNC=1 (added 2026-08-04, out of the original Tier-1 scope)
+
+Not in the original transfer plan; added because LNC=1 was the 35B's single biggest
+prefill lever (+24.5%) and the 27B had never been run at 8 logical cores. LNC=1
+exposes the chip as 8 × 12 GB instead of 4 × 24 GB, so it **forces TP=8**.
+
+**Two blockers had to be cleared first**, both real:
+1. Per-core head counts were hardcoded in 6 NKI kernels — the exact scope deviation
+   T1a had skipped as having no consumer. It has one now.
+2. `num_key_value_heads = 4` does not divide 8. Every other dimension does (q heads
+   24, DeltaNet 16/48, intermediate 17408, vocab 248320, q+gate 12288). Fixed by
+   replicating whole KV heads across rank groups (`shard_linear_colwise_replicated`)
+   rather than splitting them: a 256-dim head cannot be halved across ranks because
+   `q·k` contracts over all 256 dims and `k_norm` is per-head. The row-wise `o_proj`
+   all-reduce stays exact because *query* heads remain disjoint — the reduce sums over
+   a partition of q heads, so a replicated KV head cannot be double-counted.
+
+T1b is a **hard prerequisite**, not a companion lever: TP=4 needs 13,450 MB/core with
+T1b already, so it cannot run under a 12 GB ceiling at all, and TP=8 with a replicated
+vocab needs ~11.1 GB of 12. Both sides of every A/B therefore carry both T1b flags.
+
+### Validation — DONE (2026-08-04, beta-4, 64L, both T1b flags on both sides)
+
+Predicted 6,813 MB/core; measured **6,768** (0.7% off). Decode, host-sync tok/s:
+
+| BS | TP=4/LNC=2 | TP=8/LNC=1 | Δ |
+|---|---|---|---|
+| 1 | 21.0 | 22.7 | +8.1% |
+| 8 | 72.3 | 82.0 | +13.4% |
+| 8 + T1a | — | **92.0** | +27.2% vs TP=4 |
+| 16 | **94.3** | OOM | — |
+
+All passing legs emit the identical greedy continuation. CPU gate:
+`kernels/tests/test_tp8_sharding_cpu.py`, 60 checks, no device needed.
+
+**The stated risk did not materialize, and that is the finding.** Going in, the
+concern was that TP=8 doubles the participants in every `out_proj`/`down_proj`
+all-reduce while ~58% of a BS=8 step is already GLUE+SYNC. LNC=1 won anyway, at every
+batch size it could reach: decode here is weight-read bound before it is collective
+bound, and halving per-core weight traffic beats the added collective cost. **Third
+consecutive case (with T1a and beta-4) where the sign of a lever was mispredicted from
+a profile attribution.** Stop predicting signs.
+
+**The replication has a cost, and it lands on batch scaling.** BS=16 at TP=8 OOMs
+loading the decode NEFF — weights are fine (6,768 of 12,288 MB), a 65.5 MB instruction
+staging buffer is not (`TDRV:dmem_alloc_internal ... ret=-12`). The KV cache
+(`static_decode.py:1429`, `[NUM_GQA, B, max_seq, 256]`) holds one whole KV head per
+rank at *both* TP values, so the one tensor that grows with batch is the one tensor
+TP=8 does not shrink — now measured against 12 GB instead of 24. **So LNC=1 is the
+latency and footprint configuration; LNC=2 is still required for BS=16.**
+
+### Open under T1c
+- BS=16 at TP=8 is unmeasured. Re-running at `--max-seq-len 1024` to buy the headroom
+  back is queued (`/mnt/nvme/tmp/tp8_bs16fix.sh`), together with an allocator
+  breakdown under `NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG=1`.
+- Prefill at TP=8 vs TP=4 is unmeasured; first attempt failed on a flag error (below).
+- Whether sharding the *replicated* KV head across its rank group — storing half a
+  head per rank and all-gathering before attention — buys back BS=16. Trades HBM for a
+  collective on every GQA layer; unattractive given the collective already dominates.
+
+### A flag trap, worth recording
+`--prompt-len` is read only in tiny mode (`static_decode.py:1448`), so the prefill
+command documented in the README silently prefilled the 5-token real prompt and then
+tripped `--compile-prefill`'s multiple-of-64 guard. It failed **identically at TP=4 and
+TP=8**, which is what identified it as a flag error rather than a port defect — the
+value of always running the control. README fixed to include `--tiny`.
+
 ## Reproducing these runs
 The beta-4 DLC has no `transformers`, which this harness needs (`from_pretrained`).
 See README → "Running" for the `pip install --target /pysite` + `PYTHONPATH=/pysite`
 recipe; transformers **5.14.1** is the validated version for `model_type: qwen3_5`.
 Driver scripts used for the 2026-08-04 runs live on the Trn2 at
 `/mnt/nvme/tmp/run27b.sh`, `rerun16.sh`, `t1a_kernel_gate.sh`, `t1a_e2e.sh`,
-`t1a_bs16_rev.sh`, `t1a_kernel_bs16.sh`, logs in `/mnt/nvme/tmp/runlog/`
-(instance store — copy off before any stop/start). T1a source snapshot:
-`/mnt/nvme/code/q27b-t1a`.
+`t1a_bs16_rev.sh`, `t1a_kernel_bs16.sh`, and for T1c `tp8_gate.sh`, `tp8_legs.sh`,
+`tp8_pf2.sh`, `tp8_t1a16.sh`, `tp8_bs16fix.sh`; logs in `/mnt/nvme/tmp/runlog/`
+(instance store — copy off before any stop/start). Source snapshots:
+`/mnt/nvme/code/q27b-t1a` (T1a), `/mnt/nvme/code/q27b-tp8` (T1c).

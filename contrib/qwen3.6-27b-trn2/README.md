@@ -24,9 +24,29 @@ GQA (16 layers): 24 Q-heads (+ output gate), 4 KV-heads, head_dim 256
 MLP (all 64 layers): SwiGLU, gate/up [5120,17408], down [17408,5120]
 ```
 
-TP=4 sharding is manual and per-core (colwise for q/k/v/gate/up, rowwise for the
+Sharding is manual and per-core (colwise for q/k/v/gate/up, rowwise for the
 output/down projections) with an all-reduce after each `out_proj` and `down_proj`.
 See the sharding helpers in `static_decode.py`.
+
+**TP=4 and TP=8 are both supported** (`TP_DEGREE`, default 4). TP=8 is what LNC=1
+requires — see [TP=8 / LNC=1](#tp8--lnc1-8-logical-cores-of-12-gb) below. Every
+per-core dimension is derived from `TP_DEGREE` rather than hardcoded:
+
+| | TP=4 (LNC=2) | TP=8 (LNC=1) |
+|---|---|---|
+| DeltaNet key / value heads | 4 / 12 | 2 / 6 |
+| DeltaNet per-core QKV dim | 2560 (= 20×128) | 1280 (= 10×128) |
+| GQA query heads | 6 | 3 |
+| GQA KV heads | 1 | 1 (**replicated ×2**) |
+| MLP per-core dim | 4352 | 2176 |
+
+The one dimension that does not divide by 8 is `num_key_value_heads = 4`, so past
+TP=4 whole KV heads are **replicated** across rank groups instead of split
+(`shard_linear_colwise_replicated`) — splitting a 256-dim head across two ranks
+would break attention, since `q·k` contracts over all 256 dims and `k_norm` is
+per-head. The row-wise `o_proj` all-reduce stays exact under replication because the
+*query* heads remain disjoint: the reduce sums over a partition of q heads, so a
+replicated KV head cannot be double-counted.
 
 ## Layout
 
@@ -79,10 +99,23 @@ torchrun --nproc-per-node=4 static_decode.py --num-layers 64 --max-seq-len 2048 
 DNBATCHED_V2=1 GQATAIL=1 \
   torchrun --nproc-per-node=4 static_decode.py --num-layers 64 --batch-size 8
 
-# Compiled chunked prefill
+# Compiled chunked prefill. --tiny is required: --prompt-len is only read in tiny
+# mode (static_decode.py:1448), so without it you silently prefill the 5-token real
+# prompt and --compile-prefill rejects it (S must be a multiple of CHUNK_SIZE=64).
+# Tiny mode keeps full width and --num-layers layers but randomizes weights, which
+# is sound here — prefill TTFT is structural, independent of weight values.
 CHUNKEDPREFILL=1 \
-  torchrun --nproc-per-node=4 static_decode.py --num-layers 64 --prompt-len 128 --compile-prefill
+  torchrun --nproc-per-node=4 static_decode.py --num-layers 64 --tiny --prompt-len 128 --compile-prefill
+
+# TP=8 / LNC=1 (8 logical cores of 12 GB). T1b is mandatory here, not optional:
+# a replicated vocab needs ~11.1 GB of the 12 GB ceiling.
+NEURON_LOGICAL_NC_CONFIG=1 TP_DEGREE=8 SHARDED_EMBED=1 SHARDED_LM_HEAD=1 \
+  DNBATCHED_V2=1 GQATAIL=1 \
+  torchrun --nproc-per-node=8 static_decode.py --num-layers 64 --batch-size 8
 ```
+
+`TP_DEGREE` must match `--nproc-per-node`; the harness raises at startup if it does
+not, rather than sharding for one world size and running on another.
 
 Useful flags: `--tiny` (small config for quick iteration), `--num-layers N`,
 `--skip-prefill`, `--fp8-weights`, `--batch-size N`, `PROFILE_STEPS=N` (emit a
@@ -119,7 +152,9 @@ high-batch decode, take `SHARDED_EMBED`.
 
 ## Performance summary
 
-All numbers are `trn2.3xlarge`, TP=4, LNC=2, bf16, measured with a
+All numbers are `trn2.3xlarge`, TP=4, LNC=2, bf16 — **except the
+[TP=8 / LNC=1](#tp8--lnc1-8-logical-cores-of-12-gb) section, which is the current
+best decode configuration** — measured with a
 `torch.neuron`-synchronized timer (async-enqueue artifacts excluded). "PyTorch
 Native" = this repo's `static_decode.py` (single compiled NEFF). "XLA" reference
 points are the [NxDI](https://github.com/aws-neuron/neuronx-distributed-inference)
@@ -296,11 +331,88 @@ with the profile, just not with the 35B's BS=32 result.
 
 **Status: default-off and scoped to BS=8.** Do not enable at BS=16.
 
+#### TP=8 / LNC=1: 8 logical cores of 12 GB {#tp8--lnc1-8-logical-cores-of-12-gb}
+
+Everything above this section runs at **TP=4 / LNC=2** — 4 logical cores of 24 GB.
+LNC=1 splits the same chip into 8 cores of 12 GB, which forces TP=8. Measured
+2026-08-04, beta-4 container, 64 layers, `--max-seq-len 2048`.
+
+**Both sides of every A/B carry `SHARDED_EMBED=1 SHARDED_LM_HEAD=1` (T1b).** That is
+not a preference: TP=4 needs **13,450 MB/core** *with* T1b already, so it cannot run
+under a 12 GB ceiling at all, and TP=8 without T1b needs ~11.1 GB of 12 GB. Putting
+T1b on the controls is what makes this a measurement of TP/LNC rather than of T1b.
+
+| Config | HBM/core | A) host-sync ms/tok | B) on-device ms/tok | tok/s (host-sync) | tok/s (synced) |
+|---|---|---|---|---|---|
+| BS=1, TP=4/LNC=2 | 13,450 MB | 47.61 | 48.09 | 21.0 | 26.7 |
+| BS=1, TP=8/LNC=1 | **6,768 MB** | **44.06** | **43.62** | **22.7** (+8.1%) | **29.7** (+11.2%) |
+| BS=8, TP=4/LNC=2 | 13,450 MB | 110.61 | 117.43 | 72.3 | 82.5 |
+| BS=8, TP=8/LNC=1 | **6,768 MB** | 97.51 | 105.75 | **82.0** (+13.4%) | **94.2** (+14.2%) |
+| BS=8, TP=8/LNC=1 **+ T1a** | **6,768 MB** | **86.94** | **95.74** | **92.0** (+27.2%) | **107.0** (+29.7%) |
+| BS=16, TP=4/LNC=2 | 13,450 MB | 169.69 | 185.76 | 94.3 | 59.4 ⚠ |
+| BS=16, TP=8/LNC=1 | — | — | — | **OOM at NEFF load** | — |
+
+`DNBATCHED_V2=1 GQATAIL=1` on all BS=8 and BS=16 rows. Every leg that ran emits the
+identical greedy continuation, so none of this moves numerics. ⚠ the BS=16 "synced"
+figure is the known-broken C2 timer — it reports 59.4 tok/s *below* the same run's
+94.3 host-sync figure, which is impossible; read BS=16 off method A.
+
+**LNC=1 wins, and the prediction that it would not was wrong.** Going in, the stated
+risk was that TP=8 doubles the participants in every `out_proj`/`down_proj`
+all-reduce, and the barrier-bound analysis below says ~58% of a BS=8 step is
+GLUE+SYNC — so more ranks on a collective-dominated step looked like a losing trade.
+It is not, at either batch size. The reason appears to be that decode here is
+weight-read bound before it is collective bound: TP=8 halves the per-core weight
+traffic per step (13,450 → 6,768 MB resident, and the HBM halves almost exactly,
+6,768×2 = 13,536), and that saving is larger than the added collective cost. The
+lesson is the same one T1a and beta-4 already taught — *predicting the sign of a
+Trainium lever from a profile attribution is unreliable; measure it.*
+
+**T1a stacks. At equal batch size the combination is the best 27B decode
+configuration measured: 92.0 tok/s host-sync at BS=8**, versus 82.1 previously (T1a
+at TP=4, no T1b) and 72.3 for the TP=4 control here. T1a's own delta is +12.2% at
+TP=8 against +16.8% at TP=4 — smaller, which is what a halved tile count
+(`NT` 20 → 10) predicts if the lever is about conv-state DMA volume.
+
+**But the best absolute throughput is still TP=4 at BS=16 (94.3 tok/s), because TP=8
+cannot reach BS=16 at all.** It OOMs while loading the decode NEFF — not on weights
+(6,768 of 12,288 MB is fine) but on a 65.5 MB instruction staging buffer
+(`TDRV:dmem_alloc_internal ... ret=-12`). The structural reason TP=8 does not buy
+proportional headroom is that **the KV cache is replicated, not sharded**:
+`torch.zeros(NUM_GQA, B, max_seq_len, GQA_HEAD_DIM)` (`static_decode.py:1429`) holds
+one whole KV head per rank at *both* TP values, since `num_key_value_heads = 4` forces
+replication past TP=4. So the one tensor that grows with batch is the one tensor TP=8
+does not shrink — and at LNC=1 it is measured against 12 GB instead of 24 GB. That is
+the real cost of the replication approach, and it lands exactly where batch scaling
+needs the room.
+
+So the configuration choice is not "LNC=1 is better": it is **LNC=1 for latency and
+for memory-constrained deployments (half the resident footprint, best TPOT at every
+batch size it can reach), LNC=2 when you need BS=16 throughput.**
+
+**One flag trap found while measuring this.** `--prompt-len` is read only in tiny mode
+(`static_decode.py:1448`), so the prefill command previously documented in this README
+silently prefilled the 5-token real prompt and then tripped `--compile-prefill`'s
+multiple-of-64 guard. It failed identically at TP=4 and TP=8, which is how it was
+identified as a flag error and not a port defect. The command above now includes
+`--tiny`.
+
+**What changed in the code.** Per-core dimensions are derived from `TP_DEGREE`
+instead of hardcoded (see the table under [Architecture](#architecture)), the derived
+head counts are exported to the NKI kernels through the environment *before* they are
+imported — NKI needs them as Python constants for loop bounds and tile shapes, so
+kwargs will not do — and GQA KV heads are replicated rather than split past TP=4.
+`kernels/tests/test_tp8_sharding_cpu.py` gates all of it without a device (60 checks,
+including a negative check that a plain column shard at TP=8 really would hand a rank
+half a KV head, and a frozen assertion that the TP=4 constants are bit-for-bit the
+ones every published number above was measured with).
+
 ### Prefill (TTFT / prompt throughput)
 
 | Test | Framework | Config | Latency | Prompt tok/s |
 |---|---|---|---|---|
 | Prefill, compiled chunked-DeltaNet kernel | PyTorch Native | S=128, BS=1 | **83.7 ms** (warm) | **1530** |
+| Prefill, same, **TP=8 / LNC=1** | PyTorch Native | S=128, BS=1 | **65.3 ms** (warm) | **1961** |
 | Prefill, eager fallback (unoptimized) | PyTorch Native | S=128, BS=1 | 6847 ms | 19 |
 
 Wiring the validated chunked-DeltaNet NKI kernel makes the prefill graph
@@ -308,6 +420,18 @@ compilable (one custom call/layer instead of an un-compilable data-dependent tor
 chunk-loop), giving a **~82×** speedup over the eager fallback. Cold compile of the
 prefill graph is ~391 s (one-time; NEFF cached after). Enabling chunked prefill
 does not regress decode (BS=1 TPOT stays 36.7 ms).
+
+**LNC=1 is worth +27.4% on prefill** (1,539 → 1,961 prompt tok/s; 83.2 → 65.3 ms) at
+half the resident footprint (12,200 → 6,143 MB/core). Measured 2026-08-04 on beta-4
+with both T1b flags on both sides. The TP=4 control landing at 1,539 reproduces the
+1,530 in the table above almost exactly, which is worth stating for two reasons: it
+confirms the tiny-mode basis is the same one that figure was measured on, and it means
+beta-4 did **not** move 27B prefill at TP=4 (unlike the 35B, where beta-4 alone was
++12.5%). Cold compile is longer at TP=8 (683 s vs 527 s).
+
+This is the one 35B lever whose sign has transferred cleanly — LNC=1 was +24.5% on
+35B prefill and is +27.4% here. Contrast T1a (sign flips with batch size) and beta-4
+(+27% at BS=8, −11% at BS=1).
 
 ### The core finding: BS=8 decode is barrier-bound, not compute-bound
 
