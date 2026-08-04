@@ -1,5 +1,20 @@
 # Implementation plan — Tier-1 transfers (35B-A3B → 27B)
 
+> **Status 2026-08-04: T1b is DONE and gated on device; T1a is not started.**
+> T1b landed as `SHARDED_EMBED` / `SHARDED_LM_HEAD` (not `PREFILL_SHARDED_*` — on the
+> 27B one module serves both `forward` and `prefill`, so a `PREFILL_` prefix would
+> have been misleading). Measured at BS=1/64L on the beta-4 container: module resident
+> **17,264 → 13,450 MB/core (−3,814 MB, −22.1%)** with a **token-identical** greedy
+> continuation and no TPOT regression (39.8 → 37.5 ms). Freed bytes match the
+> arithmetic to the megabyte. See `README.md` → "T1b: vocab-row sharding" for the full
+> table and `kernels/tests/test_decode_sharded_lm_cpu.py` for the bitwise CPU gate.
+>
+> Two deviations from the step list below, both deliberate: the load-time slicing went
+> into `apply_vocab_sharding` called from `main()` rather than into `extract_weights`
+> (it then covers the `--tiny` random-weight path too, and runs after `del model` so
+> the full `[V, H]` tensor actually frees), and the 35B method is named
+> `_embed_tokens`, not `_embedding`.
+
 Companion to `SPIKE_35B_TO_27B_TRANSFER.md`. Two independent workstreams, each on
 its own branch. Both are default-off env flags so the baseline path stays
 byte-identical. Line numbers are from the trees as read on 2026-08-03 and will
@@ -127,17 +142,22 @@ zero-pad + sum-all-reduce reconstructs the replicated result with no extra round
    (expected), the two can be sharded independently. If a build ties them, sharding
    must be consistent — assert and handle.
 
-### Validation (device, when Trn2 frees)
-- **Bit-identical gate.** Prefill a fixed prompt with and without the flags; the
-  logits fingerprint / greedy continuation must match the replicated path exactly
-  (the reduce is exact by construction — disjoint ranges, additive zeros).
-- **HBM accounting.** Capture resident GB/rank before/after (the 35B tracked this
-  via the runtime allocation breakdown). Target ~4 GB/rank freed.
-- **CPU pre-check.** `test_decode_sharded_lm_cpu.py` exists on the 35B side as a
-  model for a pure-CPU equivalence test of the pad+reduce; write the 27B analog.
+### Validation — DONE (2026-08-04, beta-4 container, BS=1, 64L, TP=4/LNC=2)
+- ✅ **Identity gate.** All three configurations (replicated, embed-only, both) emit the
+  same greedy continuation for `'The meaning of life is'` →
+  `' to find your gift. The purpose of life is to give it away.'`
+- ✅ **HBM accounting.** 17,264 → 15,357 MB/core (embed only, −1,907) → 13,450 MB/core
+  (both, −3,814, −22.1%). Predicted exactly: 248320×5120×2 B = 2,542.8 MB per tensor,
+  3/4 of which leaves each rank at TP=4 = 1,907.1 MB.
+- ✅ **CPU pre-check.** `kernels/tests/test_decode_sharded_lm_cpu.py` written; asserts
+  `rtol=atol=0` for embed, lm_head, and greedy argmax at ws=1/2/4/8 in fp32 and bf16,
+  plus the out-of-range-id clamp. Passes.
+- ➕ **No latency cost.** TPOT 39.8 (replicated) / 39.9 (embed) / 37.5 ms (both). The
+  small improvement at "both" comes from the `lm_head` half; treat it as
+  "no regression," not a claimed win, until repeated.
 
-**Effort:** ~1–2 days. **Risk:** low-medium (exact reference; the only subtlety is
-the decode-BS logits-tensor size in step 4).
+**Actual effort:** under a day. **Risk as realised:** low — the exactness argument held
+and the padded-tensor concern of step 4 did not bite at BS≤16.
 
 ---
 
@@ -154,8 +174,31 @@ the decode-BS logits-tensor size in step 4).
   *magnitude*, not just finiteness (see the 35B AGENT.md C32 saga).
 
 ## Open items needing the Trn2 (cannot resolve statically)
-- Actual 27B resident HBM/rank (sets T1b's real payoff and whether step-4's
-  decode-path caveat bites).
+- ~~Actual 27B resident HBM/rank~~ — **resolved: 17,264 MB/core replicated**
+  (13,450 with both T1b flags). Step-4's decode-path caveat does **not** bite at
+  BS ≤ 16: the padded pre-reduce tensor is 0.5/4.0/7.9 MB per rank at BS=1/8/16.
 - Whether the 27B `deltanet_full_batched_35b_ops.py` op schema widened for the
   `state_out` kwargs (affects whether T1a step-2 needs a schema edit).
 - The measured 27B tiled-conv delta (hypothesis: ~+15%, from the 35B).
+- **New, and it changes T1a's baseline:** the beta-4 container already moved BS=8
+  decode 62.7 → **79.9 tok/s (+27.4%)** with no source change, while *regressing*
+  BS=1 by 11%. T1a must be A/B'd against the beta-4 BS=8 number, not the README's
+  62.7 — some of the barrier-bound headroom T1a targets may already be spent.
+- ~~**BS=16 needs a clean number.**~~ **Resolved: the `synchronize()` ("synced TPOT")
+  timer is broken at BS=16; the model is fine.** Three runs gave C2 = 473.7 / 486.4 /
+  488.9 ms (±1.6%, so not throttling) while the two independent end-to-end loops agreed
+  with each other and scaled smoothly (A = 172.9 / 173.5 / 173.0 ms → **92.4 tok/s**;
+  B = 189.6 / 190.8 / 190.0 ms → 84.1 tok/s). C2 sits at a stable 0.78–0.83× of B at
+  BS=1/8 and only blows up to 2.5× at BS=16. **T1a's BS=16 A/B must use method A or B**
+  — the "TRUE steady-state TPOT (synced)" line the harness prints is not usable there.
+  Root cause of the C2 blow-up is unidentified and is its own (low-priority) bug.
+- **T1a's BS=16 headroom is larger than the README implied.** The "plateaus ~63 tok/s"
+  claim was a C2 artifact; real beta-4 scaling is 70.1 → 92.4 tok/s (+32%) from 8→16.
+
+## Reproducing these runs
+The beta-4 DLC has no `transformers`, which this harness needs (`from_pretrained`).
+See README → "Running" for the `pip install --target /pysite` + `PYTHONPATH=/pysite`
+recipe; transformers **5.14.1** is the validated version for `model_type: qwen3_5`.
+Driver scripts used for the 2026-08-04 runs live on the Trn2 at
+`/mnt/nvme/tmp/run27b.sh` and `/mnt/nvme/tmp/rerun16.sh`, logs in
+`/mnt/nvme/tmp/runlog/` (instance store — copy off before any stop/start).

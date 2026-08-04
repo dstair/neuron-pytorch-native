@@ -50,6 +50,27 @@ deploy/                 vLLM-Neuron serving scripts (baseline, chunked-prefill, 
 The decode/prefill harness runs inside the PyTorch-Native container on a Trainium2
 box. It is launched with `torchrun` across the 4 logical cores:
 
+> **The container does not ship `transformers`.** Unlike the 35B harness (which reads
+> safetensors directly), this one loads the checkpoint via HF
+> `Qwen3_5ForConditionalGeneration.from_pretrained` and then shards it. The Neuron
+> DLC has `torch`, `torch-neuronx`, `neuronx-cc`, and `safetensors` but **no
+> `transformers`**, so a bare run dies with `ModuleNotFoundError: No module named
+> 'transformers'`. Install it once into a host directory and mount it on
+> `PYTHONPATH` rather than baking a new image:
+>
+> ```bash
+> docker run --rm -v /mnt/nvme/tmp/pysite:/pysite "$QWEN27_VLLM_IMAGE" \
+>   python3 -m pip install --target /pysite transformers    # 5.14.1 validated
+> # then add to every run:  -v /mnt/nvme/tmp/pysite:/pysite:ro -e PYTHONPATH=/pysite
+> ```
+>
+> `transformers` **5.14.1** has `Qwen3_5ForConditionalGeneration` and parses this
+> checkpoint's `model_type: qwen3_5` config (the checkpoint itself records
+> `transformers_version: 4.57.1`). It also needs the neuron devices visible at
+> import time (`--privileged` + `-v /opt/aws/neuron:/opt/aws/neuron:ro` +
+> `LD_LIBRARY_PATH=/opt/aws/neuron/lib`), because `torch` auto-loads the
+> `torch_neuronx` backend extension on import and hard-fails without a device.
+
 ```bash
 # Decode benchmark, full 64 layers, BS=1
 torchrun --nproc-per-node=4 static_decode.py --num-layers 64 --max-seq-len 2048 --batch-size 1
@@ -77,7 +98,23 @@ All are **default-off**; the baseline path is byte-identical without them.
 | `DNBATCHED_V2=1` | DMA-coalesced batched-DeltaNet decode kernel (BS>1) |
 | `GQATAIL=1` | Fused GQA attention-tail mega-kernel |
 | `NORMFUSE=1` | NKI RMSNorm |
+| `SHARDED_EMBED=1` | Row-shard the replicated `embed` table across TP (HBM capacity) |
+| `SHARDED_LM_HEAD=1` | Row-shard the replicated `lm_head` weight across TP (HBM capacity) |
 | `LEANKV=1`, `NOREDUCE=1`, `DNF32STATE=1` | Reference levers, ruled out (kept for A/B) |
+
+`SHARDED_EMBED` / `SHARDED_LM_HEAD` are the **T1b** transfer from the 35B
+(`PREFILL_SHARDED_*` there). `embed` and `lm_head` are the only weights TP leaves
+replicated — 2.54 GB bf16 each at V=248320, H=5120 — so together they are ~5.1 GB of
+the ~17.3 GB/core module. Each rank keeps a disjoint contiguous vocab range; the
+replicated result is reconstructed **exactly** (masked gather + sum-all-reduce for
+embed; local matmul + zero-pad + sum-all-reduce for the head), so this is a pure
+*capacity* lever with no numerical cost. `kernels/tests/test_decode_sharded_lm_cpu.py`
+proves the reduction bitwise-equal at ws=1/2/4/8 in fp32 and bf16.
+
+One asymmetry worth knowing: `SHARDED_LM_HEAD`'s pre-reduce padded tensor is
+`[B, 1, V]` and grows linearly with batch (0.5 / 4.0 / 7.9 MB per rank at BS=1/8/16),
+while `SHARDED_EMBED` has no padded intermediate at all. If only one is wanted on a
+high-batch decode, take `SHARDED_EMBED`.
 
 ## Performance summary
 
@@ -104,9 +141,96 @@ implementation of the same model on the torch-xla stack, for comparison.
   (`DNBATCHED_V2`) and GQA-tail (`GQATAIL`) kernels.
 - Throughput plateaus ~63 tok/s: 8→16 adds only ~0.4 tok/s (per-step work grows
   nearly linearly with batch; see the barrier-bound analysis below).
+  **⚠ Retracted-pending-remeasurement:** both figures come from the `synchronize()`
+  timer, which is demonstrably wrong at BS=16 (see "The `synchronize()` timer is
+  unreliable at BS=16"). On beta-4 the two agreeing end-to-end loops show 8→16
+  scaling +32%, not flat.
 - The XLA/NxDI rows are not a strict head-to-head (different serving overhead and
   the offline path carries per-step Python scheduler + sampling cost) — treat them
   as an independent reference, not an A/B against the Native numbers.
+
+#### Re-baselined on the beta-4 container (2026-08-04)
+
+The table above was measured on the earlier PyTorch-Native DLC. Re-running the same
+three configurations unchanged on the **beta-4** image
+(`concourse-release-0461d3b:latest`, digest `sha256:ad7f7bbcd468…` — the one that gave
+the 35B **+12.5%** prefill for free) shows the container is **not** a uniform win here:
+
+| BS | TPOT (ms, synced) | tok/s synced | vs table above | tok/s host-sync |
+|---:|---:|---:|---|---:|
+| 1 | 39.8 | 25.1 | **−11.0%** | 19.8 |
+| 8 | **100.1** | **79.9** | **+27.4%** | 70.1 |
+| 16 | 483.0 ⚠ | 33.1 ⚠ | timer artifact — see below | **92.4** |
+
+- **BS=8 is the headline: 62.7 → 79.9 tok/s (+27.4%)**, TPOT 127.6 → 100.1 ms, from a
+  compiler change alone. This is now the best measured 27B decode throughput.
+- **BS=1 regresses 28.2 → 25.1 tok/s (−11.0%).** The container helps the batched,
+  barrier-bound step and hurts the latency-bound one — consistent with the
+  barrier-bound analysis below, but it means "upgrade the container" is a
+  per-configuration decision, not a global one.
+- ⚠ **The BS=16 synced figure is a defect in the synced timer, not in the model.**
+  Repeated three times (see below); use **92.4 tok/s** for BS=16.
+- Numerics are unchanged across every run: all runs emit the identical
+  greedy continuation for `'The meaning of life is'` →
+  `' to find your gift. The purpose of life is to give it away.'`
+- Module resident is **17,264 MB/core** replicated — the figure T1b is measured against.
+
+#### ⚠ The `synchronize()` timer is unreliable at BS=16 (resolved 2026-08-04)
+
+The harness reports four timings per run. Three of them agree everywhere; the fourth
+breaks at BS=16. Values in ms/token, `DNBATCHED_V2=1 GQATAIL=1`, beta-4:
+
+| Method | BS=1 | BS=8 | BS=16 (×3 runs) | C2 ÷ B |
+|---|---:|---:|---:|---:|
+| **A** per-token host sync (`.item()` D2H) | 47.93 | 114.06 | 172.86 / 173.51 / 172.97 | — |
+| **B** on-device greedy, no per-step sync | 48.21 | 121.32 | 189.63 / 190.81 / 189.99 | — |
+| **C1** no synchronize (old bench style) | 1.77 | 1.86 | 3.54 / 1.74 / 3.91 | async-enqueue artifact |
+| **C2** + `torch.neuron.synchronize()` ← *the "synced TPOT" column* | 37.47 | 100.15 | 473.66 / 486.38 / 488.91 | **2.50 / 2.55 / 2.57** |
+
+A and B are independent end-to-end greedy loops; they agree with each other to within
+10% at every batch size and scale **smoothly and sublinearly** (A: 47.9 → 114.1 → 173.1,
+i.e. 8→16 costs only +52% for 2× the tokens). C2 tracks them at BS=1 and BS=8 at a
+stable 0.78–0.83× of B — the expected offset, since C2 skips the argmax/token-update
+work. At BS=16 C2 alone jumps to **2.5× B**, deterministically: three runs landed at
+473.7 / 486.4 / 488.9 ms (±1.6%), so this is **not** throttling and not a one-off.
+
+**Verdict: C2 is the broken measurement at BS=16, and BS=16 decode is ~92.4 tok/s**
+(mean of A over three runs; B gives the more conservative 84.1 tok/s). Root cause of
+the C2 blow-up is not yet identified — the mechanism is in the timing loop, not the
+step, since the same NEFF measured by two other loops is fine.
+
+Two consequences worth flagging:
+
+- **The "throughput plateaus ~63 tok/s" finding below is suspect.** It rests entirely
+  on the C2 column (62.7 at BS=8 vs 63.1 at BS=16). Measured by A, beta-4 BS=8→16 scales
+  **70.1 → 92.4 tok/s (+32%)** — no plateau. Note the old-container BS=16 C2 figure
+  (253.5 ms) was already 1.34× B, so C2 was mildly off at BS=16 there too and got worse;
+  but there are no A/B numbers from the old container, so whether the *old* stack
+  plateaued is genuinely unknown. Re-measure with A/B before repeating the claim.
+- **Any BS=16 A/B (e.g. T1a) must use method A or B**, not the "synced TPOT" line.
+
+#### T1b: vocab-row sharding (measured, gate passed)
+
+`SHARDED_EMBED` / `SHARDED_LM_HEAD` at BS=1, 64 layers, same beta-4 container:
+
+| Config | Module (MB/core) | Freed | TPOT (ms) | tok/s | Continuation |
+|---|---:|---:|---:|---:|---|
+| replicated (baseline) | 17,264 | — | 39.8 | 25.1 | reference |
+| `SHARDED_EMBED=1` | 15,357 | 1,907 (−11.0%) | 39.9 | 25.1 | **identical** |
+| `SHARDED_EMBED=1 SHARDED_LM_HEAD=1` | **13,450** | **3,814 (−22.1%)** | **37.5** | **26.7** | **identical** |
+
+- **The freed bytes match the arithmetic exactly.** Each `[248320, 5120]` bf16 tensor
+  is 2,542.8 MB; TP=4 leaves 1/4 resident, so 1,907.1 MB per tensor should go. Measured
+  deltas are 1,907 MB (embed only) and 3,814 MB (both). No hidden copy survives.
+- **Correctness gate passes:** both sharded configurations emit a token-identical
+  continuation to the replicated baseline, as the exactness argument requires.
+- TPOT does not regress; with both flags it measured **37.5 ms vs 39.8** (+6.4%
+  throughput). That is a single measurement, not a claimed latency win — the honest
+  statement is "no regression, plausibly a small win from reduced HBM pressure on the
+  head." Note the win comes from the `lm_head` half; `SHARDED_EMBED` alone is
+  TPOT-neutral (39.9 vs 39.8).
+- Both flags stay **default-off**. The capacity they return (~3.8 GB/core out of a
+  24 GB budget) is the point: it is headroom for larger batch or longer context.
 
 ### Prefill (TTFT / prompt throughput)
 
