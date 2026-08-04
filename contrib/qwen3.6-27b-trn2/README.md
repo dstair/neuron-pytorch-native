@@ -121,6 +121,57 @@ Useful flags: `--tiny` (small config for quick iteration), `--num-layers N`,
 `--skip-prefill`, `--fp8-weights`, `--batch-size N`, `PROFILE_STEPS=N` (emit a
 device profile over N decode steps).
 
+### Cross-compiling on a trn1 host {#cross-compiling-on-a-trn1-host}
+
+A 64-layer TP=8 decode compile is ~15–20 min of a ~17–20 min cold run, so compile — not
+execution — is the dev-loop bottleneck, and it is being paid on a scarce trn2.3xlarge.
+`deploy/cross_compile_trn1.sh` moves it to a trn1.32xlarge (128 vCPU / 495 GB RAM) and
+ships the resulting compiler cache to S3 for the Trn2 run to pick up as a **cache hit**.
+
+```bash
+# On the trn1 host, after building the shim (see below):
+./deploy/cross_compile_trn1.sh 16              # BS=16, 64L, S=1024, TP=8
+./deploy/cross_compile_trn1.sh 12 "DN_CONV_GROUP=12"
+```
+
+Three pieces have to agree or the Trn2 run silently recompiles instead of hitting:
+
+1. **`NEURON_CC_FLAGS="--target trn2 --lnc 1"`** — makes neuronx-cc emit trn2 code.
+2. **The `LD_PRELOAD` shim** (`../qwen3.6-35b-a3b/deploy/cross_compile/`) intercepts
+   `nrt_get_instance_info` and reports TRN2 *only* when called from the compiler-cache-key
+   constructor, detected via `backtrace()`. Without it the key records trn1 and the Trn2
+   lookup misses. Build it with `build_shim.sh` (needs `QWEN35_NATIVE_IMAGE`) and verify
+   with `validate_cache_override.py` — a working shim logs
+   `cache_key=1 original_family=2 target=trn2 overridden_family=5`. The `cache_key=1` is
+   the part that matters: it confirms the rewrite is scoped to the key constructor and is
+   not lying to the runtime at large.
+3. **`CROSS_TARGET_COMPILE_ONLY=1`** (`static_decode.py` step 6b) catches the device load
+   failure that must happen — the local hardware really is trn1 — *after* the cache write,
+   then exits clean via filesystem rank markers.
+
+Two non-obvious requirements, both learned the hard way:
+
+- **`--tiny --tiny-full-vocab`**, not bare `--tiny`. Plain `--tiny` shrinks `VOCAB` to
+  4096, which changes the embed/lm_head shapes and therefore the cache key — the NEFF
+  would never be reused. `--tiny-full-vocab` keeps the real 248320 vocab with random
+  weights, giving a graph shape-identical to production and skipping the 51.8 GB
+  checkpoint download entirely. Confirmed identical: both report **6,768 MB/core**.
+- **Do not run graph-producing setup ops before the guard.** Neuron reports execution
+  errors *asynchronously*, so a failed load surfaces at the next synchronization point,
+  not where it was dispatched. `_conv_cm_to_tiled`'s reshape/permute/contiguous is itself a
+  device graph; calling it before the `try` produced an `Invalid NEFF` at an unrelated
+  `torch.zeros` line and killed the run before the decode NEFF was ever compiled. Step 6b
+  allocates the tiled shape directly instead, keeping the decode NEFF the only graph on
+  this path.
+
+`CROSS_TARGET_COMPILE_CONCURRENCY` (default = world size) throttles ranks into compile
+waves. Turn it down first if a compile dies with `[F137] neuronx-cc was forcibly killed`
+— that is host OOM, and it is what made the trn2.3xlarge unable to compile decode at all.
+At 64L/TP=8 on the trn1, 8 concurrent ranks peak around 60 GB of 495 GB.
+
+Both hosts must also agree on `NEURON_COMPILE_CACHE_URL`; the script sets it to the
+directory it ships, so point the Trn2 run at the restored copy rather than the default.
+
 ### Optimization levers (environment flags)
 
 All are **default-off**; the baseline path is byte-identical without them.
@@ -130,7 +181,7 @@ All are **default-off**; the baseline path is byte-identical without them.
 | `CHUNKEDPREFILL=1` | Compiled chunked-DeltaNet prefill (~82× faster prefill compile) |
 | `DNBATCHED_V2=1` | DMA-coalesced batched-DeltaNet decode kernel (BS>1) |
 | `DN_TILED_CONV=1` | Tile-partition-major DeltaNet conv-state layout (**BS=8 any TP; BS=16 only at TP=8** — regresses 37% at BS=16/TP=4, see T1a; requires `DNBATCHED_V2=1` and `--batch-size >= 2`) |
-| `DN_CONV_GROUP=G` | 128-aligned group-tiled Phase-1 conv, `G` items per pass (**prototype, ungated** — requires `DN_TILED_CONV=1`) |
+| `DN_CONV_GROUP=G` | 128-aligned group-tiled Phase-1 conv, `G` items per pass (**gated: numerics exact, but NO throughput win — leave off**; requires `DN_TILED_CONV=1`) |
 | `GQATAIL=1` | Fused GQA attention-tail mega-kernel |
 | `NORMFUSE=1` | NKI RMSNorm |
 | `SHARDED_EMBED=1` | Row-shard the replicated `embed` table across TP (HBM capacity) |
@@ -374,17 +425,48 @@ the free axis instead of one item at a time, so the conv tiles become `[128, G×
 and the `mq` transpose becomes `[G×NT, 128] → [128, G×NT]`. That targets both violations
 above directly: free dim 30 → 120, transpose partitions 10 → 120.
 
-`nc_transpose` caps moving partitions at 128 and `B` must divide by `G`, so the kernel
-picks `G` at trace time as the largest divisor of `B` with `G×NT ≤ 128` (G=12 at
-BS=16/NT=10 → 120; G=8 at BS=8/NT=10 → 80), falling back to the per-item tiled path if
-no divisor ≥2 exists. Phases 2 and 3 are untouched — they already run full 128-partition
-column ops per head, and simply slice this group's `qkv_act`. The HBM buffer layout is
-unchanged from `DN_TILED_CONV=1`, so there is no harness plumbing change.
+`nc_transpose` caps moving partitions at 128 and **`G` must divide `B`** — the divisor
+constraint, not the 128 cap, is what actually binds. The kernel picks `G` at trace time
+as the largest divisor of `B` with `G×NT ≤ 128`, falling back to the per-item tiled path
+if no divisor ≥2 exists:
 
-**Unmeasured.** No numerics gate and no device A/B yet (task #15); the design, the `G`
-table, and the gating plan are in `PLAN_TIER1_TRANSFER.md`. The open question is whether
-Phase-1 width was ever the bound — if the `B × NT` cliff is DMA pipelining rather than
-vector width, this will be flat, and that null result is itself the answer to #13.
+| TP | NT | B=8 | B=12 | B=16 |
+|---|---|---|---|---|
+| 8 | 10 | G=8 → **80** | G=12 → **120** ✅ | G=8 → **80** |
+| 4 | 20 | G=4 → **80** | G=6 → **120** ✅ | G=4 → **80** |
+
+Only a `B` divisible by 12 (TP=8) or 6 (TP=4) reaches the 128-aligned 120; **BS=16 lands
+on G=8 → 80**, not 120, because 12 ∤ 16. That makes BS=12 the discriminating leg, and
+lifting the restriction would mean handling a ragged remainder group. Phases 2 and 3 are
+untouched — they already run full 128-partition column ops per head, and simply slice
+this group's `qkv_act`. The HBM buffer layout is unchanged from `DN_TILED_CONV=1`, so
+there is no harness plumbing change.
+
+**Gated, and the answer is: no throughput win. Do not enable.** Numerics are exact and
+the mechanism works; the throughput hypothesis is dead.
+
+*Numerics (task #15 gate, TP=4 shape, `test_deltanet_full_batched.py`):* all four legs
+pass with **digit-identical** diffs against `DN_CONV_GROUP=0` — state `0.000039`/
+conv_state `0.000000`/output `0.000977` at BS=8, and `0.000036`/`0.000000`/`0.007812` at
+BS=12. `conv_state` being exactly `0.0` confirms both the channel↔(tile, partition)
+mapping and the shifted-history writeback.
+
+*End-to-end (64 layers, TP=8/LNC=1, S=1024, beta-4, every leg carrying T1a):*
+
+| B | G → G×NT | TPOT A (host sync) | TPOT B (on-device) | Δ vs T1a |
+|---|---|---|---|---|
+| 12 | — (T1a control) | 98.55 ms | 112.99 ms | — |
+| 12 | 12 → **120** (aligned) | 99.61 ms | 114.12 ms | **−1.1%** |
+| 8 | — (T1a control) | 77.53 ms | 86.37 ms | — |
+
+The 128-aligned leg — the one the whole design targets — is **flat to 1% slower**. So
+Phase-1 vector width was never the bound, and by elimination the `B × NT` cliff (#13) is
+**DMA pipelining, not vector width or alignment**. That null result is the useful output
+here.
+
+Worth stating plainly: the kernel microbenchmark had suggested BS=12/GNT=120 was **31%
+faster**. That was an artifact — the microbench timer is dispatch-bound with a ~0.10 ms
+floor, so it measures call overhead, not the kernel. Do not size a lever from it.
 
 #### TP=8 / LNC=1: 8 logical cores of 12 GB {#tp8--lnc1-8-logical-cores-of-12-gb}
 

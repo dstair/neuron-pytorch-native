@@ -317,10 +317,19 @@ is `[G*NT, PMAX] -> [PMAX, G*NT]`. `nc_transpose` caps moving partitions at 128,
 must be divisible by `G`, so `G` is picked at trace time as the largest divisor of `B`
 with `G*NT ≤ 128`:
 
-| TP | NT | Target `G*NT` | Group `G` (BS=8 / BS=16) | Achieved free dim |
+`G` must **divide `B`**, and that constraint — not the 128 cap — is what actually binds:
+
+| TP | NT | B=8 | B=12 | B=16 |
 |---|---|---|---|---|
-| 8 | 10 | ≤128 | 8 / 12 | 80 / 120 |
-| 4 | 20 | ≤128 | 4 / 4 (BS=16), 2 (BS=8) | 80 / 40 |
+| 8 | 10 | G=8 → **80** | G=12 → **120** ✅ | G=8 → **80** |
+| 4 | 20 | G=4 → **80** | G=6 → **120** ✅ | G=4 → **80** |
+
+**Only `B` divisible by 12 (TP=8) or 6 (TP=4) reaches the 120 target.** B=16 cannot: the
+largest divisor of 16 within the cap is 8, so it lands on 80. So the "128-aligned"
+configuration is reachable at B=12/24 but *not* at the B=8/16 powers of two — which makes
+B=12 the config that actually tests the alignment hypothesis. Lifting this would mean
+allowing a ragged final group (`B % G` items handled by a remainder pass), which is the
+obvious follow-up if alignment proves to be the lever.
 
 Phase 2/3 stay per-item and unchanged — the head recurrence at `qkv_act[:, kh]` /
 `[K_HEADS+kh]` / `[2*K_HEADS+h]` is already full 128-partition column ops. Group is a
@@ -348,9 +357,34 @@ conv won't help. That is exactly why this stays a flagged experiment on top of T
 rather than replacing it. Measure BS=8 first (where T1a already won at +27%) before
 deciding whether to reach for BS=16.
 
-**Open.** Device gate at both TP values; BS=8/16 decode A/B against T1a-alone; profile
-Phase-1 latency at G=1 vs G=8/12 to test the "SBUF-width was the bound" claim
-independently of end-to-end throughput.
+**Gated 2026-08-04 — numerics exact, throughput flat. Prediction was wrong; leave off.**
+
+*Numerics.* Four legs at the TP=4 shape (`deploy/grp_gate.sh`) all pass with
+**digit-identical** diffs vs `DN_CONV_GROUP=0`: BS=8 → `0.000039 / 0.000000 / 0.000977`,
+BS=12 → `0.000036 / 0.000000 / 0.007812`. The exact `0.0` on `conv_state` confirms the
+channel↔(tile, partition) mapping and the shifted-history writeback.
+
+*End-to-end* (`deploy/grp_e2e.sh`, 64L, TP=8/LNC=1, S=1024, beta-4, all legs on T1a):
+
+| B | G → G×NT | TPOT A | TPOT B | Δ vs T1a |
+|---|---|---|---|---|
+| 12 | — control | 98.55 ms | 112.99 ms | — |
+| 12 | 12 → **120** aligned | 99.61 ms | 114.12 ms | **−1.1%** |
+| 8 | — control | 77.53 ms | 86.37 ms | — |
+
+The 128-aligned leg is flat to 1% slower. **Phase-1 vector width was never the bound**,
+which by elimination makes the `B × NT` cliff (#13) DMA pipelining rather than vector
+width or alignment. The caveat above ("the unknown is whether Phase-1 was the bound")
+resolved against the prediction.
+
+*Retraction.* The kernel microbench had shown BS=12/GNT=120 **31% faster**. That was an
+artifact of a dispatch-bound timer with a ~0.10 ms floor — it measures call overhead, not
+kernel time. It bounded the sign only, never the magnitude, and should not have been read
+as sizing the lever.
+
+**Still open (low priority now).** Isolated Phase-1 latency at G=1 vs G=12 would confirm
+the mechanism directly rather than by elimination, but the end-to-end null already
+answers the question this experiment existed to ask.
 
 ### A flag trap, worth recording
 `--prompt-len` is read only in tiny mode (`static_decode.py:1448`), so the prefill

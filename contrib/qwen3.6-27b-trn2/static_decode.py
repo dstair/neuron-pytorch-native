@@ -1332,6 +1332,14 @@ def main():
     parser.add_argument("--num-layers", type=int, default=None,
                         help="Override layer count (tiny mode only). Must be a "
                              "multiple of 4 to keep the [DeltaNet×3, GQA×1] pattern.")
+    parser.add_argument("--tiny-full-vocab", action="store_true",
+                        help="In --tiny mode, keep the REAL vocab (248320) instead of "
+                             "shrinking to 4096. Costs ~5 GB host RAM per rank for the "
+                             "random embed+lm_head, and buys a decode graph that is "
+                             "shape-identical to production -- required for a "
+                             "cross-compiled NEFF to be a CACHE HIT on the real run. "
+                             "Combine with --tiny --num-layers 64 to build the "
+                             "production cache entry without the 51.8 GB checkpoint.")
     args = parser.parse_args()
 
     if USE_DN_TILED_CONV and args.batch_size < 2:
@@ -1339,6 +1347,10 @@ def main():
         # only understands the channel-major layout — a tiled buffer would be read
         # with the wrong channel mapping and corrupt silently rather than error.
         raise SystemExit("DN_TILED_CONV=1 requires --batch-size >= 2 (BS=1 uses the untiled deltanet.full kernel)")
+
+    if args.tiny_full_vocab and not args.tiny:
+        raise SystemExit("--tiny-full-vocab only applies to --tiny (the real "
+                         "checkpoint path already uses the full vocab)")
 
     # ── tiny mode: shrink NUM_LAYERS (and derived counts) before building buffers
     global NUM_LAYERS, NUM_DELTANET, NUM_GQA, VOCAB
@@ -1348,7 +1360,12 @@ def main():
         NUM_LAYERS = nl
         NUM_DELTANET = sum(1 for i in range(nl) if layer_type(i) == "deltanet")
         NUM_GQA = sum(1 for i in range(nl) if layer_type(i) == "gqa")
-        VOCAB = 4096  # shrink embed/lm_head; decode graph shape is layer-driven
+        if not args.tiny_full_vocab:
+            # Shrink embed/lm_head. Cheap, and the decode graph shape is otherwise
+            # layer-driven -- but it DOES change the embed/lm_head matmul shapes, so
+            # a NEFF built this way will not be a cache hit for a real-checkpoint
+            # run. --tiny-full-vocab is the cross-compile path for that reason.
+            VOCAB = 4096
 
     import torch_neuronx
 
@@ -1448,6 +1465,101 @@ def main():
         )
         if rank == 0:
             print(f"  torch.compile setup: {time.time()-t0:.1f}s")
+
+    # 6b. CROSS_TARGET_COMPILE_ONLY: build the decode NEFF for a target this host
+    # is NOT (trn2 from a trn1 compile host) and exit before any timed run.
+    #
+    # Mechanism: the LD_PRELOAD shim (deploy/cross_compile/) rewrites the instance
+    # family to TRN2 *only* inside the compiler-cache-key constructor, so the NEFF
+    # neuronx-cc emits under NEURON_CC_FLAGS="--target trn2 --lnc 1" lands under the
+    # same cache key a native Trn2 run will look up. Compilation therefore succeeds
+    # and persists; the subsequent device LOAD necessarily fails ("Invalid NEFF")
+    # because the local hardware is trn1. That failure is the expected terminus:
+    # catch it AFTER the cache write, then exit clean.
+    #
+    # This must run BEFORE prefill: prefill's own graphs would hit the same load
+    # failure first, and static_decode has no guard there -- which is exactly why
+    # earlier trn1 attempts hung at "Model stop timeout" and got SIGTERM'd before
+    # the fullgraph NEFF finished being written to the persistent cache.
+    #
+    # Rank sync uses FILESYSTEM markers, not dist.barrier(): every rank raises here,
+    # and the neuron process group is not dependable once a load has failed.
+    if os.environ.get("CROSS_TARGET_COMPILE_ONLY", "0") == "1":
+        marker_dir = os.environ.get("CROSS_TARGET_MARKER_DIR",
+                                    "/tmp/cross-target-compile")
+        marker_timeout = int(os.environ.get(
+            "CROSS_TARGET_MARKER_TIMEOUT_SECONDS", "10800"))
+        # Host-RAM throttle. A 64-layer neuronx-cc invocation is multi-GB; eight
+        # concurrent ones are what produced the [F137] "forcibly killed" OOMs on
+        # smaller hosts. Ranks compile in waves of this size.
+        concurrency = int(os.environ.get(
+            "CROSS_TARGET_COMPILE_CONCURRENCY", str(world_size)))
+        if not 1 <= concurrency <= world_size:
+            raise SystemExit(
+                f"CROSS_TARGET_COMPILE_CONCURRENCY must be in [1, {world_size}], "
+                f"got {concurrency}")
+        os.makedirs(marker_dir, exist_ok=True)
+
+        def _wait_for(count, what):
+            deadline = time.time() + marker_timeout
+            while len(os.listdir(marker_dir)) < count:
+                if time.time() >= deadline:
+                    raise TimeoutError(
+                        f"rank {rank} timed out after {marker_timeout}s "
+                        f"waiting for {what} ({len(os.listdir(marker_dir))}/{count})")
+                time.sleep(2)
+
+        if concurrency < world_size:
+            _wait_for((rank // concurrency) * concurrency,
+                      f"compile wave {rank // concurrency}")
+
+        # Match the shape the real decode run will present: the tiled conv layout is
+        # part of the graph signature, so a cache entry built untiled would MISS.
+        #
+        # Build it by ALLOCATING the tiled shape directly rather than calling
+        # _conv_cm_to_tiled(): that helper's reshape/permute/contiguous is itself a
+        # device graph, and on a cross-target host it compiles, fails to load, and
+        # then reports asynchronously at whatever the next sync point happens to be.
+        # Values are irrelevant here (compile-only), so skip the conversion entirely
+        # and keep the decode NEFF the only graph this path needs to execute.
+        if USE_DN_TILED_CONV:
+            _nd, _b, _qkv, _k = conv_states.shape
+            xc_conv = torch.zeros(
+                _nd, _b, _DN_TILED_PMAX, _qkv // _DN_TILED_PMAX, _k,
+                dtype=conv_states.dtype, device=device)
+        else:
+            xc_conv = conv_states
+        if rank == 0:
+            print(f"  [cross-target] compiling decode NEFF "
+                  f"(B={B}, {NUM_LAYERS}L, tiled_conv={USE_DN_TILED_CONV}, "
+                  f"concurrency={concurrency}/{world_size})...")
+        _xc0 = time.time()
+        loaded = False
+        try:
+            # Allocations live INSIDE the try: Neuron reports execution errors
+            # asynchronously, so a load failure queued by any earlier op surfaces at
+            # the next synchronization point, which may be one of these lines rather
+            # than the decode call itself.
+            xc_tok = torch.zeros(B, dtype=torch.long, device=device)
+            xc_pos = torch.tensor(0, dtype=torch.long, device=device)
+            with torch.no_grad():
+                static_module(xc_tok, xc_pos, dn_states, xc_conv, kv_k, kv_v)
+                torch.neuron.synchronize()
+            loaded = True
+        except RuntimeError as exc:
+            if "Invalid NEFF" not in str(exc):
+                raise
+        open(os.path.join(marker_dir, f"rank{rank}.done"), "w").close()
+        if rank == 0:
+            outcome = ("LOADED (this host IS the target)" if loaded else
+                       "NEFF persisted; incompatible-target load skipped as expected")
+            print(f"  [cross-target] rank 0 compile: {time.time()-_xc0:.1f}s ({outcome})")
+        _wait_for(world_size, "all rank compile markers")
+        if rank == 0:
+            print(f"  [cross-target] all {world_size} ranks compiled; "
+                  f"total {time.time()-_xc0:.1f}s")
+        dist.destroy_process_group()
+        return
 
     # 7. Tokenize prompt (tiny mode: synthetic ids, no tokenizer/detokenize)
     tokenizer = None
