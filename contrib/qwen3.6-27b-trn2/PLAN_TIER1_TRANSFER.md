@@ -290,13 +290,67 @@ TP=8 does not shrink — now measured against 12 GB instead of 24. **So LNC=1 is
 latency and footprint configuration; LNC=2 is still required for BS=16.**
 
 ### Open under T1c
-- BS=16 at TP=8 is unmeasured. Re-running at `--max-seq-len 1024` to buy the headroom
-  back is queued (`/mnt/nvme/tmp/tp8_bs16fix.sh`), together with an allocator
-  breakdown under `NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG=1`.
-- Prefill at TP=8 vs TP=4 is unmeasured; first attempt failed on a flag error (below).
+- ~~BS=16 at TP=8 is unmeasured.~~ **Measured** at `--max-seq-len 1024`: 100.3 (TP=4) →
+  113.7 (TP=8, +13.4%) → **133.1** (TP=8 + T1a, +32.7%), the model's best decode figure.
+  Allocator breakdown for the 2048-context OOM captured under
+  `NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG=1` (see README): 11.873 of 12 GB, `Tensors`
+  10.609 GB against 6.6 GB of weights, so ~4 GB is batch state and fragmentation at ~99%
+  occupancy is the proximate failure.
+- ~~Prefill at TP=8 vs TP=4 is unmeasured.~~ **Measured:** +27.4% at S=128, +40.0% at
+  S=512 — the advantage grows with S, so S=128's figure is a floor.
+- **`B × NT` is the ordering key for T1a's sign** (cliff between 256 and 320), which
+  reopens #13 with a sharper question: the SBUF-capacity story is dead (~8% occupancy at
+  the losing config) and the 35B counterexample is FP8-MoE, so the candidates left are
+  DMA pipelining and vector-width/alignment. `DN_CONV_GROUP` (above) tests the latter.
 - Whether sharding the *replicated* KV head across its rank group — storing half a
   head per rank and all-gathering before attention — buys back BS=16. Trades HBM for a
   collective on every GQA layer; unattractive given the collective already dominates.
+
+### T1a follow-up — 128-aligned group-tiled conv (`DN_CONV_GROUP`, prototype)
+
+The tiled path's Phase-1 tiles are `[PMAX=128, NT, 3]` — free dim `NT*3` = **30 at TP=8**
+(60 at TP=4), below the ≥64 the NKI skill recommends, and the `mq_raw` transpose feeds
+only `NT` of 128 partitions. Two direct violations at TP=8, on the exact code path we
+care about. The group-tiled variant runs Phase-1 across `G` batch items on the free
+axis, one wide vector pass per group, so the tile is `[PMAX, G*NT, 3]` and the transpose
+is `[G*NT, PMAX] -> [PMAX, G*NT]`. `nc_transpose` caps moving partitions at 128, and `B`
+must be divisible by `G`, so `G` is picked at trace time as the largest divisor of `B`
+with `G*NT ≤ 128`:
+
+| TP | NT | Target `G*NT` | Group `G` (BS=8 / BS=16) | Achieved free dim |
+|---|---|---|---|---|
+| 8 | 10 | ≤128 | 8 / 12 | 80 / 120 |
+| 4 | 20 | ≤128 | 4 / 4 (BS=16), 2 (BS=8) | 80 / 40 |
+
+Phase 2/3 stay per-item and unchanged — the head recurrence at `qkv_act[:, kh]` /
+`[K_HEADS+kh]` / `[2*K_HEADS+h]` is already full 128-partition column ops. Group is a
+Phase-1-only pre-pass that fills a persistent `qkv_act_all [PMAX, B*NT]` SBUF tile the
+batch loop then slices.
+
+**Runtime knobs.** `DN_CONV_GROUP=G` (defaults 0 = off, `G >= 2` activates). Requires
+`DN_TILED_CONV=1` — the HBM buffer layout is unchanged, so no harness plumbing changes.
+When `B % G != 0` or `G*NT > 128`, the kernel silently picks the largest working
+divisor of `B` (and falls back to `G=1` = the per-item tiled path if none exists).
+
+**Numeric gate (must pass before any device time).** The existing CPU/device oracle at
+`kernels/tests/test_deltanet_full_batched.py` already covers the tiled layout end to
+end; run at BS=8 and BS=12 with `DN_TILED_CONV=1 DN_CONV_GROUP=<G>` and expect the same
+`state / conv_state / output` diffs as `DN_CONV_GROUP=0`, not the looser 1e-2/5e-2
+tolerance the test asserts against. Any regression there means the group's channel↔
+(tile, partition) mapping drifted from the per-item path.
+
+**Prediction and its caveats.** The vector-side wins are the two skill hits directly:
+free dim 30 → 120 (Phase-1 SiLU, reduce, and 4 `tensor_tensor`s at 4× the width per
+call) and transpose partitions 10 → 120. The unknown is whether Phase-1 was the bound
+in the first place — the T1a regression at BS=16 is `B*NT`-shaped (won at 160, lost at
+320), and if the mechanism is DMA pipelining rather than SBUF or vector width, group
+conv won't help. That is exactly why this stays a flagged experiment on top of T1a
+rather than replacing it. Measure BS=8 first (where T1a already won at +27%) before
+deciding whether to reach for BS=16.
+
+**Open.** Device gate at both TP values; BS=8/16 decode A/B against T1a-alone; profile
+Phase-1 latency at G=1 vs G=8/12 to test the "SBUF-width was the bound" claim
+independently of end-to-end throughput.
 
 ### A flag trap, worth recording
 `--prompt-len` is read only in tiny mode (`static_decode.py:1448`), so the prefill

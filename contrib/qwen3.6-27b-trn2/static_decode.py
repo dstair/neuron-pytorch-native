@@ -61,6 +61,10 @@ GQA_Q_DIM = GQA_Q_HEADS * GQA_HEAD_DIM * 2   # q_proj out per core (query+gate)
 # a sum over disjoint q heads and remains exact.
 GQA_KV_HEADS = max(1, GQA_KV_HEADS_TOTAL // TP)     # KV heads per core (>=1)
 GQA_KV_REPLICAS = max(1, TP // GQA_KV_HEADS_TOTAL)  # ranks sharing one KV shard
+# RoPE is PARTIAL: config partial_rotary_factor=0.25 -> rotary applies to the
+# first 64 of 256 head dims; dims [64:256] pass through unrotated. TP-invariant.
+ROPE_DIM = int(GQA_HEAD_DIM * 0.25)  # 64
+ROPE_THETA = 10000000.0              # config rope_theta (1e7, NOT 1e6)
 
 # MLP constants (per-core)
 MLP_DIM = INTERMEDIATE // TP    # TP=4: 4352, TP=8: 2176
@@ -164,6 +168,13 @@ USE_DN_TILED_CONV = os.environ.get("DN_TILED_CONV", "0") == "1"
 _DN_TILED_PMAX = 128
 if USE_DN_TILED_CONV and os.environ.get("DNBATCHED_V2", "0") != "1":
     raise SystemExit("DN_TILED_CONV=1 requires DNBATCHED_V2=1 (only the v2 kernel has the tiled path)")
+# Group-tiled conv (DN_CONV_GROUP=G, G in {2..12}): runs Phase-1 across G items so the
+# tile free dim lands on a 128-multiple (G=12/NT=10 -> GNT=120 at TP=8; G=6/NT=20 ->
+# GNT=120 at TP=4). Buffer layout is unchanged from DN_TILED_CONV=1 — group is a
+# kernel-internal loop only. Requires DN_TILED_CONV=1 (shares the buffer) and B%G==0.
+_DN_CONV_GROUP = int(os.environ.get("DN_CONV_GROUP", "0"))
+if _DN_CONV_GROUP >= 2 and not USE_DN_TILED_CONV:
+    raise SystemExit("DN_CONV_GROUP>=2 requires DN_TILED_CONV=1 (shares the tiled conv buffer)")
 
 
 def _conv_cm_to_tiled(cs):

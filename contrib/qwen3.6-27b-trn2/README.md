@@ -129,7 +129,8 @@ All are **default-off**; the baseline path is byte-identical without them.
 |---|---|
 | `CHUNKEDPREFILL=1` | Compiled chunked-DeltaNet prefill (~82× faster prefill compile) |
 | `DNBATCHED_V2=1` | DMA-coalesced batched-DeltaNet decode kernel (BS>1) |
-| `DN_TILED_CONV=1` | Tile-partition-major DeltaNet conv-state layout (**BS=8 only** — regresses at BS=16; requires `DNBATCHED_V2=1` and `--batch-size >= 2`) |
+| `DN_TILED_CONV=1` | Tile-partition-major DeltaNet conv-state layout (**BS=8 any TP; BS=16 only at TP=8** — regresses 37% at BS=16/TP=4, see T1a; requires `DNBATCHED_V2=1` and `--batch-size >= 2`) |
+| `DN_CONV_GROUP=G` | 128-aligned group-tiled Phase-1 conv, `G` items per pass (**prototype, ungated** — requires `DN_TILED_CONV=1`) |
 | `GQATAIL=1` | Fused GQA attention-tail mega-kernel |
 | `NORMFUSE=1` | NKI RMSNorm |
 | `SHARDED_EMBED=1` | Row-shard the replicated `embed` table across TP (HBM capacity) |
@@ -268,7 +269,7 @@ Two consequences worth flagging:
 - Both flags stay **default-off**. The capacity they return (~3.8 GB/core out of a
   24 GB budget) is the point: it is headroom for larger batch or longer context.
 
-#### T1a: tiled conv-state layout (measured — a BS=8 win *and* a BS=16 regression)
+#### T1a: tiled conv-state layout (measured — the sign tracks `B × NT`, not batch size)
 
 `DN_TILED_CONV=1` stores DeltaNet `conv_states` tile-partition-major
 (`[NUM_DN, B, 128, NT, 3]`, element `[b, p, t, j]` = tap `j` of channel `t*128 + p`,
@@ -320,16 +321,70 @@ loop is bound by per-call dispatch rather than kernel work. Treat this test as t
 numerics gate it is, not as a timer. (An earlier run of it reported 0.174 → 0.115 at
 B=8; that −34% was launch-noise and should not be cited.)
 
-**Why BS=16 regresses is not yet established.** Two hypotheses, untested: (1) SBUF
-pressure — the tiled branch holds `[128, 20, 3]` fp32 tiles (`hist`, `new_hist`,
-`prod3`, ~30 KB each) per batch item where the untiled path holds `[128, 4]` (~2 KB),
-so at B=16 the working set may spill; (2) the single wide DMA loses the
-many-small-DMA pipelining that hid latency at the larger batch. Note the mechanism
-T1a targets is DMA *count*, and the barrier-bound analysis below says BS=8 is where
-that cost dominates — so a lever that helps at BS=8 and hurts at BS=16 is consistent
-with the profile, just not with the 35B's BS=32 result.
+**The sign tracks `B × NT`, not batch size alone.** The TP=8 legs settled this. `NT` is
+the per-core 128-channel tile count (`QKV_DIM / 128`), so it is set by TP: 20 at TP=4,
+10 at TP=8. Every measurement to date, with `B × NT` as the ordering key:
 
-**Status: default-off and scoped to BS=8.** Do not enable at BS=16.
+| `B × NT` | Model / config | Δ |
+|---:|---|---|
+| 80 | 27B, B=8, NT=10 (TP=8) | +12.1% |
+| 160 | 27B, B=8, NT=20 (TP=4) | +16.8% |
+| 160 | 27B, B=16, NT=10 (TP=8) | **+17.1%** |
+| 256 | 35B, B=32, NT=8 | +15–19% |
+| 320 | 27B, B=16, NT=20 (TP=4) | **−37.3%** |
+
+So the cliff sits between **256 and 320**, and `B=16` is not the trigger — `B=16` at
+`NT=10` is a clean win. Halving `NT` flipped the sign at fixed batch size, which is the
+controlled experiment the earlier TP=4-only data could not provide.
+
+*Two corrections to what this section previously claimed.* The 35B row is a **weaker**
+counterexample than first treated: its `DN_TILED_CONV` numbers were measured with
+`MOE_FUSED_W8=fp8` (`../qwen3.6-35b-a3b/DECODE_RECIPE.md` §2), so an FP8-MoE model's
+SBUF/PSUM budget is not this bf16 kernel's. And it is `NT=8` there, not 16, because that
+config runs `DN_K_HEADS=2 DN_V_HEADS=4`. Second, the SBUF-spill hypothesis above is
+**not supported by the arithmetic**: the tiled branch's per-item fp32 tiles come to
+roughly `56 × NT` bytes per partition, so the *losing* config holds ~18 KB of each
+partition's 224 KiB — about 8% of SBUF. Whatever the mechanism is, plain capacity
+exhaustion is not it. Both statements are retracted; the `B × NT` ordering is what the
+data supports, and the mechanism remains open (task #13).
+
+**Two NKI tiling-guidance violations, which is the actionable lever.** Checked against
+`~/dev/NKIBootcamp/neuron-agentic-development/skills/neuron-nki-writing/SKILL.md`, whose
+guidance is to use the full 128 partition dimension and keep Vector/Scalar free dims
+≥64:
+
+1. **Phase-1 free dim is `NT × 3` = 30 at TP=8** (60 at TP=4) — below the ≥64 minimum,
+   so the wide `tensor_tensor`/`tensor_reduce`/`activation` calls run at a fraction of
+   the vector engines' efficient width.
+2. **`mq_raw` is `[NT, PMAX]`** (`deltanet_full_batched_v2.py:169`) = `[10, 128]` at
+   TP=8, so its `nc_transpose` feeds **10 of 128 partitions** — 92% of the partition
+   dimension idle on that op.
+
+Neither is a batch-size effect, which is why they are worth fixing independently of #13.
+`DN_CONV_GROUP` (below) is the prototype that addresses both.
+
+**Status: default-off. Enable at BS=8 (any TP), and at BS=16 only at TP=8** — where it
+is the largest single decode win measured on this model (+32.7%). Do not enable at
+BS=16/TP=4.
+
+#### T1a follow-up: 128-aligned group-tiled conv (`DN_CONV_GROUP`) — prototype, ungated
+
+`DN_CONV_GROUP=G` (requires `DN_TILED_CONV=1`) runs Phase-1 across `G` batch items on
+the free axis instead of one item at a time, so the conv tiles become `[128, G×NT, 3]`
+and the `mq` transpose becomes `[G×NT, 128] → [128, G×NT]`. That targets both violations
+above directly: free dim 30 → 120, transpose partitions 10 → 120.
+
+`nc_transpose` caps moving partitions at 128 and `B` must divide by `G`, so the kernel
+picks `G` at trace time as the largest divisor of `B` with `G×NT ≤ 128` (G=12 at
+BS=16/NT=10 → 120; G=8 at BS=8/NT=10 → 80), falling back to the per-item tiled path if
+no divisor ≥2 exists. Phases 2 and 3 are untouched — they already run full 128-partition
+column ops per head, and simply slice this group's `qkv_act`. The HBM buffer layout is
+unchanged from `DN_TILED_CONV=1`, so there is no harness plumbing change.
+
+**Unmeasured.** No numerics gate and no device A/B yet (task #15); the design, the `G`
+table, and the gating plan are in `PLAN_TIER1_TRANSFER.md`. The open question is whether
+Phase-1 width was ever the bound — if the `B × NT` cliff is DMA pipelining rather than
+vector width, this will be flat, and that null result is itself the answer to #13.
 
 #### TP=8 / LNC=1: 8 logical cores of 12 GB {#tp8--lnc1-8-logical-cores-of-12-gb}
 
@@ -357,6 +412,25 @@ identical greedy continuation, so none of this moves numerics. ⚠ the BS=16 "sy
 figure is the known-broken C2 timer — it reports 59.4 tok/s *below* the same run's
 94.3 host-sync figure, which is impossible; read BS=16 off method A.
 
+**BS=16 does run at TP=8 once `--max-seq-len` is halved to 1024**, which buys back the
+headroom the replicated KV cache consumes. That makes BS=16 an apples-to-apples A/B at
+both TP values, and it also rescues the T1a hypothesis test, since SBUF tile pressure
+depends on `B` and `NT` and not on `max_seq_len`:
+
+| Config (BS=16, `--max-seq-len 1024`) | HBM/core | A) host-sync ms/tok | B) on-device ms/tok | tok/s (host-sync) | Δ |
+|---|---|---|---|---|---|
+| TP=4 / LNC=2 | 13,450 MB | 159.48 | 174.77 | 100.3 | — |
+| TP=8 / LNC=1 | **6,768 MB** | 140.68 | 155.10 | **113.7** | **+13.4%** |
+| TP=8 / LNC=1 **+ T1a** | **6,768 MB** | **120.20** | **134.36** | **133.1** | **+32.7%** |
+
+Two things follow. First, **LNC=1's decode win is remarkably stable at +13.4%** — the
+identical figure at BS=8 (72.3 → 82.0) and BS=16 (100.3 → 113.7). Second, and more
+important: **`DN_TILED_CONV` (T1a) *wins* at BS=16 when `NT` is 10, having lost 37.3% at
+BS=16 when `NT` was 20.** 133.1 tok/s is the best 27B decode number measured to date at
+any batch size or configuration.
+
+That is the finding that reframes T1a — see the correction below.
+
 **LNC=1 wins, and the prediction that it would not was wrong.** Going in, the stated
 risk was that TP=8 doubles the participants in every `out_proj`/`down_proj`
 all-reduce, and the barrier-bound analysis below says ~58% of a BS=8 step is
@@ -368,27 +442,48 @@ traffic per step (13,450 → 6,768 MB resident, and the HBM halves almost exactl
 lesson is the same one T1a and beta-4 already taught — *predicting the sign of a
 Trainium lever from a profile attribution is unreliable; measure it.*
 
-**T1a stacks. At equal batch size the combination is the best 27B decode
-configuration measured: 92.0 tok/s host-sync at BS=8**, versus 82.1 previously (T1a
-at TP=4, no T1b) and 72.3 for the TP=4 control here. T1a's own delta is +12.2% at
-TP=8 against +16.8% at TP=4 — smaller, which is what a halved tile count
-(`NT` 20 → 10) predicts if the lever is about conv-state DMA volume.
+**T1a stacks, and the combination is the best 27B decode configuration measured:
+133.1 tok/s host-sync at BS=16/TP=8** (`--max-seq-len 1024`), with 92.0 at BS=8/TP=8
+versus 82.1 previously (T1a at TP=4, no T1b) and 72.3 for the TP=4 control. T1a's own
+delta is +12.1% at BS=8/TP=8 against +16.8% at BS=8/TP=4 and +17.1% at BS=16/TP=8 —
+i.e. the delta grows with `B × NT` right up to the cliff, which is consistent with the
+lever being about conv-state DMA volume but *not* with `NT` alone setting the size of
+the win.
 
-**But the best absolute throughput is still TP=4 at BS=16 (94.3 tok/s), because TP=8
-cannot reach BS=16 at all.** It OOMs while loading the decode NEFF — not on weights
-(6,768 of 12,288 MB is fine) but on a 65.5 MB instruction staging buffer
-(`TDRV:dmem_alloc_internal ... ret=-12`). The structural reason TP=8 does not buy
-proportional headroom is that **the KV cache is replicated, not sharded**:
-`torch.zeros(NUM_GQA, B, max_seq_len, GQA_HEAD_DIM)` (`static_decode.py:1429`) holds
-one whole KV head per rank at *both* TP values, since `num_key_value_heads = 4` forces
-replication past TP=4. So the one tensor that grows with batch is the one tensor TP=8
-does not shrink — and at LNC=1 it is measured against 12 GB instead of 24 GB. That is
-the real cost of the replication approach, and it lands exactly where batch scaling
-needs the room.
+**At `--max-seq-len 2048`, TP=8 cannot reach BS=16 at all.** It dies allocating a
+62.5 MB `model code` block
+(`TDRV:dmem_alloc_internal ... ret=-12`). The allocator breakdown, captured with
+`NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG=1`:
 
-So the configuration choice is not "LNC=1 is better": it is **LNC=1 for latency and
-for memory-constrained deployments (half the resident footprint, best TPOT at every
-batch size it can reach), LNC=2 when you need BS=16 throughput.**
+```
+ND 0 HBM 1   TOTAL 11.873GB | Model Code 35.6MB | Model Constants 5.2MB
+             | Tensors 10.609GB | Shared Scratchpad 1.000GB | Runtime 26.1MB
+             | DMA Rings (IO/Spill/Collectives) 7.8 / 135.4 / 0.3 MB
+LNC size is 1. Neuron Cores using this HBM: NC 2 and NC 3
+```
+
+11.873 of 12 GB — genuinely full, and the runtime notes that "aligned allocations may
+fail even if HBM has space … due to running out of alignment boundaries," so the
+proximate failure is fragmentation at ~99% occupancy rather than a clean shortfall.
+
+**`Tensors` is 10.609 GB against 6.6 GB of weights** — i.e. ~4 GB is batch-scaling
+state, and TP=8 shrinks only part of it. DeltaNet states do shard with TP; the **KV
+cache does not**. `torch.zeros(NUM_GQA, B, max_seq_len, GQA_HEAD_DIM)`
+(`static_decode.py:1429`) holds one whole KV head per rank at *both* TP values, because
+`num_key_value_heads = 4` forces replication past TP=4. Add the functional state
+threading — `kv_cache_k.clone()` at lines 704/748 double-buffers every state tensor in
+the graph — plus a fixed 1.0 GB shared scratchpad, and the headroom is gone. So the
+cost of the KV-replication approach lands precisely where batch scaling needs room.
+Worth noting too that at LNC=1 two NeuronCores share one HBM stack.
+
+**LNC=1 is the better configuration on every axis measured, once you also pick the
+context length.** It wins TPOT at every batch size, wins prefill at every sequence
+length, uses half the resident HBM, and with T1a it holds the throughput record
+(133.1 tok/s at BS=16). The one thing LNC=2 still buys is **BS=16 at a 2048 context**,
+which LNC=1 cannot fit — so the trade is not TP against TP, it is *batch × context*
+against *per-core headroom*, and the KV cache is what sets the exchange rate. If a
+deployment needs both BS=16 and long contexts, that is the case for LNC=2 (or for
+sharding the replicated KV head, which is still unexplored).
 
 **One flag trap found while measuring this.** `--prompt-len` is read only in tiny mode
 (`static_decode.py:1448`), so the prefill command previously documented in this README
@@ -413,6 +508,8 @@ ones every published number above was measured with).
 |---|---|---|---|---|
 | Prefill, compiled chunked-DeltaNet kernel | PyTorch Native | S=128, BS=1 | **83.7 ms** (warm) | **1530** |
 | Prefill, same, **TP=8 / LNC=1** | PyTorch Native | S=128, BS=1 | **65.3 ms** (warm) | **1961** |
+| Prefill, compiled, TP=4 / LNC=2 | PyTorch Native | S=512, BS=1 | 248.9 ms (warm) | 2057 |
+| Prefill, compiled, **TP=8 / LNC=1** | PyTorch Native | S=512, BS=1 | **177.8 ms** (warm) | **2880** |
 | Prefill, eager fallback (unoptimized) | PyTorch Native | S=128, BS=1 | 6847 ms | 19 |
 
 Wiring the validated chunked-DeltaNet NKI kernel makes the prefill graph
@@ -421,9 +518,14 @@ chunk-loop), giving a **~82×** speedup over the eager fallback. Cold compile of
 prefill graph is ~391 s (one-time; NEFF cached after). Enabling chunked prefill
 does not regress decode (BS=1 TPOT stays 36.7 ms).
 
-**LNC=1 is worth +27.4% on prefill** (1,539 → 1,961 prompt tok/s; 83.2 → 65.3 ms) at
-half the resident footprint (12,200 → 6,143 MB/core). Measured 2026-08-04 on beta-4
-with both T1b flags on both sides. The TP=4 control landing at 1,539 reproduces the
+**LNC=1 is worth +27.4% on prefill at S=128, and the win grows with sequence length —
++40.0% at S=512** (2,057 → 2,880 prompt tok/s; 248.9 → 177.8 ms), at half the resident
+footprint (12,200 → 6,143 MB/core). Measured 2026-08-04 on beta-4 with both T1b flags
+on both sides. That the advantage widens with S is the expected shape for a
+compute-bound phase getting twice the cores, and it means the +27.4% at S=128 is a
+floor, not the headline — the 35B measured its LNC=1 win at 20k context.
+
+The TP=4 control landing at 1,539 reproduces the
 1,530 in the table above almost exactly, which is worth stating for two reasons: it
 confirms the tiny-mode basis is the same one that figure was measured on, and it means
 beta-4 did **not** move 27B prefill at TP=4 (unlike the 35B, where beta-4 alone was

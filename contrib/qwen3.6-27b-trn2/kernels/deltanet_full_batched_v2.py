@@ -57,6 +57,17 @@ RMS_EPS = 1e-6
 USE_TILED_CONV = _os.environ.get("DN_TILED_CONV", "0") == "1"
 _PMAX = 128
 _NT = QKV_DIM // _PMAX  # 27B: 20 at TP=4, 10 at TP=8. (The 35B has 16.)
+# Group-tiled conv (DN_CONV_GROUP=G, requires DN_TILED_CONV=1). The per-item tiled
+# path runs Phase-1 conv on tiles [PMAX, _NT, 3]: free dim _NT*3 = 30 at TP=8 (60 at
+# TP=4), below the >=64 the vector engines want, and the mq transpose feeds only _NT
+# of 128 partitions. Grouping G batch items onto the free axis makes the conv math one
+# wide pass over [PMAX, G*_NT, 3] and the transpose run [G*_NT, PMAX] -> [PMAX, G*_NT]
+# on G*_NT partitions. nc_transpose caps the moving partition dim at 128, so the group
+# is sized to the largest divisor of B with G*_NT <= 128 (the "128-aligned" target:
+# G=12/_NT=10 -> 120; G=6/_NT=20 -> 120). Phase 2/3 stay per-item, slicing this group's
+# qkv_act. Off by default; falls back to the per-item tiled path when unset or =1.
+_CONV_GROUP_ENV = int(_os.environ.get("DN_CONV_GROUP", "0"))
+USE_GROUP_CONV = USE_TILED_CONV and _CONV_GROUP_ENV >= 2
 
 
 @nki.jit
@@ -91,6 +102,21 @@ def nki_deltanet_full_batched(
     PMAX = nl.tile_size.pmax  # 128
     NUM_QKV_TILES = QKV_DIM // PMAX  # 20
     Q_SCALE = 1.0 / math.sqrt(K_DIM)
+
+    # Group-conv sizing (trace-time; B is a Python int here). Pick the largest divisor
+    # of B not exceeding both the requested DN_CONV_GROUP and 128//NUM_QKV_TILES — the
+    # latter because the group's mq transpose is [G*NT, PMAX] and nc_transpose caps the
+    # moving partition dim at 128. If nothing >=2 divides B, group conv is inactive and
+    # the batch loop uses the per-item tiled path unchanged.
+    _G = 1
+    if USE_GROUP_CONV:
+        _cap = min(_CONV_GROUP_ENV, B, PMAX // NUM_QKV_TILES)
+        for _cand in range(_cap, 1, -1):
+            if B % _cand == 0:
+                _G = _cand
+                break
+    grp = USE_GROUP_CONV and _G >= 2
+    GNT = _G * NUM_QKV_TILES
 
     # =========================================================================
     # Read-only helpers — hoisted ABOVE the batch loop (shared across all b).
@@ -138,6 +164,70 @@ def nki_deltanet_full_batched(
         new_conv_state_t = new_conv_state.reshape((B, _PMAX, _NT, CONV_KERNEL - 1))
         mixed_qkv_t = mixed_qkv.reshape((B, _NT, _PMAX))
 
+    # ===== Grouped Phase-1 conv (DN_CONV_GROUP=G). Fills qkv_act_all [PMAX, B*NT] =====
+    # in NG = B/G outer iterations, each spanning G items along the free axis so the
+    # vector ops run at GNT=G*NT wide (120 at TP=8 G=12; 120 at TP=4 G=6) instead of NT
+    # (10 / 20). Broadcasts the shared conv weight/bias once above the loop so the wide
+    # multiply is a same-shape tensor_tensor. Batch loop below then does Phase 2/3.
+    if grp:
+        NG = B // _G
+        qkv_act_all = nl.ndarray((PMAX, B * NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+        zb_p_g = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=zb_p_g, value=0.0)
+        # Broadcast cw_all [PMAX, NT, 3] and cb_all [PMAX, NT] to GNT along the free axis.
+        # G tensor_copies each -- one per group slot -- filling cw_grp[:, gi*NT:(gi+1)*NT, :].
+        cw_grp = nl.ndarray((PMAX, GNT, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
+        cb_grp = nl.ndarray((PMAX, GNT), dtype=nl.float32, buffer=nl.sbuf)
+        for gi in range(_G):
+            nisa.tensor_copy(
+                dst=cw_grp[0:PMAX, gi * NUM_QKV_TILES:(gi + 1) * NUM_QKV_TILES, 0:CONV_KERNEL],
+                src=cw_all[0:PMAX, 0:NUM_QKV_TILES, 0:CONV_KERNEL])
+            nisa.tensor_copy(
+                dst=cb_grp[0:PMAX, gi * NUM_QKV_TILES:(gi + 1) * NUM_QKV_TILES],
+                src=cb_all[0:PMAX, 0:NUM_QKV_TILES])
+
+        for gb in nl.affine_range(NG):
+            # (1) Load G items' hist [PMAX, GNT, 3] as G contiguous [PMAX, NT, 3] slabs.
+            hist_g = nl.ndarray((PMAX, GNT, CONV_KERNEL - 1), dtype=nl.float32, buffer=nl.sbuf)
+            # (2) Load G items' mixed_qkv [GNT, PMAX] as G contiguous [NT, PMAX] slabs.
+            mq_raw_g = nl.ndarray((GNT, PMAX), dtype=nl.float32, buffer=nl.sbuf)
+            for gi in nl.affine_range(_G):
+                b_g = gb * _G + gi
+                nisa.dma_copy(
+                    dst=hist_g[0:PMAX, gi * NUM_QKV_TILES:(gi + 1) * NUM_QKV_TILES, 0:3],
+                    src=conv_state_t[b_g, 0:PMAX, 0:NUM_QKV_TILES, 0:3])
+                nisa.dma_copy(
+                    dst=mq_raw_g[gi * NUM_QKV_TILES:(gi + 1) * NUM_QKV_TILES, 0:PMAX],
+                    src=mixed_qkv_t[b_g, 0:NUM_QKV_TILES, 0:PMAX])
+            # (3) Wide transpose fills GNT of 128 partitions (fixes the mq_raw skill hit).
+            mq_p_g = nl.ndarray((PMAX, GNT), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(dst=mq_p_g, data=mq_raw_g[0:GNT, 0:PMAX])
+            mq_g = nl.ndarray((PMAX, GNT), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=mq_g, src=mq_p_g)
+            # (4) Shifted history: drop tap 0, append this step. Write back G slabs.
+            new_hist_g = nl.ndarray((PMAX, GNT, CONV_KERNEL - 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=new_hist_g[0:PMAX, 0:GNT, 0:2], src=hist_g[0:PMAX, 0:GNT, 1:3])
+            nisa.tensor_copy(dst=new_hist_g[0:PMAX, 0:GNT, 2], src=mq_g[0:PMAX, 0:GNT])
+            for gi in nl.affine_range(_G):
+                b_g = gb * _G + gi
+                nisa.dma_copy(
+                    dst=new_conv_state_t[b_g, 0:PMAX, 0:NUM_QKV_TILES, 0:3],
+                    src=new_hist_g[0:PMAX, gi * NUM_QKV_TILES:(gi + 1) * NUM_QKV_TILES, 0:3])
+            # (5) conv = sum_j hist[j]*cw[j] + mq*cw[3] + bias; SiLU. Free dim = GNT=120.
+            prod3_g = nl.ndarray((PMAX, GNT, CONV_KERNEL - 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=prod3_g, data1=hist_g, data2=cw_grp[0:PMAX, 0:GNT, 0:3], op=nl.multiply)
+            conv_sum_g = nl.ndarray((PMAX, GNT), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=conv_sum_g, op=nl.add, data=prod3_g, axis=2)
+            mq_contrib_g = nl.ndarray((PMAX, GNT), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=mq_contrib_g, data1=mq_g, data2=cw_grp[0:PMAX, 0:GNT, 3], op=nl.multiply)
+            nisa.tensor_tensor(dst=conv_sum_g, data1=conv_sum_g, data2=mq_contrib_g, op=nl.add)
+            conv_biased_g = nl.ndarray((PMAX, GNT), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=conv_biased_g, data1=conv_sum_g, data2=cb_grp, op=nl.add)
+            # Fold the whole group's SiLU straight into qkv_act_all — no per-b staging.
+            nisa.activation(
+                dst=qkv_act_all[0:PMAX, gb * GNT:(gb + 1) * GNT],
+                op=nl.silu, data=conv_biased_g, bias=zb_p_g, scale=1.0)
+
     # =========================================================================
     # BATCH LOOP — independent per b, so affine_range (pipelined).
     # =========================================================================
@@ -154,7 +244,16 @@ def nki_deltanet_full_batched(
         # conv_in tile (drops the 2 per-tile bf16->f32 copy activations that the
         # profile flagged; nc reads bf16 src in the multiply/reduce directly).
         # ---------------------------------------------------------------------
-        if USE_TILED_CONV:
+        if grp:
+            # Grouped Phase-1 already ran above the batch loop and filled qkv_act_all;
+            # slice this b's [PMAX, NT] column into a local qkv_act so the existing
+            # Phase 2/3 code (which reads qkv_act[:, kh] / [:, K_HEADS+kh] / [:, 2*K_HEADS+h])
+            # runs unchanged.
+            qkv_act = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(
+                dst=qkv_act,
+                src=qkv_act_all[0:PMAX, b * NUM_QKV_TILES:(b + 1) * NUM_QKV_TILES])
+        elif USE_TILED_CONV:
             # Fully-coalesced conv-state I/O: ~3 DMAs/batch item. (1) whole 3-tap
             # history in ONE contiguous DMA; (2) mixed_qkv[b] in ONE contiguous DMA
             # as [NT,PMAX] + one nc_transpose -> [PMAX,NT]; (3) shifted history back
