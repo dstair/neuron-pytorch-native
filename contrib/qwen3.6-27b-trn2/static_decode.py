@@ -88,6 +88,33 @@ USE_DN_F32_STATE = os.environ.get("DNF32STATE", "0") == "1"
 # — measure the lever before building it. Default off = byte-identical baseline.
 NO_REDUCE = os.environ.get("NOREDUCE", "0") == "1"
 
+# ── Vocab (row) sharding of the two replicated [V, H] tensors (T1b, from the 35B) ──
+# embed and lm_head are the only weights TP leaves REPLICATED: at V=248320, H=5120
+# that is 2.54 GB bf16 each, ~5.1 GB/rank of the module. Sharding both across TP
+# frees ~4 GB/rank. Each rank owns a disjoint CONTIGUOUS vocab range, so the
+# replicated result is reconstructed EXACTLY (no extra rounding):
+#   embed    — gather only in-range rows, zero the rest, sum-all-reduce.
+#   lm_head  — matmul the local rows, zero-pad to full vocab, sum-all-reduce.
+# This is a CAPACITY lever (HBM headroom), not a latency one.
+#
+# Caveat on SHARDED_LM_HEAD: the pre-reduce padded tensor is [B, 1, V]. At BS=1/8/16
+# that is 0.5/4.0/7.9 MB per rank — fine — but it grows linearly with B, so it stays
+# opt-in rather than defaulted on. SHARDED_EMBED has no such padded intermediate
+# ([B, 1, H] only) and is the cheaper half if only one is wanted.
+#
+# Composes with --fp8-weights: quantize_fp8_per_channel takes absmax over dim=-1,
+# i.e. per OUTPUT ROW, so a row's scale is identical whether it was computed on the
+# full [V, H] tensor or on this rank's row slice. Sharding therefore does not
+# perturb the quantization either.
+USE_SHARDED_EMBED = os.environ.get("SHARDED_EMBED", "0") == "1"
+USE_SHARDED_LM_HEAD = os.environ.get("SHARDED_LM_HEAD", "0") == "1"
+
+if (USE_SHARDED_EMBED or USE_SHARDED_LM_HEAD) and NO_REDUCE:
+    raise SystemExit(
+        "SHARDED_EMBED/SHARDED_LM_HEAD require real all-reduces; NOREDUCE=1 would "
+        "silently return one rank's partial vocab slice. Pick one."
+    )
+
 
 def functional_all_reduce(x, op, group):
     """TP all-reduce, or identity when NOREDUCE=1 (cost-probe only — not correct)."""
@@ -207,6 +234,38 @@ def build_random_sharded_weights(num_layers: int, seed: int) -> dict:
             })
         w["layers"].append(lw)
     return w
+
+
+def shard_vocab_rows(w: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
+    """Take this rank's contiguous row (vocab-dim) slice of a [V, H] tensor.
+
+    Contiguous + disjoint is what makes the reconstruction exact: every vocab id is
+    owned by exactly one rank, so the zero-pad + sum-all-reduce in
+    _embed_tokens/_lm_head_logits adds nothing but exact zeros. `.clone()` so the
+    full [V, H] source can be freed by the caller.
+    """
+    vocab = w.shape[0]
+    assert vocab % world_size == 0, (
+        f"vocab {vocab} not divisible by world_size {world_size}; "
+        "vocab sharding needs equal contiguous ranges"
+    )
+    per_rank = vocab // world_size
+    return w[rank * per_rank:(rank + 1) * per_rank].clone()
+
+
+def apply_vocab_sharding(weights: dict, rank: int, world_size: int) -> None:
+    """In-place, flag-gated row-sharding of weights["embed"] / ["lm_head"].
+
+    Called from main() rather than extract_weights() so it covers BOTH weight
+    sources (the HF checkpoint path and --tiny's random path) in one place, and so
+    it runs after `del model` — the full [V, H] tensor's last reference is the dict
+    entry we overwrite, so it frees immediately instead of being pinned by the HF
+    module.
+    """
+    if USE_SHARDED_EMBED:
+        weights["embed"] = shard_vocab_rows(weights["embed"], rank, world_size)
+    if USE_SHARDED_LM_HEAD:
+        weights["lm_head"] = shard_vocab_rows(weights["lm_head"], rank, world_size)
 
 
 def extract_weights(model) -> dict:
@@ -386,10 +445,13 @@ class StaticDecodeModule(nn.Module):
     }
 
     def __init__(self, weights: dict, max_seq_len: int, world_size: int,
-                 fp8_weights: bool = False, batch_size: int = 1):
+                 fp8_weights: bool = False, batch_size: int = 1, rank: int = 0):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.world_size = world_size
+        # Needed by _embed_tokens / _lm_head_logits to locate this rank's vocab
+        # range when SHARDED_EMBED / SHARDED_LM_HEAD are on.
+        self.rank = rank
         self.tp_group = list(range(world_size))
         self.fp8_weights = fp8_weights
         self.batch_size = batch_size  # decode batch B; layers read this for B>1
@@ -486,6 +548,46 @@ class StaticDecodeModule(nn.Module):
                 w = w.t()
             return F.linear(x.to(w.dtype), w)
 
+    def _embed_tokens(self, ids: torch.Tensor) -> torch.Tensor:
+        """Embedding lookup, transparently handling a vocab-row-sharded table.
+
+        When sharded, this rank holds rows [rank*per_rank, (rank+1)*per_rank). Ids
+        outside that range are clamped to a safe local index (so the gather never
+        reads out of bounds — no data-dependent control flow, Dynamo-safe), their
+        rows are then zeroed, and the sum-all-reduce picks up each id's row from
+        whichever single rank owns it. Exactly one rank contributes per id, so the
+        result is bit-identical to the replicated table.
+        """
+        if not USE_SHARDED_EMBED:
+            return F.embedding(ids, self.embed)
+        per_rank = self.embed.shape[0]
+        local_ids = ids - self.rank * per_rank
+        in_range = (local_ids >= 0) & (local_ids < per_rank)
+        safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
+        rows = F.embedding(safe_ids, self.embed)
+        rows = rows * in_range.unsqueeze(-1).to(rows.dtype)
+        return functional_all_reduce(rows, "sum", self.tp_group)
+
+    def _lm_head_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """LM head, transparently handling a vocab-row-sharded weight.
+
+        The local matmul yields this rank's contiguous logit slice; zero-padding it
+        to full vocab and sum-reducing reconstructs the replicated logits exactly
+        (disjoint ranges, additive zeros). See the SHARDED_LM_HEAD note at the top
+        for the size of the padded pre-reduce tensor as batch grows.
+        """
+        if not USE_SHARDED_LM_HEAD:
+            return self._lin("lm_head_w", x)
+        local = self._lin("lm_head_w", x)
+        per_rank = local.shape[-1]
+        # Derive full vocab from the shard rather than the module-level VOCAB, which
+        # main() shrinks for --tiny; per_rank * world_size == V by the slice assert.
+        full_vocab = per_rank * self.world_size
+        lo = self.rank * per_rank
+        return functional_all_reduce(
+            F.pad(local, (lo, full_vocab - lo - per_rank)), "sum", self.tp_group
+        )
+
     def _init_rope(self, max_seq_len: int):
         """Precompute PARTIAL RoPE cos/sin tables (matches HF Qwen3.5).
 
@@ -515,7 +617,7 @@ class StaticDecodeModule(nn.Module):
         Returns: (logits, new_deltanet_states, new_conv_states, new_kv_cache_k, new_kv_cache_v)
         """
         # Embedding lookup: [B] -> [B, 1, 5120] (one token per batch row)
-        hidden = F.embedding(input_id, self.embed).unsqueeze(1)  # [B, 1, 5120]
+        hidden = self._embed_tokens(input_id).unsqueeze(1)  # [B, 1, 5120]
 
         # Clone mutable state for functional style
         dn_states = deltanet_states.clone()
@@ -543,7 +645,7 @@ class StaticDecodeModule(nn.Module):
 
         # Final norm + LM head
         hidden = rms_norm(hidden, self.final_norm)
-        logits = self._lin("lm_head_w", hidden.to(torch.bfloat16))  # [B, 1, vocab]
+        logits = self._lm_head_logits(hidden.to(torch.bfloat16))  # [B, 1, vocab]
 
         return logits.squeeze(1), dn_states, cv_states, kv_k, kv_v  # [B, vocab]
 
@@ -560,7 +662,7 @@ class StaticDecodeModule(nn.Module):
         Returns: (last_logits, dn_states, conv_states, kv_k, kv_v)
         """
         seq_len = input_ids.shape[0]
-        hidden = F.embedding(input_ids, self.embed).unsqueeze(0).float()  # [1, S, 5120] fp32
+        hidden = self._embed_tokens(input_ids).unsqueeze(0).float()  # [1, S, 5120] fp32
 
         dn_states = deltanet_states.clone()
         cv_states = conv_states.clone()
@@ -579,7 +681,7 @@ class StaticDecodeModule(nn.Module):
             hidden = hidden + self._mlp_prefill(i, normed)
 
         hidden = rms_norm(hidden, self.final_norm)
-        logits = self._lin("lm_head_w", hidden[:, -1:, :].to(torch.bfloat16))  # [1, 1, vocab]
+        logits = self._lm_head_logits(hidden[:, -1:, :].to(torch.bfloat16))  # [1, 1, vocab]
         return logits.squeeze(0), dn_states, cv_states, kv_k, kv_v
 
     def _deltanet_prefill(
@@ -1146,11 +1248,20 @@ def main():
         weights = extract_weights(model)
         del model  # Free CPU memory
 
+    # 3b. Flag-gated row-sharding of the two replicated [V, H] vocab tensors.
+    #     (--tiny builds a DIFFERENT random table per rank, so a sharded-vs-replicated
+    #     bit-identity A/B is only meaningful on the real checkpoint.)
+    apply_vocab_sharding(weights, rank, world_size)
+    if rank == 0 and (USE_SHARDED_EMBED or USE_SHARDED_LM_HEAD):
+        which = [n for n, on in (("embed", USE_SHARDED_EMBED),
+                                 ("lm_head", USE_SHARDED_LM_HEAD)) if on]
+        print(f"  Vocab-sharded across TP={world_size}: {', '.join(which)}")
+
     # 4. Create static decode module and move to device
     t0 = time.time()
     static_module = StaticDecodeModule(
         weights, args.max_seq_len, world_size, fp8_weights=args.fp8_weights,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size, rank=rank,
     )
     del weights
     static_module = static_module.to(device)
