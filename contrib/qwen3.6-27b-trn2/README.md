@@ -96,6 +96,7 @@ All are **default-off**; the baseline path is byte-identical without them.
 |---|---|
 | `CHUNKEDPREFILL=1` | Compiled chunked-DeltaNet prefill (~82× faster prefill compile) |
 | `DNBATCHED_V2=1` | DMA-coalesced batched-DeltaNet decode kernel (BS>1) |
+| `DN_TILED_CONV=1` | Tile-partition-major DeltaNet conv-state layout (**BS=8 only** — regresses at BS=16; requires `DNBATCHED_V2=1` and `--batch-size >= 2`) |
 | `GQATAIL=1` | Fused GQA attention-tail mega-kernel |
 | `NORMFUSE=1` | NKI RMSNorm |
 | `SHARDED_EMBED=1` | Row-shard the replicated `embed` table across TP (HBM capacity) |
@@ -163,7 +164,7 @@ the 35B **+12.5%** prefill for free) shows the container is **not** a uniform wi
 | 16 | 483.0 ⚠ | 33.1 ⚠ | timer artifact — see below | **92.4** |
 
 - **BS=8 is the headline: 62.7 → 79.9 tok/s (+27.4%)**, TPOT 127.6 → 100.1 ms, from a
-  compiler change alone. This is now the best measured 27B decode throughput.
+  compiler change alone. (Since superseded at BS=8 by `DN_TILED_CONV=1` — see T1a below.)
 - **BS=1 regresses 28.2 → 25.1 tok/s (−11.0%).** The container helps the batched,
   barrier-bound step and hurts the latency-bound one — consistent with the
   barrier-bound analysis below, but it means "upgrade the container" is a
@@ -231,6 +232,69 @@ Two consequences worth flagging:
   TPOT-neutral (39.9 vs 39.8).
 - Both flags stay **default-off**. The capacity they return (~3.8 GB/core out of a
   24 GB budget) is the point: it is headroom for larger batch or longer context.
+
+#### T1a: tiled conv-state layout (measured — a BS=8 win *and* a BS=16 regression)
+
+`DN_TILED_CONV=1` stores DeltaNet `conv_states` tile-partition-major
+(`[NUM_DN, B, 128, NT, 3]`, element `[b, p, t, j]` = tap `j` of channel `t*128 + p`,
+`NT = 2560/128 = 20`) instead of channel-major (`[NUM_DN, B, 2560, 3]`). That lets the
+kernel move each batch item's whole 3-tap history in **one** DMA instead of one per
+128-channel tile, collapsing ~48 conv-state DMAs per item to ~3. Ported from the 35B,
+where it was ~+15% at BS=32.
+
+**It does not transfer cleanly. The sign flips with batch size** — measured on beta-4,
+64 layers, `DNBATCHED_V2=1 GQATAIL=1`, methods A/B (the "synced TPOT" line is unusable
+at BS=16, see above):
+
+| BS | `DN_TILED_CONV` | A (ms/tok) | B (ms/tok) | tok/s (host-sync) | Δ |
+|---:|---|---:|---:|---:|---|
+| 8 | off | 113.80 | 121.42 | 70.3 | — |
+| 8 | **on** | **97.46** | **105.00** | **82.1** | **+16.8%** |
+| 16 | off | 172.91 / 171.88 | 189.87 / 188.88 | 92.5 / 93.1 | — |
+| 16 | **on** | 275.14 / 275.19 | 290.51 / 291.23 | 58.2 / 58.1 | **−37.3%** |
+
+- **BS=8 is a clean win, agreed by all three timers** (A −14.4%, B −13.5%, C2 −17.0%).
+  82.1 tok/s host-sync is the best measured 27B BS=8 decode.
+- **BS=16 is a large regression, and it is real, not an artifact.** The BS=16 pair was
+  run twice in *opposite* order (off→on, then on→off) specifically to separate the flag
+  from thermal/ordering drift after ~45 min of continuous device load. The regression
+  follows the **flag**, not the position, and both configurations reproduce to within
+  0.6% across the two passes.
+- **Numerics are unaffected in every leg.** All four legs — and both BS=16 repeats —
+  emit the identical greedy continuation
+  (`' to find your gift. The purpose of life is to give it away.'`). This is a
+  performance cliff, not a correctness failure.
+
+**Gates that passed.** The device kernel gate runs the same `cpu_reference` against both
+layouts (feeding the tiled buffer, un-tiling the result), and the two layouts produce
+**identical max-diffs to the last digit** at both batch sizes — B=8: state `0.000039`,
+conv_state `0.000000`, output `0.000977`; B=16: `0.000053` / `0.000000` / `0.007812` —
+which is strong evidence the layout change is bit-identical, as designed.
+`kernels/tests/test_tiled_conv_layout_cpu.py` gates the
+layout algebra device-free (16 checks: round-trip bitwise exactness, the
+`channel = t*128 + p` mapping over the full grid, a negative check that the transposed
+mapping is genuinely different, and that the q/k/v slot boundaries all land on tile
+boundaries). Both flag-off legs reproduced their baselines exactly, so the edits left
+the default path untouched.
+
+**The single-call kernel microbenchmark cannot explain the E2E result — don't use it.**
+`test_deltanet_full_batched.py` reports 0.110 → 0.101 ms/call at B=8 (−8%) and
+0.106 → 0.112 at B=16 (+6%): the right *signs*, but the magnitudes are nowhere near the
+E2E −14%/+59%, and B=8 and B=16 cost the *same* ~0.11 ms, which is only possible if the
+loop is bound by per-call dispatch rather than kernel work. Treat this test as the
+numerics gate it is, not as a timer. (An earlier run of it reported 0.174 → 0.115 at
+B=8; that −34% was launch-noise and should not be cited.)
+
+**Why BS=16 regresses is not yet established.** Two hypotheses, untested: (1) SBUF
+pressure — the tiled branch holds `[128, 20, 3]` fp32 tiles (`hist`, `new_hist`,
+`prod3`, ~30 KB each) per batch item where the untiled path holds `[128, 4]` (~2 KB),
+so at B=16 the working set may spill; (2) the single wide DMA loses the
+many-small-DMA pipelining that hid latency at the larger batch. Note the mechanism
+T1a targets is DMA *count*, and the barrier-bound analysis below says BS=8 is where
+that cost dominates — so a lever that helps at BS=8 and hurts at BS=16 is consistent
+with the profile, just not with the 35B's BS=32 result.
+
+**Status: default-off and scoped to BS=8.** Do not enable at BS=16.
 
 ### Prefill (TTFT / prompt throughput)
 

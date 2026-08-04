@@ -82,16 +82,51 @@ tiles for the 27B vs 16 for the 35B — parameterized, no code change needed.
      prefill path (which shares `conv_states`) still gets the untiled layout — tiled
      is decode-only on the 35B.
 
-### Validation (device, when Trn2 frees)
-- **Bit-identical gate.** Run BS=8 decode with and without `DN_TILED_CONV=1`; the
-  generated-token hash must match exactly (the 35B calls this out as bit-identical).
-- **Throughput A/B.** BS=8 and BS=16, `DNBATCHED_V2=1 GQATAIL=1` ± `DN_TILED_CONV=1`,
-  synced TPOT. Expect a double-digit % gain if the 35B's ~+15% carries.
-- **CPU pre-check.** If there's a CPU/sim oracle for `deltanet_full_batched`
-  (`kernels/tests/test_deltanet_full_batched.py`), extend it to exercise the tiled
-  layout before any device compile.
+### Validation — DONE (2026-08-04, beta-4, 64L, TP=4/LNC=2, `DNBATCHED_V2=1 GQATAIL=1`)
 
-**Effort:** ~1–2 days. **Risk:** low (bit-identical reference, math unchanged).
+**Outcome: the lever's sign flips with batch size. +16.8% at BS=8, −37.3% at BS=16.**
+Ships default-off and scoped to BS=8. Full write-up in README → "T1a: tiled conv-state
+layout". Numbers (methods A/B; the harness's synced-TPOT line is unusable at BS=16):
+
+| BS | flag | A (ms/tok) | B (ms/tok) | tok/s host-sync | Δ |
+|---:|---|---:|---:|---:|---|
+| 8 | off | 113.80 | 121.42 | 70.3 | — |
+| 8 | on | 97.46 | 105.00 | **82.1** | **+16.8%** |
+| 16 | off | 172.91 / 171.88 | 189.87 / 188.88 | 92.5 / 93.1 | — |
+| 16 | on | 275.14 / 275.19 | 290.51 / 291.23 | 58.2 / 58.1 | **−37.3%** |
+
+- **Bit-identical gate: PASSED.** All four legs plus both BS=16 repeats emit the identical
+  greedy continuation. The device kernel gate compares both layouts to the same
+  `cpu_reference` and gets **identical max-diffs to the last digit** at B=8 and B=16.
+- **CPU pre-check: built and passing.** `kernels/tests/test_tiled_conv_layout_cpu.py`,
+  16 checks, device-free. `test_deltanet_full_batched.py` gained a `DN_TILED_CONV=1`
+  mode (tiled input, un-tiled output, same reference).
+- **The BS=16 regression was confirmed, not assumed.** The pair was re-run in reverse
+  order to rule out thermal/ordering drift; the regression follows the flag, and both
+  configs reproduce within 0.6% across the two passes.
+- **Do not cite the single-call kernel benchmark as a timer.** It is dispatch-bound
+  (B=8 and B=16 both ~0.11 ms/call), so its −8%/+6% has the right signs but no
+  attribution power.
+
+**Scope deviations from the steps above** (all deliberate, none affecting the gates):
+1. `state_out`/`conv_state_out` were **not** ported (step 1's last bullet). They are
+   inert for T1a and T2c can add them; keeping the signature narrow kept the diff
+   auditable.
+2. Head counts were **not** made env-driven — they stay module constants at the 27B's
+   correct `K_HEADS=4`/`V_HEADS=12`. The warning that mattered (don't inherit the 35B's
+   `V_HEADS=8`) is satisfied either way.
+3. `USE_WIDE_CONV` and its mutual-exclusion guard were **not** ported (no `DN_WIDE_CONV`
+   on the 27B, so there is nothing to be mutually exclusive with).
+4. `feat/27b-tiled-conv` is **stacked on** `feat/27b-sharded-vocab` rather than branched
+   from `main` in parallel, so the T1b docs are in its history. Files remain disjoint.
+
+Two guards were added because both failure modes are silent: `DN_TILED_CONV=1` without
+`DNBATCHED_V2=1` exits (only v2 has the tiled path), and with `--batch-size < 2` exits
+(BS=1 uses the untiled `deltanet.full` kernel and would silently ignore the layout).
+
+**Open, not blocking:** why BS=16 regresses. Hypotheses are SBUF pressure from the
+`[128, 20, 3]` fp32 tiles (~30 KB/item vs ~2 KB untiled) or loss of many-small-DMA
+pipelining at the wider batch. A profile would settle it.
 
 ---
 
@@ -179,7 +214,10 @@ and the padded-tensor concern of step 4 did not bite at BS≤16.
   BS ≤ 16: the padded pre-reduce tensor is 0.5/4.0/7.9 MB per rank at BS=1/8/16.
 - Whether the 27B `deltanet_full_batched_35b_ops.py` op schema widened for the
   `state_out` kwargs (affects whether T1a step-2 needs a schema edit).
-- The measured 27B tiled-conv delta (hypothesis: ~+15%, from the 35B).
+- ~~The measured 27B tiled-conv delta (hypothesis: ~+15%, from the 35B).~~
+  **Resolved, and the hypothesis was half right: +16.8% at BS=8, −37.3% at BS=16.**
+  See T1a's Validation section — the lever's sign flips with batch size, so it ships
+  default-off and scoped to BS=8.
 - **New, and it changes T1a's baseline:** the beta-4 container already moved BS=8
   decode 62.7 → **79.9 tok/s (+27.4%)** with no source change, while *regressing*
   BS=1 by 11%. T1a must be A/B'd against the beta-4 BS=8 number, not the README's
@@ -192,13 +230,20 @@ and the padded-tensor concern of step 4 did not bite at BS≤16.
   BS=1/8 and only blows up to 2.5× at BS=16. **T1a's BS=16 A/B must use method A or B**
   — the "TRUE steady-state TPOT (synced)" line the harness prints is not usable there.
   Root cause of the C2 blow-up is unidentified and is its own (low-priority) bug.
-- **T1a's BS=16 headroom is larger than the README implied.** The "plateaus ~63 tok/s"
-  claim was a C2 artifact; real beta-4 scaling is 70.1 → 92.4 tok/s (+32%) from 8→16.
+- ~~**T1a's BS=16 headroom is larger than the README implied.**~~ **Written before T1a
+  was measured, and the measurement contradicts it.** The premise was right — the
+  "plateaus ~63 tok/s" claim *was* a C2 artifact, and real beta-4 scaling *is*
+  70.1 → 92.4 tok/s (+32%) from 8→16 — but the inference that more headroom meant more
+  for T1a to capture was wrong. T1a *loses* 37% at BS=16 while winning 17% at BS=8. The
+  correct reading is the opposite: BS=16 is where the untiled path is already doing well,
+  and where T1a's wide-DMA trade stops paying.
 
 ## Reproducing these runs
 The beta-4 DLC has no `transformers`, which this harness needs (`from_pretrained`).
 See README → "Running" for the `pip install --target /pysite` + `PYTHONPATH=/pysite`
 recipe; transformers **5.14.1** is the validated version for `model_type: qwen3_5`.
 Driver scripts used for the 2026-08-04 runs live on the Trn2 at
-`/mnt/nvme/tmp/run27b.sh` and `/mnt/nvme/tmp/rerun16.sh`, logs in
-`/mnt/nvme/tmp/runlog/` (instance store — copy off before any stop/start).
+`/mnt/nvme/tmp/run27b.sh`, `rerun16.sh`, `t1a_kernel_gate.sh`, `t1a_e2e.sh`,
+`t1a_bs16_rev.sh`, `t1a_kernel_bs16.sh`, logs in `/mnt/nvme/tmp/runlog/`
+(instance store — copy off before any stop/start). T1a source snapshot:
+`/mnt/nvme/code/q27b-t1a`.
