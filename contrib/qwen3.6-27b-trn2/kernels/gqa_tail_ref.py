@@ -19,11 +19,13 @@ Output: attn_out [B, 1536] (= 6*256), pre-o_proj.
 
 partial RoPE (ROPE_DIM=64 of 256): rotary applied to [...,:64], [64:] passes through.
 """
+import os as _os
 import torch
 import torch.nn.functional as F
 
 HEAD_DIM = 256
-Q_HEADS = 6
+# Per-core query heads; see static_decode.py TP block (TP=4 -> 6, TP=8 -> 3).
+Q_HEADS = int(_os.environ.get("GQA_Q_HEADS", "6"))
 ROPE_DIM = 64
 RMS_EPS = 1e-6
 

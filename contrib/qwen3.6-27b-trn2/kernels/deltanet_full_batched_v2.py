@@ -38,10 +38,13 @@ import nki.language as nl
 
 K_DIM = 128
 V_DIM = 128
-K_HEADS = 4
-V_HEADS = 12
+# Per-core head counts. Exported by static_decode.py from TP_DEGREE before this
+# module is imported (TP=4 -> 4/12, TP=8 -> 2/6). NKI needs them as Python
+# constants for loop bounds and tile shapes, hence env rather than kwargs.
+K_HEADS = int(_os.environ.get("DN_K_HEADS", "4"))
+V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))
 HEAD_GROUP = V_HEADS // K_HEADS  # 3
-QKV_DIM = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM  # 2560
+QKV_DIM = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM  # TP=4: 2560, TP=8: 1280
 CONV_KERNEL = 4
 RMS_EPS = 1e-6
 # Tiled conv-state DMA coalescing (DN_TILED_CONV=1), ported from the 35B (T1a).
@@ -53,7 +56,7 @@ RMS_EPS = 1e-6
 # downstream op are unchanged — the layout change is confined to Phase 1.
 USE_TILED_CONV = _os.environ.get("DN_TILED_CONV", "0") == "1"
 _PMAX = 128
-_NT = QKV_DIM // _PMAX  # 20 on the 27B (2560/128); the 35B has 16 (2048/128)
+_NT = QKV_DIM // _PMAX  # 27B: 20 at TP=4, 10 at TP=8. (The 35B has 16.)
 
 
 @nki.jit

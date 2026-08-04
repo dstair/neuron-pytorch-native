@@ -21,6 +21,73 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed._functional_collectives import all_reduce as _functional_all_reduce
 
+# ─── Tensor-parallel degree (must precede the kernel imports) ────────────────
+# All the *_HEADS / *_DIM constants further down are per-core, i.e. already
+# divided by TP. TP defaults to 4 — trn2.3xlarge at LNC=2, the configuration
+# every published number was measured at. TP=8 is the LNC=1 configuration: the
+# same 96 GB chip exposed as 8 logical cores of 12 GB instead of 4 of 24 GB.
+#
+# Set TP_DEGREE to match --nproc-per-node. This block runs BEFORE the kernel
+# imports below on purpose: the NKI kernels need their head counts as Python
+# constants (loop bounds and tile shapes), so they read them from the
+# environment at import time, and _tp_env() has to have written them by then.
+INTERMEDIATE = 17408        # config intermediate_size
+TP = int(os.environ.get("TP_DEGREE", "4"))
+
+# Global (unsharded) architecture counts, from config.json.
+DN_K_HEADS_TOTAL = 16       # linear_num_key_heads
+DN_V_HEADS_TOTAL = 48       # linear_num_value_heads
+GQA_Q_HEADS_TOTAL = 24      # num_attention_heads
+GQA_KV_HEADS_TOTAL = 4      # num_key_value_heads  <-- the one that caps clean TP
+
+# DeltaNet constants (per-core)
+DN_K_DIM = 128          # per-head key dim
+DN_V_DIM = 128          # per-head value dim
+DN_K_HEADS = DN_K_HEADS_TOTAL // TP     # key heads per core   (TP=4: 4,  TP=8: 2)
+DN_V_HEADS = DN_V_HEADS_TOTAL // TP     # value heads per core (TP=4: 12, TP=8: 6)
+DN_VALUE_DIM = DN_V_HEADS * DN_V_DIM    # total value dim per core
+DN_QKV_DIM = 2 * DN_K_HEADS * DN_K_DIM + DN_VALUE_DIM  # TP=4: 2560, TP=8: 1280
+DN_CONV_KERNEL = 4
+
+# GQA constants (per-core)
+GQA_HEAD_DIM = 256      # head dimension
+GQA_Q_HEADS = GQA_Q_HEADS_TOTAL // TP   # query heads per core (TP=4: 6, TP=8: 3)
+GQA_Q_DIM = GQA_Q_HEADS * GQA_HEAD_DIM * 2   # q_proj out per core (query+gate)
+# KV heads do NOT divide past TP=4 (there are only 4). Beyond that each KV head
+# is REPLICATED across a group of GQA_KV_REPLICAS ranks — standard practice when
+# tp_degree > num_key_value_heads. Splitting a 256-dim head across ranks would
+# break the attention math: q·k needs the whole head resident, and k_norm is
+# per-head. Q heads still shard cleanly, so the row-wise o_proj all-reduce stays
+# a sum over disjoint q heads and remains exact.
+GQA_KV_HEADS = max(1, GQA_KV_HEADS_TOTAL // TP)     # KV heads per core (>=1)
+GQA_KV_REPLICAS = max(1, TP // GQA_KV_HEADS_TOTAL)  # ranks sharing one KV shard
+
+# MLP constants (per-core)
+MLP_DIM = INTERMEDIATE // TP    # TP=4: 4352, TP=8: 2176
+
+assert DN_K_HEADS_TOTAL % TP == 0 and DN_V_HEADS_TOTAL % TP == 0, (
+    f"TP={TP} does not divide the DeltaNet head counts "
+    f"({DN_K_HEADS_TOTAL} key / {DN_V_HEADS_TOTAL} value)")
+assert GQA_Q_HEADS_TOTAL % TP == 0, f"TP={TP} does not divide {GQA_Q_HEADS_TOTAL} q heads"
+assert INTERMEDIATE % TP == 0, f"TP={TP} does not divide intermediate {INTERMEDIATE}"
+assert DN_QKV_DIM % 128 == 0, (
+    f"per-core DN_QKV_DIM={DN_QKV_DIM} must be a multiple of 128 (partition dim)")
+# The KV cache is allocated [NUM_GQA, B, max_seq, GQA_HEAD_DIM] — one KV head per
+# rank — and both attention paths broadcast that single head across the rank's q
+# heads. TP=4 and TP=8 both give 1; TP<4 would give 2 or 4 and silently mis-shape
+# the cache, so refuse rather than corrupt.
+assert GQA_KV_HEADS == 1, (
+    f"TP={TP} yields {GQA_KV_HEADS} KV heads/rank; the KV cache and attention "
+    f"paths assume exactly 1. Supported: TP=4 (LNC=2) and TP=8 (LNC=1).")
+
+# Export the per-core head counts the NKI kernel modules read at import. This
+# OVERWRITES rather than defaults: a stale DN_V_HEADS left in the environment
+# would otherwise silently build a wrong-shaped kernel that still compiles.
+os.environ["DN_K_HEADS"] = str(DN_K_HEADS)
+os.environ["DN_V_HEADS"] = str(DN_V_HEADS)
+os.environ["GQA_Q_HEADS"] = str(GQA_Q_HEADS)
+os.environ["GQA_KV_HEADS"] = str(GQA_KV_HEADS)
+
 _KERNELS_DIR = os.environ.get(
     "DELTANET_KERNELS_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels"),
@@ -155,31 +222,14 @@ NUM_LAYERS = 64
 NUM_DELTANET = 48
 NUM_GQA = 16
 HIDDEN = 5120
-INTERMEDIATE = 17408
 VOCAB = 248320
+# INTERMEDIATE and the TP-derived per-core constants are defined above the kernel
+# imports (the NKI modules read the head counts from the environment at import).
 RMS_EPS = 1e-6
 
-# DeltaNet constants (per-core after TP=4)
-DN_QKV_DIM = 2560       # in_proj_qkv output dim per core
-DN_K_HEADS = 4          # key heads per core
-DN_V_HEADS = 12         # value heads per core
-DN_K_DIM = 128          # per-head key dim
-DN_V_DIM = 128          # per-head value dim
-DN_VALUE_DIM = 1536     # total value dim per core (12*128)
-DN_CONV_KERNEL = 4
-
-# GQA constants (per-core after TP=4)
-GQA_Q_HEADS = 6         # query heads per core
-GQA_KV_HEADS = 1        # KV heads per core
-GQA_HEAD_DIM = 256      # head dimension
-GQA_Q_DIM = 3072        # q_proj output per core (6*256*2 for query+gate)
-# RoPE is PARTIAL: config partial_rotary_factor=0.25 -> rotary applies to the
-# first 64 of 256 head dims; dims [64:256] pass through unrotated. theta=1e7.
-ROPE_DIM = int(GQA_HEAD_DIM * 0.25)  # 64
-ROPE_THETA = 10000000.0              # config rope_theta (1e7, NOT 1e6)
-
-# MLP constants (per-core after TP=4)
-MLP_DIM = 4352          # intermediate / tp
+# DeltaNet / GQA / MLP per-core constants are derived from TP at the top of this
+# file (see "Tensor-parallel degree"), because the NKI kernel modules read the
+# head counts from the environment at import time.
 
 
 def layer_type(i: int) -> str:
@@ -1123,6 +1173,38 @@ def shard_linear_rowwise(linear, rank, world_size):
     linear.in_features = shard
 
 
+def shard_linear_colwise_replicated(linear, rank, world_size, n_heads, head_dim):
+    """Column-shard by whole heads, replicating when world_size > n_heads.
+
+    Needed for GQA k_proj/v_proj: the 27B has only 4 KV heads, so at TP=8 a plain
+    out_dim // world_size split would hand each rank half of a 256-dim head. That
+    is not a valid shard — attention needs the whole head resident on one rank
+    (q·k contracts over all 256 dims, and k_norm is per-head).
+
+    Instead, ranks are grouped: with 4 heads over 8 ranks, replicas = 2, so ranks
+    {0,1} both hold head 0, {2,3} head 1, and so on. Correctness is unaffected
+    because the *query* heads remain disjoint across all ranks, so the row-wise
+    o_proj all-reduce is still a sum over a partition of the q heads. The cost is
+    a duplicated KV cache, which is negligible here (~34 MB/rank at seq 2048).
+    """
+    assert linear.weight.shape[0] == n_heads * head_dim, (
+        f"expected [{n_heads}*{head_dim}, hidden], got {tuple(linear.weight.shape)}")
+    if world_size <= n_heads:
+        assert n_heads % world_size == 0, f"{n_heads} heads over {world_size} ranks"
+        return shard_linear_colwise(linear, rank, world_size)
+    replicas = world_size // n_heads
+    assert world_size % n_heads == 0, (
+        f"world_size {world_size} must be a multiple of {n_heads} KV heads to "
+        f"replicate cleanly")
+    head = rank // replicas                       # which KV head this rank holds
+    w = linear.weight.data[head * head_dim:(head + 1) * head_dim].clone()
+    linear.weight = nn.Parameter(w)
+    if linear.bias is not None:
+        linear.bias = nn.Parameter(
+            linear.bias.data[head * head_dim:(head + 1) * head_dim].clone())
+    linear.out_features = head_dim
+
+
 def shard_conv1d_for_qkv(conv, rank, world_size, key_dim, value_dim):
     """Shard depthwise conv1d matching the [q, k, v] group structure."""
     C = conv.weight.shape[0]  # = key_dim + key_dim + value_dim
@@ -1182,9 +1264,14 @@ def shard_model(model, rank, world_size):
             attn.dt_bias = nn.Parameter(attn.dt_bias.data[rank * shard_h:(rank + 1) * shard_h].clone())
         else:
             attn = layer.self_attn
+            # q_proj carries query+gate (2*head_dim per q head) and shards cleanly
+            # (24 q heads). k/v_proj hold only 4 KV heads, so past TP=4 they
+            # replicate by whole heads instead of splitting one.
             shard_linear_colwise(attn.q_proj, rank, world_size)
-            shard_linear_colwise(attn.k_proj, rank, world_size)
-            shard_linear_colwise(attn.v_proj, rank, world_size)
+            shard_linear_colwise_replicated(attn.k_proj, rank, world_size,
+                                            GQA_KV_HEADS_TOTAL, GQA_HEAD_DIM)
+            shard_linear_colwise_replicated(attn.v_proj, rank, world_size,
+                                            GQA_KV_HEADS_TOTAL, GQA_HEAD_DIM)
             shard_linear_rowwise(attn.o_proj, rank, world_size)
 
         shard_linear_colwise(layer.mlp.gate_proj, rank, world_size)
@@ -1258,6 +1345,17 @@ def main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.neuron.current_device()
+
+    # The per-core constants (and the head counts already handed to the NKI
+    # kernels at import) were derived from TP_DEGREE. If that disagrees with the
+    # actual world size, every shard is the wrong width — and because each rank
+    # would still slice *something*, the run would produce plausible garbage
+    # rather than crashing. Fail loudly instead.
+    if TP != world_size:
+        raise SystemExit(
+            f"TP_DEGREE={TP} but torchrun world_size={world_size}. Set "
+            f"TP_DEGREE={world_size} (and NEURON_LOGICAL_NC_CONFIG="
+            f"{'1' if world_size == 8 else '2'}) to match --nproc-per-node.")
 
     if rank == 0:
         tag = f"TINY({NUM_LAYERS}L, full-width)" if args.tiny else "Qwen 3.6 27B"

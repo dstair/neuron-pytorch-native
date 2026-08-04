@@ -34,6 +34,7 @@ NOTE: this returns the RAW attention output (pre RMSNormGated / pre out_proj), s
 it can be validated directly against ref_chunk_single_head. Gating + out_proj are
 applied outside (Phase B will fuse them).
 """
+import os as _os
 import math
 import nki
 import nki.isa as nisa
@@ -41,7 +42,8 @@ import nki.language as nl
 
 K_DIM = 128
 V_DIM = 128
-V_HEADS = 12
+# Per-core value heads; see static_decode.py TP block (TP=4 -> 12, TP=8 -> 6).
+V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))
 RMS_EPS = 1e-6
 
 

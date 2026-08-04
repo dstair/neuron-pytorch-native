@@ -22,13 +22,15 @@ Layout (per TP core): Q_HEADS=6 on partition; HEAD_DIM=256 tiled 2x128 for the
 contraction; seq S tiled by 128 (K) / 512 (matmul moving free). All head vectors
 that must index the partition dim stay <=128 by the 2x128 d-split.
 """
+import os as _os
 import math
 import nki
 import nki.isa as nisa
 import nki.language as nl
 
 HEAD_DIM = 256
-Q_HEADS = 6
+# Per-core query heads; see static_decode.py TP block (TP=4 -> 6, TP=8 -> 3).
+Q_HEADS = int(_os.environ.get("GQA_Q_HEADS", "6"))
 ROPE_DIM = 64
 HALF_ROPE = 32          # ROPE_DIM // 2
 RMS_EPS = 1e-6

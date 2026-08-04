@@ -26,6 +26,7 @@ Returns:
   new_conv_state: [B*QKV_DIM, 3]           bf16
   output:         [B*V_HEADS, V_DIM]       bf16  gated, ready for out_proj
 """
+import os as _os
 import math
 import nki
 import nki.isa as nisa
@@ -34,10 +35,13 @@ import nki.language as nl
 
 K_DIM = 128
 V_DIM = 128
-K_HEADS = 4
-V_HEADS = 12
+# Per-core head counts. Exported by static_decode.py from TP_DEGREE before this
+# module is imported (TP=4 -> 4/12, TP=8 -> 2/6). NKI needs them as Python
+# constants for loop bounds and tile shapes, hence env rather than kwargs.
+K_HEADS = int(_os.environ.get("DN_K_HEADS", "4"))
+V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))
 HEAD_GROUP = V_HEADS // K_HEADS  # 3
-QKV_DIM = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM  # 2560
+QKV_DIM = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM  # TP=4: 2560, TP=8: 1280
 CONV_KERNEL = 4
 RMS_EPS = 1e-6
 

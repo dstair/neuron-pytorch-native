@@ -81,6 +81,16 @@ if __name__ == "__main__":
     tiled = bool(getattr(kmod, "USE_TILED_CONV", False))
     if os.environ.get("DN_TILED_CONV", "0") == "1" and not tiled:
         raise SystemExit(f"DN_TILED_CONV=1 but {mod_name} has no tiled path (use deltanet_full_batched_v2)")
+    # The kernel's head counts are env-driven now (TP=4 -> 4/12, TP=8 -> 2/6).
+    # This test builds its inputs from its own module-level constants, so a
+    # mismatch would compare against a differently-shaped reference and fail in a
+    # confusing place. Check it here instead.
+    for _n, _local in (("K_HEADS", K_HEADS), ("V_HEADS", V_HEADS), ("QKV_DIM", QKV_DIM)):
+        _k = getattr(kmod, _n)
+        if _k != _local:
+            raise SystemExit(
+                f"{mod_name}.{_n}={_k} but this test assumes {_local}. Unset "
+                f"DN_K_HEADS/DN_V_HEADS to test the default TP=4 shape.")
     print(f"=== {mod_name}.nki_deltanet_full_batched  B={B}"
           f"{'  [TILED conv layout]' if tiled else ''} ===")
     torch.manual_seed(11)
