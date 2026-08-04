@@ -23,10 +23,14 @@ Batch layout (B sequences, weights SHARED across batch):
 
 Returns:
   new_state:      [B*V_HEADS*K_DIM, V_DIM] f32
-  new_conv_state: [B*QKV_DIM, 3]           bf16
+  new_conv_state: [B*QKV_DIM, 3]           bf16   (tiled layout under DN_TILED_CONV)
   output:         [B*V_HEADS, V_DIM]       bf16  gated, ready for out_proj
+
+DN_TILED_CONV=1 switches conv_state/new_conv_state to the tile-partition-major
+layout described below — the caller must supply the tiled buffer.
 """
 import math
+import os as _os
 import nki
 import nki.isa as nisa
 import nki.language as nl
@@ -40,6 +44,16 @@ HEAD_GROUP = V_HEADS // K_HEADS  # 3
 QKV_DIM = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM  # 2560
 CONV_KERNEL = 4
 RMS_EPS = 1e-6
+# Tiled conv-state DMA coalescing (DN_TILED_CONV=1), ported from the 35B (T1a).
+# conv_state/new_conv_state are stored tile-partition-major
+# [B*_PMAX, _NT*(CONV_KERNEL-1)] (logically [B, _PMAX, _NT, 3], element [b,p,t,j] =
+# conv tap j of channel t*_PMAX+p), so one batch item's whole 3-tap history
+# loads/stores in ~3 DMAs instead of ~3*_NT. The channel<->(tile, partition) mapping
+# is exactly the one the head loop already assumes, so qkv_act ordering and every
+# downstream op are unchanged — the layout change is confined to Phase 1.
+USE_TILED_CONV = _os.environ.get("DN_TILED_CONV", "0") == "1"
+_PMAX = 128
+_NT = QKV_DIM // _PMAX  # 20 on the 27B (2560/128); the 35B has 16 (2048/128)
 
 
 @nki.jit
@@ -60,7 +74,11 @@ def nki_deltanet_full_batched(
     B = state.shape[0] // (V_HEADS * K_DIM)
 
     new_state = nl.ndarray((B * V_HEADS * K_DIM, V_DIM), dtype=state.dtype, buffer=nl.shared_hbm)
-    new_conv_state = nl.ndarray((B * QKV_DIM, 3), dtype=conv_state.dtype, buffer=nl.shared_hbm)
+    if USE_TILED_CONV:
+        new_conv_state = nl.ndarray(
+            (B * _PMAX, _NT * (CONV_KERNEL - 1)), dtype=conv_state.dtype, buffer=nl.shared_hbm)
+    else:
+        new_conv_state = nl.ndarray((B * QKV_DIM, 3), dtype=conv_state.dtype, buffer=nl.shared_hbm)
     output = nl.ndarray((B * V_HEADS, V_DIM), dtype=z.dtype, buffer=nl.shared_hbm)
     # v2: exp_g/beta gates kept in per-b SBUF TRANSPOSED to [1,V_HEADS] (head on free dim
     # → row-h slice has partition start 0, accepted as matmul moving). silu_z stays in HBM
@@ -112,6 +130,11 @@ def nki_deltanet_full_batched(
         nisa.dma_copy(dst=cw_all[0:PMAX, t, 0:CONV_KERNEL], src=conv_weight[cw_ch:cw_ch + PMAX, 0:CONV_KERNEL])
         nisa.dma_copy(dst=cb_all[0:PMAX, t:t + 1], src=conv_bias[cw_ch:cw_ch + PMAX])
 
+    if USE_TILED_CONV:
+        conv_state_t = conv_state.reshape((B, _PMAX, _NT, CONV_KERNEL - 1))
+        new_conv_state_t = new_conv_state.reshape((B, _PMAX, _NT, CONV_KERNEL - 1))
+        mixed_qkv_t = mixed_qkv.reshape((B, _NT, _PMAX))
+
     # =========================================================================
     # BATCH LOOP — independent per b, so affine_range (pipelined).
     # =========================================================================
@@ -128,37 +151,74 @@ def nki_deltanet_full_batched(
         # conv_in tile (drops the 2 per-tile bf16->f32 copy activations that the
         # profile flagged; nc reads bf16 src in the multiply/reduce directly).
         # ---------------------------------------------------------------------
-        qkv_act = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
-        zb_p = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=zb_p, value=0.0)
+        if USE_TILED_CONV:
+            # Fully-coalesced conv-state I/O: ~3 DMAs/batch item. (1) whole 3-tap
+            # history in ONE contiguous DMA; (2) mixed_qkv[b] in ONE contiguous DMA
+            # as [NT,PMAX] + one nc_transpose -> [PMAX,NT]; (3) shifted history back
+            # in ONE DMA. Conv+SiLU then vectorise across all tiles at once instead
+            # of NUM_QKV_TILES separate reduce/activation pairs.
+            # qkv_act[p,t] = channel t*PMAX+p — same mapping as the untiled path.
+            qkv_act = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            zb_p = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(dst=zb_p, value=0.0)
+            hist = nl.ndarray((PMAX, NUM_QKV_TILES, CONV_KERNEL - 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=hist[0:PMAX, 0:NUM_QKV_TILES, 0:3], src=conv_state_t[b, 0:PMAX, 0:NUM_QKV_TILES, 0:3])
+            mq_raw = nl.ndarray((NUM_QKV_TILES, PMAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=mq_raw[0:NUM_QKV_TILES, 0:PMAX], src=mixed_qkv_t[b, 0:NUM_QKV_TILES, 0:PMAX])
+            mq_p = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(dst=mq_p, data=mq_raw[0:NUM_QKV_TILES, 0:PMAX])
+            mq = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=mq, src=mq_p)
+            # Shifted history: drop the oldest tap, append this step's sample.
+            new_hist = nl.ndarray((PMAX, NUM_QKV_TILES, CONV_KERNEL - 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=new_hist[0:PMAX, 0:NUM_QKV_TILES, 0:2], src=hist[0:PMAX, 0:NUM_QKV_TILES, 1:3])
+            nisa.tensor_copy(dst=new_hist[0:PMAX, 0:NUM_QKV_TILES, 2], src=mq[0:PMAX, 0:NUM_QKV_TILES])
+            nisa.dma_copy(dst=new_conv_state_t[b, 0:PMAX, 0:NUM_QKV_TILES, 0:3], src=new_hist[0:PMAX, 0:NUM_QKV_TILES, 0:3])
+            # conv = sum_j hist[j]*cw[j] + mq*cw[3] + bias, then SiLU. Reducing the
+            # 3 history taps and adding the 4th term separately keeps the same
+            # left-to-right summation order as the untiled 4-column reduce.
+            prod3 = nl.ndarray((PMAX, NUM_QKV_TILES, CONV_KERNEL - 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=prod3, data1=hist, data2=cw_all[0:PMAX, 0:NUM_QKV_TILES, 0:3], op=nl.multiply)
+            conv_sum = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=conv_sum, op=nl.add, data=prod3, axis=2)
+            mq_contrib = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=mq_contrib, data1=mq, data2=cw_all[0:PMAX, 0:NUM_QKV_TILES, 3], op=nl.multiply)
+            nisa.tensor_tensor(dst=conv_sum, data1=conv_sum, data2=mq_contrib, op=nl.add)
+            conv_biased = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=conv_biased, data1=conv_sum, data2=cb_all, op=nl.add)
+            nisa.activation(dst=qkv_act, op=nl.silu, data=conv_biased, bias=zb_p, scale=1.0)
+        else:
+            qkv_act = nl.ndarray((PMAX, NUM_QKV_TILES), dtype=nl.float32, buffer=nl.sbuf)
+            zb_p = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(dst=zb_p, value=0.0)
 
-        for t in nl.affine_range(NUM_QKV_TILES):
-            ch = qkv_base + t * PMAX
+            for t in nl.affine_range(NUM_QKV_TILES):
+                ch = qkv_base + t * PMAX
 
-            # Load conv_state (3 cols) + mixed_qkv (1 col) straight into one f32
-            # conv_in tile via DMA (no separate bf16 staging + copy-activations).
-            conv_in = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=conv_in[0:PMAX, 0:3], src=conv_state[ch:ch + PMAX, 0:3])
-            nisa.dma_copy(dst=conv_in[0:PMAX, 3:4], src=mixed_qkv[ch:ch + PMAX])
+                # Load conv_state (3 cols) + mixed_qkv (1 col) straight into one f32
+                # conv_in tile via DMA (no separate bf16 staging + copy-activations).
+                conv_in = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=conv_in[0:PMAX, 0:3], src=conv_state[ch:ch + PMAX, 0:3])
+                nisa.dma_copy(dst=conv_in[0:PMAX, 3:4], src=mixed_qkv[ch:ch + PMAX])
 
-            # Write back updated conv_state (drop oldest column) — direct DMA from
-            # the shifted conv_in slice (no copy-activation staging).
-            nisa.dma_copy(dst=new_conv_state[ch:ch + PMAX, 0:3], src=conv_in[0:PMAX, 1:4])
+                # Write back updated conv_state (drop oldest column) — direct DMA from
+                # the shifted conv_in slice (no copy-activation staging).
+                nisa.dma_copy(dst=new_conv_state[ch:ch + PMAX, 0:3], src=conv_in[0:PMAX, 1:4])
 
-            # conv_weight / conv_bias read from hoisted SBUF tiles (no per-(b,t) DMA).
-            prod = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=prod, data1=conv_in, data2=cw_all[0:PMAX, t, 0:CONV_KERNEL], op=nl.multiply)
+                # conv_weight / conv_bias read from hoisted SBUF tiles (no per-(b,t) DMA).
+                prod = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=prod, data1=conv_in, data2=cw_all[0:PMAX, t, 0:CONV_KERNEL], op=nl.multiply)
 
-            conv_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(
-                dst=prod, op=nl.copy, data=prod, bias=zb_p, scale=1.0,
-                reduce_op=nl.add, reduce_res=conv_sum,
-                reduce_cmd=nisa.reduce_cmd.reset_reduce,
-            )
+                conv_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(
+                    dst=prod, op=nl.copy, data=prod, bias=zb_p, scale=1.0,
+                    reduce_op=nl.add, reduce_res=conv_sum,
+                    reduce_cmd=nisa.reduce_cmd.reset_reduce,
+                )
 
-            act = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(dst=act, op=nl.silu, data=conv_sum, bias=cb_all[0:PMAX, t:t + 1], scale=1.0)
-            nisa.tensor_copy(dst=qkv_act[0:PMAX, t:t + 1], src=act)
+                act = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=act, op=nl.silu, data=conv_sum, bias=cb_all[0:PMAX, t:t + 1], scale=1.0)
+                nisa.tensor_copy(dst=qkv_act[0:PMAX, t:t + 1], src=act)
 
         # ---------------------------------------------------------------------
         # silu(z) for this b -> HBM scratch slice [head_base:head_base+V_HEADS]

@@ -81,6 +81,31 @@ USE_GQA_TAIL = os.environ.get("GQATAIL", "0") == "1"
 # ~2x dn_states memory (tiny vs the 12.3GB/core weights). Default off (bf16 baseline).
 USE_DN_F32_STATE = os.environ.get("DNF32STATE", "0") == "1"
 
+# ── Tiled conv-state layout for the batched DeltaNet decode kernel (T1a, from the
+# 35B, where it was +19% at BS=32/40L and BIT-IDENTICAL). DN_TILED_CONV=1 stores
+# conv_states tile-partition-major, [NUM_DELTANET, B, PMAX, NT, 3] instead of
+# [NUM_DELTANET, B, DN_QKV_DIM, 3], so the kernel's sliding-window conv-state I/O
+# coalesces from ~3*NT DMAs per batch item to ~3. NT = 2560/128 = 20 here (the 35B
+# has 16), derived in the kernel — no per-model constant. The buffer is converted
+# ONCE, after prefill and before the decode loop; generated tokens are unchanged.
+#
+# DECODE-ONLY, and that is load-bearing: `_deltanet_prefill` and the BS=1
+# `deltanet.full` path both index cv_states channel-major, so they must never see a
+# tiled buffer. Hence the batch_size > 1 requirement below, and the conversion
+# happening after prefill has already run.
+USE_DN_TILED_CONV = os.environ.get("DN_TILED_CONV", "0") == "1"
+_DN_TILED_PMAX = 128
+if USE_DN_TILED_CONV and os.environ.get("DNBATCHED_V2", "0") != "1":
+    raise SystemExit("DN_TILED_CONV=1 requires DNBATCHED_V2=1 (only the v2 kernel has the tiled path)")
+
+
+def _conv_cm_to_tiled(cs):
+    """[NUM_DN,B,qkv_dim,3] channel-major -> [NUM_DN,B,PMAX,NT,3] tiled (channel=t*PMAX+p)."""
+    nd, b, qkv, k = cs.shape
+    nt = qkv // _DN_TILED_PMAX
+    return cs.reshape(nd, b, nt, _DN_TILED_PMAX, k).permute(0, 1, 3, 2, 4).contiguous()
+
+
 # Collective-cost probe: NOREDUCE=1 turns every TP all-reduce into a no-op. This
 # BREAKS correctness (each rank keeps its partial sum) but isolates the wall-clock
 # cost of the 128 all-reduces/token (2 per layer × 64). The TPOT delta vs BASE is
@@ -928,7 +953,13 @@ class StaticDecodeModule(nn.Module):
         Qd = DN_QKV_DIM             # 2560
         state_in = dn_states[di].reshape(B * Vd, DN_V_DIM).float()        # [B*1536,128]
         qkv_in = mixed_qkv.to(torch.bfloat16).reshape(B * Qd)            # [B*2560] bf16
-        conv_in = cv_states[di].reshape(B * Qd, DN_CONV_KERNEL - 1)       # [B*2560,3]
+        if USE_DN_TILED_CONV:
+            # cv_states is [NUM_DN, B, PMAX, NT, 3] here; the kernel wants the batch
+            # axis folded into dim 0 exactly as in the channel-major case.
+            _nt = Qd // _DN_TILED_PMAX
+            conv_in = cv_states[di].reshape(B * _DN_TILED_PMAX, _nt * (DN_CONV_KERNEL - 1))
+        else:
+            conv_in = cv_states[di].reshape(B * Qd, DN_CONV_KERNEL - 1)   # [B*2560,3]
         a_in = a_out.reshape(B * DN_V_HEADS)                              # [B*12]
         b_in = b_out.reshape(B * DN_V_HEADS)                              # [B*12]
         z_in = z.to(torch.bfloat16).reshape(B * DN_V_HEADS, DN_V_DIM)     # [B*12,128]
@@ -940,7 +971,13 @@ class StaticDecodeModule(nn.Module):
             A_log.float(), dt_bias.float(), norm_w.float(),
         )
         dn_states[di] = new_state.reshape(B, Vd, DN_V_DIM).to(dn_states.dtype)
-        cv_states[di] = new_conv_state.reshape(B, Qd, DN_CONV_KERNEL - 1).to(cv_states.dtype)
+        if USE_DN_TILED_CONV:
+            _nt = Qd // _DN_TILED_PMAX
+            cv_states[di] = new_conv_state.reshape(
+                B, _DN_TILED_PMAX, _nt, DN_CONV_KERNEL - 1
+            ).to(cv_states.dtype)
+        else:
+            cv_states[di] = new_conv_state.reshape(B, Qd, DN_CONV_KERNEL - 1).to(cv_states.dtype)
 
         attn_out = attn_flat.reshape(B, DN_VALUE_DIM).to(torch.bfloat16)  # [B, 1536]
         out = self._lin(out_w_name, attn_out)                            # [B, 5120]
@@ -1199,6 +1236,12 @@ def main():
                              "multiple of 4 to keep the [DeltaNet×3, GQA×1] pattern.")
     args = parser.parse_args()
 
+    if USE_DN_TILED_CONV and args.batch_size < 2:
+        # At BS=1 _deltanet_layer takes the single-row `deltanet.full` kernel, which
+        # only understands the channel-major layout — a tiled buffer would be read
+        # with the wrong channel mapping and corrupt silently rather than error.
+        raise SystemExit("DN_TILED_CONV=1 requires --batch-size >= 2 (BS=1 uses the untiled deltanet.full kernel)")
+
     # ── tiny mode: shrink NUM_LAYERS (and derived counts) before building buffers
     global NUM_LAYERS, NUM_DELTANET, NUM_GQA, VOCAB
     if args.tiny:
@@ -1414,6 +1457,13 @@ def main():
 
             # position lives on device and is incremented with a device-side add
             position = torch.tensor(len(input_ids), dtype=torch.long, device=device)
+
+        # DN_TILED_CONV: convert conv_states to tile-partition-major ONCE, here —
+        # after prefill (which reads it channel-major) and before the first decode
+        # step. Decode then reads and writes it tiled end to end.
+        if USE_DN_TILED_CONV:
+            conv_states = _conv_cm_to_tiled(conv_states)
+
         one = torch.tensor(1, dtype=torch.long, device=device)
 
         # Decode remaining tokens — next_id [B] flows straight back in, never to host

@@ -3,6 +3,12 @@
 Safety net for the DMA-coalescing rework: the batched kernel MUST match the
 single-batch cpu_reference applied per row. Set KERNEL_MODULE env to test a
 variant (default deltanet_full_batched; set to deltanet_full_batched_v2 etc.).
+
+DN_TILED_CONV=1 (v2 only) additionally switches conv_state/new_conv_state to the
+tile-partition-major layout; this test then feeds the tiled buffer and un-tiles the
+returned one, so the SAME cpu_reference comparison gates both layouts:
+
+  KERNEL_MODULE=deltanet_full_batched_v2 DN_TILED_CONV=1 BS=8 python3 test_deltanet_full_batched.py
 """
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # kernels/ for bare-name imports
@@ -51,12 +57,32 @@ def cpu_reference(state, mixed_qkv, conv_state, conv_weight, conv_bias,
     return new_state, new_cs, gated.to(z.dtype)
 
 
+_TILED_PMAX = 128
+
+
+def cm_to_tiled(cs):
+    """[B, QKV_DIM, 3] channel-major -> [B, PMAX, NT, 3] tiled (channel = t*PMAX+p)."""
+    b, qkv, k = cs.shape
+    nt = qkv // _TILED_PMAX
+    return cs.reshape(b, nt, _TILED_PMAX, k).permute(0, 2, 1, 3).contiguous()
+
+
+def tiled_to_cm(cs):
+    """Inverse of cm_to_tiled: [B, PMAX, NT, 3] -> [B, QKV_DIM, 3]."""
+    b, pmax, nt, k = cs.shape
+    return cs.permute(0, 2, 1, 3).contiguous().reshape(b, pmax * nt, k)
+
+
 if __name__ == "__main__":
     mod_name = os.environ.get("KERNEL_MODULE", "deltanet_full_batched")
     kmod = __import__(mod_name)
     kernel = kmod.nki_deltanet_full_batched
     B = int(os.environ.get("BS", "8"))
-    print(f"=== {mod_name}.nki_deltanet_full_batched  B={B} ===")
+    tiled = bool(getattr(kmod, "USE_TILED_CONV", False))
+    if os.environ.get("DN_TILED_CONV", "0") == "1" and not tiled:
+        raise SystemExit(f"DN_TILED_CONV=1 but {mod_name} has no tiled path (use deltanet_full_batched_v2)")
+    print(f"=== {mod_name}.nki_deltanet_full_batched  B={B}"
+          f"{'  [TILED conv layout]' if tiled else ''} ===")
     torch.manual_seed(11)
     device = torch.device("neuron")
 
@@ -84,17 +110,28 @@ if __name__ == "__main__":
     rcs = torch.stack(rcs_l).reshape(B * QKV_DIM, 3)
     ro = torch.stack(ro_l).reshape(B * V_HEADS, V_DIM)
 
-    # Kernel: flatten batch into dim 0 (matches static_decode wiring).
+    # Kernel: flatten batch into dim 0 (matches static_decode wiring). Under the
+    # tiled layout conv_state goes in as [B*PMAX, NT*3] and comes back the same way.
+    NT = QKV_DIM // _TILED_PMAX
+    if tiled:
+        conv_in_host = cm_to_tiled(conv_state).reshape(B * _TILED_PMAX, NT * 3)
+    else:
+        conv_in_host = conv_state.reshape(B * QKV_DIM, 3)
+
     ns, ncs, no = kernel(
         state.reshape(B * V_HEADS * K_DIM, V_DIM).to(device),
         mixed_qkv.reshape(B * QKV_DIM).to(device),
-        conv_state.reshape(B * QKV_DIM, 3).to(device),
+        conv_in_host.to(device),
         conv_weight.to(device), conv_bias.to(device),
         a_out.reshape(B * V_HEADS).to(device), b_out.reshape(B * V_HEADS).to(device),
         z.reshape(B * V_HEADS, V_DIM).to(device),
         A_log.to(device), dt_bias.to(device), norm_weight.to(device),
     )
     ns, ncs, no = (t.cpu() for t in (ns, ncs, no))
+    if tiled:
+        # Un-tile before comparing, so the reference is layout-agnostic. A wrong
+        # channel<->(tile,partition) mapping shows up here as a large conv_state diff.
+        ncs = tiled_to_cm(ncs.reshape(B, _TILED_PMAX, NT, 3)).reshape(B * QKV_DIM, 3)
 
     sd = (ns.float() - rs.float()).abs().max().item()
     cd = (ncs.float() - rcs.float()).abs().max().item()
@@ -109,7 +146,7 @@ if __name__ == "__main__":
     di = dict(
         state=state.reshape(B * V_HEADS * K_DIM, V_DIM).to(device),
         mixed_qkv=mixed_qkv.reshape(B * QKV_DIM).to(device),
-        conv_state=conv_state.reshape(B * QKV_DIM, 3).to(device),
+        conv_state=conv_in_host.to(device),
         conv_weight=conv_weight.to(device), conv_bias=conv_bias.to(device),
         a_out=a_out.reshape(B * V_HEADS).to(device), b_out=b_out.reshape(B * V_HEADS).to(device),
         z=z.reshape(B * V_HEADS, V_DIM).to(device),
