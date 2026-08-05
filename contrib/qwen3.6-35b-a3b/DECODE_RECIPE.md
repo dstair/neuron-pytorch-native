@@ -69,11 +69,17 @@ re-runs are cache-hot (seconds, no recompile).
 
 > **Gate `GQA_STATEFUL_KV=1` on cache occupancy, not on `gen hash`.** Until
 > 2026-08-05 this flag combination wrote **only GQA group 0** — the ten GQA layers
-> share one traced graph under `DECODE_FULLGRAPH=1`, and this stack carries back
-> only the first in-place mutation of a given buffer per graph, so nine of ten
-> layers attended over zeros (`per_group_nz=[98304,0,0,0,0,0,0,0,0,0]`) while
-> producing finite, plausible output. Fixed by giving each GQA layer its own cache
-> buffer. Add `-e DECODE_KV_MAP=1` and require **all ten groups non-zero**:
+> share one traced graph under `DECODE_FULLGRAPH=1`, and mutating one shared cache
+> tensor ten times inside that graph loses writes, so nine of ten layers attended
+> over zeros (`per_group_nz=[98304,0,0,0,0,0,0,0,0,0]`) while producing finite,
+> plausible output. Fixed by giving each GQA layer its own cache buffer — one
+> distinct tensor per mutation.
+>
+> **This one does not reproduce at probe scale.** The pre-fix form (all ten calls
+> handed the *identical* whole-tensor view, the kernel doing the per-layer offset)
+> lands all ten writes in a small graph — `kernels/tests/test_gqa_tail_stateful_probe.py`
+> says so out loud. Only the real 40-layer graph, with MoE, DeltaNet and collectives
+> at BS=128, drops them. So the probe is a floor and the occupancy run is the gate. Add `-e DECODE_KV_MAP=1` and require **all ten groups non-zero**:
 > ```
 > DECODE kvmap per_group_nz = [98304] * 10        # correct: every group written
 > ```

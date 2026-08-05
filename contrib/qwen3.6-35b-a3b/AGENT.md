@@ -135,25 +135,39 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
 
 ## Hard-won gotchas (each cost real time)
 
-- **Only the FIRST in-place mutation of a given buffer per traced graph is carried
-  back.** A custom NKI op that mutates an aliased tensor and does not return it
-  works exactly once per buffer per graph; every later mutation of that *same*
-  buffer inside that graph is **silently dropped** — no error, output stays finite
-  and plausible. It is per-buffer, not per-graph (`kv_k` and `kv_v` each kept their
-  own first write). This cost two multi-session investigations, one withdrawn
-  prefill record, and every `GQA_STATEFUL_KV=1 DECODE_FULLGRAPH=1` decode number.
-  Rules that follow:
-  - **One buffer per mutation site.** Both KV paths now allocate one cache tensor
-    per GQA layer (`decode_kv_k{0..9}`; a list in prefill) so each graph writes
-    each buffer once. The kernels are unchanged — a per-layer buffer is just
-    `layer_index=0` / `group_index=0, num_groups=1`.
-  - **Pass the buffer whole.** `buf.reshape(...)` on a contiguous whole tensor
-    aliases; `buf[gi].reshape(...)` on a shared tensor does not, and its write is
-    lost unless the tensor is also returned. `.contiguous()` on a per-layer slice
-    at allocation time is load-bearing.
+- **Mutating one tensor more than once in a traced graph loses writes.** A custom
+  NKI op that mutates an aliased tensor and does not return it works exactly once
+  per tensor per graph; do it twice and writes are **silently dropped** — no error,
+  output stays finite and plausible. This cost two multi-session investigations, one
+  withdrawn prefill record, and every `GQA_STATEFUL_KV=1 DECODE_FULLGRAPH=1` decode
+  number. **One distinct tensor per mutation** is the only form measured safe: both
+  KV paths allocate one cache tensor per GQA layer (`decode_kv_k{0..9}`; a list in
+  prefill). The kernels are unchanged — a per-layer buffer is just `layer_index=0` /
+  `group_index=0, num_groups=1`.
+
+  Measured on device 2026-08-05 (`test_gqa_rope_kv_multicall_probe.py`,
+  `test_gqa_tail_stateful_probe.py`), because the coarse rule above hides three
+  distinctions that each mattered:
+  - **Slicing is not the hazard; sharing is.** One mutation of a buffer always
+    lands, whole-tensor reshape *or* sliced view — the pre-2026-07-30 prefill path
+    mutated sliced views and filled the cache 100%. But **N mutations through N
+    distinct views of one base lose all N** (measured 0 of 3, and 0 of 10). An
+    earlier version of this list claimed a sliced view "does not alias"; that was
+    never measured and is wrong.
+  - **N mutations through the *identical* whole-tensor view land at probe scale but
+    not at 40 layers.** That is the exact form decode shipped, and it kept only
+    group 0 in the real graph. So a green probe here is a floor, never clearance.
+  - **An in-graph read of a mutated buffer is not ordered against the mutation.**
+    Two byte-identical bodies differing only in graph-**output order** disagree:
+    read emitted before the op's own return value sees pre-mutation zeros, after it
+    sees the write. Prefill's `k_filled = kv_k[gi][:, 0]` is in the working order
+    and is bit-exact against the path that consumed the kernel's returned cache —
+    but nothing enforces that, so the occupancy gate stays.
   - **An aliasing probe must reproduce the number of mutations per graph**, not
-    just the addressing. Two probes at production geometry passed while the real
-    path lost 6 of 10 writes, because each issued one mutation per graph.
+    just the addressing, and must not export the cache or assert only on absence.
+    Two probes at production geometry passed while the real path lost 6 of 10
+    writes, because each issued one mutation per graph and read the cache as a
+    graph output.
   - **Gate on state occupancy, never on logits.** `PREFILL_KV_MAP=1` /
     `DECODE_KV_MAP=1` print per-group `nz`. Both trusted gates failed here: the
     greedy coherence continuation was token-identical on a 60%-empty cache (the

@@ -1168,14 +1168,14 @@ Landed in `static_decode_35b.py`, no new flag — it is a bug fix, not a variant
 |---|---|---|
 | decode cache | one `decode_kv_k` `[NUM_GQA,B,NKV,S,HD]` buffer | `decode_kv_k{0..9}`, each `[B,NKV,S,HD]` |
 | decode call | `kv_k.reshape(NUM_GQA*B*S,HD)`, `layer_index=gi` | `kv_k[gi].reshape(B*S,HD)`, `layer_index=0` |
-| prefill cache | `kv_cache_k.clone()` | `[kv_cache_k[gi].contiguous() for gi in …]` |
+| prefill cache | `kv_cache_k.clone()` | `[kv_cache_k[gi].clone() for gi in …]` |
 | prefill call | `kv_k.reshape(NUM_GQA*B*S,HD)`, `gi`, `NUM_GQA` | `kv_k[gi].reshape(B*S,HD)`, `0`, `1` |
 
 The kernels need no change: `nki_gqa_tail`'s row base is
 `(layer_index * B + b) * S` and `nki_gqa_rope_kv_dynamic`'s is
 `(group_index * B + b) * kmax` with `kmax = shape[0] // (B * num_groups)`, so a
 per-layer buffer is just the `layer_index = 0, num_groups = 1` case. Each buffer is
-still passed **whole** (a whole-tensor reshape aliases; a slice does not), and total
+still passed **whole**, and total
 KV memory is unchanged — it is the same bytes, differently owned. Correctness is now
 independent of `--prefill-splits`, which matters because the cheap
 `--prefill-splits 10` confirmation (4-layer segments, one GQA layer each) is not
@@ -1257,6 +1257,50 @@ What this does *not* do is restore the withdrawn `+5.5%`. That claim (105.31 →
 ms/token) was measured at BS=32 on the older container, and has **not** been
 re-measured on a correct path; it should be treated as unknown, not as recovered. The
 datum above is the first honest number for stateful-KV decode.
+
+#### Measured 2026-08-05: what the aliasing rule actually is (two earlier claims retracted)
+
+The fix above is correct and gated, but the *explanation* attached to it was wrong in
+two places. Both were inherited hypotheses that had never been measured; writing the
+probes to actually assert on device produced the following, on the beta-4 container at
+`--optlevel 1`, one rank, tiny standalone graphs (probe files listed per row):
+
+| form | writes landed | file |
+|---|---:|---|
+| 1 mutation, whole-tensor reshape | 1/1 | `test_gqa_rope_kv_alias_probe.py` |
+| 1 mutation, **sliced view** | **1/1** | `test_gqa_rope_kv_alias_probe.py` |
+| N mutations, N separate tensors (**shipped**) | 3/3, 10/10 | multicall, tail_stateful |
+| N mutations, **N distinct views of one base** | **0/3, 0/10** | multicall, tail_stateful |
+| N mutations, *identical* whole-tensor view | 3/3, 10/10 | multicall, tail_stateful |
+| in-graph read, emitted **after** the op's return value | sees the write | multicall |
+| in-graph read, emitted **before** the op's return value | **sees zeros** | multicall |
+
+**Retraction 1: "a sliced view does not alias, so its write is lost" is false.** A
+single sliced mutation lands, and always did — the pre-2026-07-30 prefill path mutated
+`kv_k[gi, :, 0].reshape(…)` and filled the cache 100% (table above). The hazard is
+**sharing one base across several mutations**, not slicing. Note this is *harsher* than
+the coarse rule, not milder: three distinct slices of one base lost **all three**
+writes, not "all but the first".
+
+**Retraction 2: "only the FIRST mutation per buffer per graph is carried back" is the
+right instinct with the wrong mechanism**, and it over-promises. N mutations through the
+*identical* whole-tensor view land at probe scale — which is exactly the form decode
+shipped, and decode still lost 9 of 10 at 40 layers. So the probes cannot reproduce the
+decode defect, and a green run on them is a floor rather than clearance; the gate remains
+a `DECODE_KV_MAP=1` run. This is stated in the probe's own output so it cannot be
+misread as a pass.
+
+**New finding, and the one to be careful with: an in-graph read of a mutated buffer is
+not ordered against the mutation.** Two byte-identical bodies differing *only* in graph
+output order disagree — digest emitted before the op's own return value reads
+pre-mutation zeros, emitted after it reads the write. Prefill's
+`k_filled = kv_k[gi][:, 0]` is in the working order, and its logits are bit-exact
+against the path that consumed the kernel's returned cache, so it is correct today; but
+nothing in the source enforces it. Do not copy that read pattern without an occupancy
+gate.
+
+The practical rule is unchanged and now has a measured basis: **one distinct tensor per
+mutation**, and gate on `PREFILL_KV_MAP=1` / `DECODE_KV_MAP=1` occupancy.
 
 ## Reference
 

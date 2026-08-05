@@ -740,14 +740,15 @@ class StaticDecode35B(nn.Module):
                     "GQA_STATEFUL_KV requires one local KV head per rank"
                 )
             # ONE BUFFER PER GQA LAYER — not a single [NUM_GQA,...] tensor.
-            # This stack carries back only the FIRST in-place mutation of a given
-            # buffer per traced graph; every later mutation of that same buffer is
-            # silently dropped. Under DECODE_FULLGRAPH=1 all NUM_GQA GQA layers
-            # share one graph, so a shared cache tensor kept only group 0's writes
-            # (measured: per_group_nz=[98304,0,0,0,0,0,0,0,0,0] at 40L/BS=128) and
-            # the other nine layers attended over zeros. Separate buffers mean each
-            # graph mutates each buffer exactly once. The buffer must also be passed
-            # WHOLE — a whole-tensor reshape aliases, a sliced view does not.
+            # Mutating one tensor several times in a single traced graph loses
+            # writes on this stack, silently: output stays finite and plausible.
+            # Under DECODE_FULLGRAPH=1 all NUM_GQA GQA layers share one graph, so
+            # a shared cache tensor kept only group 0's writes (measured:
+            # per_group_nz=[98304,0,0,0,0,0,0,0,0,0] at 40L/BS=128) and the other
+            # nine layers attended over zeros. One distinct tensor per mutation is
+            # the only form measured to be safe — see
+            # kernels/tests/test_gqa_tail_stateful_probe.py for what does and does
+            # not reproduce at probe scale.
             cache_shape = (
                 batch_size,
                 self.nkv,
@@ -1886,11 +1887,10 @@ class StaticDecode35B(nn.Module):
             # head — the kernel's [B*S,HD] layout. Pass PRE-NORM query, raw gate.
             S = self.max_seq_len
             if USE_GQA_STATEFUL_KV:
-                # WHOLE per-layer buffer (a whole-tensor reshape aliases; a slice
-                # of a shared [NUM_GQA,...] tensor does not, and a second write to
-                # a shared buffer in one graph is dropped outright). The kernel's
-                # row base is (layer_index * B + b) * S, so a per-layer buffer is
-                # addressed with layer_index=0.
+                # THIS LAYER'S OWN buffer. Ten layers share this graph, and
+                # mutating one tensor ten times loses writes; ten distinct tensors
+                # do not. The kernel's row base is (layer_index * B + b) * S, so a
+                # per-layer buffer is addressed with layer_index=0.
                 cache_k_arg = kv_k[gi].reshape(B * S, HD)
                 cache_v_arg = kv_v[gi].reshape(B * S, HD)
             else:
@@ -2162,15 +2162,19 @@ class StaticDecode35B(nn.Module):
             # [B*max_seq_len, HD] buffers as graph outputs, 1.74 GB of HBM
             # traffic per 10-layer region (21.7%) to publish 1024 changed rows.
             #
-            # Two constraints on how the buffer is handed over, both of which cost
-            # a silent 60%-empty cache to learn (see BENCHMARK.md 2026-08-05):
-            #  1. A whole-tensor reshape aliases the buffer, so the in-place write
-            #     lands; a *sliced* view does not (the write is dropped unless the
-            #     tensor is also returned) -- test_gqa_rope_kv_alias_probe.py.
-            #  2. Only the FIRST in-place mutation of a given buffer per traced
-            #     graph is carried back. Hence one buffer per GQA layer, allocated
-            #     in prefill_bucketed -- a shared [NUM_GQA,...] tensor kept only
-            #     the first GQA layer's write in each compiled segment.
+            # ONE DISTINCT TENSOR PER MUTATION is the only form measured to be
+            # safe, and learning that cost a silent 60%-empty cache (BENCHMARK.md
+            # 2026-08-05). A compiled segment holds 2-3 GQA layers, so the buffers
+            # are allocated per layer in prefill_bucketed. What was measured, on
+            # device, at probe scale:
+            #  * one mutation of a buffer per graph always lands, whole-tensor
+            #    reshape or sliced view alike;
+            #  * N mutations through N DISTINCT VIEWS of one base lose all N (this
+            #    is what left the 40-layer cache 40% populated) -- so the hazard is
+            #    the sharing, not the slicing;
+            #  * N mutations through the IDENTICAL whole-tensor view land at probe
+            #    scale but NOT at 40 layers (that is how decode lost 9 of 10).
+            # test_gqa_rope_kv_multicall_probe.py holds all three.
             cache_k = kv_k[gi].reshape(B * self.max_seq_len, HD)
             cache_v = kv_v[gi].reshape(B * self.max_seq_len, HD)
             q_f, k_active = torch.ops.gqa35b.rope_kv_dynamic(
@@ -2185,8 +2189,17 @@ class StaticDecode35B(nn.Module):
                 0,              # per-layer buffer -> group_index is always 0
                 1,              # ... and it holds exactly one group
             )
-            # These reads follow the mutating op, so functionalization orders
-            # them after it -- the same shape as the static branch below.
+            # Read the cache back in-graph, the same shape as the static branch
+            # below. NOT GUARANTEED, and do not copy this pattern without gating
+            # it: an in-graph read of a mutated buffer is not ordered against the
+            # mutation. Two byte-identical bodies differing only in graph-OUTPUT
+            # ORDER give opposite answers -- read emitted before the op's own
+            # return value sees the pre-mutation zeros, after it sees the write
+            # (measured 2026-08-05, characterized in
+            # test_gqa_rope_kv_multicall_probe.py). This site is in the working
+            # order: its logits are bit-exact against the pre-2026-07-30 path that
+            # consumed the kernel's *returned* k_filled, which is what makes it
+            # safe today. That is why PREFILL_KV_MAP=1 occupancy stays the gate.
             k_filled = kv_k[gi][:, 0]
             v_filled = kv_v[gi][:, 0]
             qb = q_base.float()

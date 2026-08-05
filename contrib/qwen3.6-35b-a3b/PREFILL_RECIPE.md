@@ -179,10 +179,13 @@ same page size 256 — a clean compiler-only win. beta-4 changes no numerics.
 > **The 3,889.4 tok/s figure previously reported here is withdrawn (2026-08-05).**
 > That run carried the 2026-07-30 rope-KV rewrite (in-place cache write, cache no
 > longer returned as a graph output), which is now proven to **drop ~60% of its KV
-> writes**: only the *first* in-place mutation of a buffer inside a traced graph is
-> carried back, so with `--splits 4` just 4 of the 10 GQA layers ever populate the
-> cache (`kv_k` occupancy 41,943,040 / 104,857,600). Part of that "gain" was work not
-> done. Its fingerprint `sum=-3.29478219e+05 norm=1.22990430e+03
+> writes**: it mutated ten *distinct slices of one shared* cache tensor per traced
+> segment, and mutating one base tensor through several views loses writes, so with
+> `--splits 4` just 4 of the 10 GQA layers ever populate the cache (`kv_k` occupancy
+> 41,943,040 / 104,857,600). Part of that "gain" was work not done. How many writes
+> survive is not predictable: one per compiled segment here, but **zero of three** in
+> a small probe (`kernels/tests/test_gqa_rope_kv_multicall_probe.py`) — do not reason
+> about this as "the first one wins". The rule is one distinct tensor per mutation. Its fingerprint `sum=-3.29478219e+05 norm=1.22990430e+03
 > top5=[517,607,15089,258,261]` is the signature of a **defect**, not an alternative
 > valid build — do not use it as a reference. Root cause and the re-land plan are in
 > `BENCHMARK.md`.
@@ -200,7 +203,11 @@ suggested — skipping the cache re-export is worth +9.8% on its own.
 > Use `.clone()`, not `.contiguous()`: a dim-0 slice of a contiguous tensor is already
 > contiguous, so `[gi].contiguous()` hands back ten views of one storage. That variant
 > did gate correctly (3,991.6 tok/s, same occupancy), but it leaves correctness resting
-> on the compiler never merging ten views of one base into a single graph input. Note
+> on the compiler never merging ten views of one base into a single graph input — and
+> ten distinct views of one base is precisely the form measured on 2026-08-05 to lose
+> writes (0 of 3 in a probe; see `BENCHMARK.md`). Why the `.contiguous()` variant
+> nevertheless reached full occupancy at 40 layers is **not explained**, which is
+> reason enough to prefer the `.clone()` form rather than probe it further. Note
 > that switching between the two forces a **cold recompile** — input aliasing structure
 > is part of the graph key even when the traced ops are identical.
 
