@@ -492,8 +492,8 @@ def functional_all_reduce(x, op, group):
 
 # ─── State-reporting helpers (a KV cache may be one tensor or a per-layer list) ─
 # The GQA caches are held as a LIST of per-layer buffers wherever a custom op
-# mutates them in place, because this stack carries back only the first in-place
-# mutation of a given buffer per traced graph. Diagnostics therefore have to
+# mutates them in place, because mutating ONE tensor several times inside a single
+# traced graph silently loses writes on this stack. Diagnostics therefore have to
 # accept either layout without materialising the [NUM_GQA,...] stack.
 def _state_parts(tensor_or_list):
     if isinstance(tensor_or_list, (list, tuple)):
@@ -523,6 +523,89 @@ def _state_nz(tensor_or_list):
 
 def _state_numel(tensor_or_list):
     return sum(int(t.numel()) for t in _state_parts(tensor_or_list))
+
+
+# ─── Guardrails for in-place-mutated KV buffers ──────────────────────────────
+# Two silent-wrong-answer modes cost several sessions of misdirected analysis, so
+# both are now enforced in code rather than left to a convention plus an opt-in
+# print. See AGENT.md gotcha #1 and kernels/tests/test_gqa_*_probe.py.
+
+def _assert_distinct_storage(tensors, what):
+    """Precondition: no two in-place-mutated buffers may share STORAGE.
+
+    Mutating one base tensor several times inside a single traced graph loses
+    writes, silently, with finite plausible output. Every form of sharing fails
+    the same way — N distinct slices, the identical whole-tensor view, and
+    `.contiguous()` on an already-contiguous dim-0 slice (which returns the view,
+    not a copy) — but only the first is caught by the probes: the whole-view form
+    lands 10/10 at probe scale and still lost 9 of 10 writes in the real 40-layer
+    graph. Storage identity is the one check that catches all three, which is why
+    this exists.
+
+    Keys on `untyped_storage().data_ptr()`, NOT `Tensor.data_ptr()`: the latter
+    differs between slices of one base, which is exactly the case to reject.
+
+    Must run EAGERLY on real tensors — inside a traced region these are
+    FakeTensors and there is no storage to compare.
+    """
+    # `decode_kv_bufs()` is also called from inside the traced decode step, where
+    # there is nothing to check and `fullgraph=True` is unforgiving. Bail out first
+    # so the guardrail can never itself become a graph break.
+    if torch.compiler.is_compiling():
+        return None
+    parts = _state_parts(tensors)
+    seen = {}
+    for i, t in enumerate(parts):
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(f"{what}[{i}] is {type(t).__name__}, not a Tensor")
+        if t.device.type == "meta" or type(t).__name__ == "FakeTensor":
+            return          # tracing: nothing to compare, and not our call site
+        ptr = t.untyped_storage().data_ptr()
+        if ptr in seen:
+            raise RuntimeError(
+                f"{what}: buffers {seen[ptr]} and {i} SHARE STORAGE "
+                f"(storage 0x{ptr:x}). A traced graph mutates each of these in "
+                f"place once per layer; two mutations of one base tensor silently "
+                f"drop writes, so this would leave part of the KV cache empty and "
+                f"still produce finite, plausible output. Allocate one distinct "
+                f"tensor per mutation — `.clone()`, never `.contiguous()` on a "
+                f"dim-0 slice. See AGENT.md gotcha #1."
+            )
+        seen[ptr] = i
+    return len(parts)
+
+
+def _assert_kv_occupancy(kv, what, min_rows=1):
+    """Postcondition: every per-GQA-layer KV buffer must contain something.
+
+    An assertion rather than the older opt-in map print, because the failure mode
+    is silent: a 60%-empty cache stayed all-finite, kept a token-identical greedy
+    continuation, and reproduced within noise on throughput. Logits and `gen hash`
+    both failed to catch it; occupancy did. ~0.2 ms of reduction against a ~10 s
+    prefill.
+
+    Every allocated group belongs to a GQA layer that actually ran — `D.NUM_GQA`
+    is recomputed from `--num-layers` — so a zero group always means lost writes,
+    never a config that legitimately skipped a layer. Set
+    `KV_OCCUPANCY_CHECK=0` to bypass (diagnostics only).
+    """
+    if os.environ.get("KV_OCCUPANCY_CHECK", "1") != "1":
+        return
+    parts = _state_parts(kv)
+    rows = [
+        int((t.reshape(-1, t.shape[-1]) != 0).any(dim=-1).sum()) for t in parts
+    ]
+    empty = [i for i, n in enumerate(rows) if n < min_rows]
+    if empty:
+        raise RuntimeError(
+            f"{what}: GQA groups {empty} of {len(parts)} hold fewer than "
+            f"{min_rows} non-zero rows (per_group_nonzero_rows={rows}). In-place "
+            f"KV writes were DROPPED — those layers attended over zeros. This is "
+            f"the defect that produced finite, plausible, token-identical output "
+            f"in 2026-08; do not trust logits or `gen hash` to catch it. Check "
+            f"that each GQA layer owns a distinct cache tensor."
+        )
+    return rows
 
 
 # ─── Norm / RoPE primitives (identical math to the 27B) ──────────────────────
@@ -1424,8 +1507,14 @@ class StaticDecode35B(nn.Module):
         A list, not a stacked tensor: `kv[gi]` must hand the kernel a WHOLE
         buffer so the in-place write aliases back, and each buffer must be
         distinct so one traced graph never mutates the same buffer twice.
+
+        This is the hand-off point into the traced graph, so the distinctness
+        invariant is checked here rather than only at `register_buffer` time —
+        that also covers a later `copy_`/reassignment aliasing two slots together.
         """
-        return [getattr(self, f"decode_kv_{which}{gi}") for gi in range(D.NUM_GQA)]
+        bufs = [getattr(self, f"decode_kv_{which}{gi}") for gi in range(D.NUM_GQA)]
+        _assert_distinct_storage(bufs, f"decode per-GQA-layer KV {which} buffers")
+        return bufs
 
     def decode_kv_stacked(self, which):
         """Eager-only [NUM_GQA,B,NKV,S,HD] materialisation for diagnostics/compare.
@@ -2339,6 +2428,11 @@ class StaticDecode35B(nn.Module):
             # caller reads the returned list, not its input tensor.
             kv_k = [kv_cache_k[gi].clone() for gi in range(D.NUM_GQA)]
             kv_v = [kv_cache_v[gi].clone() for gi in range(D.NUM_GQA)]
+            # Enforced, not assumed: `.clone()` above is one edit away from
+            # `.contiguous()` or a bare `[gi]`, and either silently empties most
+            # of the cache. Checked here because inside `segment` these are
+            # FakeTensors with no storage to compare.
+            _assert_distinct_storage(kv_k + kv_v, "prefill per-GQA-layer KV buffers")
         else:
             kv_k = kv_cache_k.clone()
             kv_v = kv_cache_v.clone()
@@ -3016,6 +3110,12 @@ def main():
                 if not args.cpu:
                     dist.barrier()
                 dt = time.time() - t0
+                # Postcondition, always on: a throughput number measured over a
+                # partly-empty KV cache is work not done, and every other signal
+                # (finiteness, logits, gen hash, TPOT) missed exactly that. Timed
+                # after `dt` so the reduction is never inside the measurement.
+                _assert_kv_occupancy(outputs[3], f"PREFILL kv_k N={N}")
+                _assert_kv_occupancy(outputs[4], f"PREFILL kv_v N={N}")
                 if rank == 0:
                     cc = "c" if args.bucket_compile == 1 else "e"
                     mode = f"bucket{bchunk}{cc}" if use_bucket else "eager"
@@ -3101,10 +3201,19 @@ def main():
         else:
             logits, dn_states, conv_states, kv_k, kv_v = mod.prefill(
                 in_t, dn_states, conv_states, kv_k, kv_v)
+        # Before the hand-off to decode, so a dropped prefill write is not blamed
+        # on decode. This is the coherence path -- the one whose "token-identical"
+        # verdict was accepted over a 60%-empty cache.
+        _assert_kv_occupancy(kv_k, "PREFILL kv_k (coherence path)")
+        _assert_kv_occupancy(kv_v, "PREFILL kv_v (coherence path)")
         if USE_GQA_STATEFUL_KV:
             mod.load_decode_kv(kv_k, kv_v)
             kv_k = mod.decode_kv_bufs("k")
             kv_v = mod.decode_kv_bufs("v")
+            # load_decode_kv is a copy_ per layer; verify the seed survived it
+            # before decode starts appending.
+            _assert_kv_occupancy(kv_k, "DECODE kv_k after load_decode_kv")
+            _assert_kv_occupancy(kv_v, "DECODE kv_v after load_decode_kv")
         else:
             # Non-stateful decode clones a single [NUM_GQA,...] tensor, but the
             # dynamic-rope-KV prefill hands back per-layer buffers.
@@ -3195,6 +3304,13 @@ def main():
                 tput = B * 1000.0 / tpot_ms
                 print(f"  BENCH BS={B} seq={args.max_seq_len}: TPOT {tpot_ms:.2f} ms/tok "
                       f"(synced, {iters} iter) | throughput {tput:.1f} tok/s")
+
+    # Always on, and on EVERY rank -- the defect was per-graph, so a rank-0-only
+    # check could miss it. `gen hash` agreeing proves nothing here: two runs that
+    # share a dropped-write defect agree with each other.
+    if USE_GQA_STATEFUL_KV and gen:
+        _assert_kv_occupancy(mod.decode_kv_bufs("k"), f"DECODE kv_k rank={rank}")
+        _assert_kv_occupancy(mod.decode_kv_bufs("v"), f"DECODE kv_v rank={rank}")
 
     if rank == 0:
         ids = [int(g[0].item()) for g in gen]

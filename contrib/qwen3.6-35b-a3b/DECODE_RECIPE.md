@@ -86,6 +86,12 @@ re-runs are cache-hot (seconds, no recompile).
 > Every decode number measured with this flag pair before 2026-08-05 is invalid,
 > including the +5.5% originally attributed to stateful KV. See `BENCHMARK.md`.
 >
+> **Why it is unpredictable rather than simply broken:** the in-place write has no
+> representation in the emitted graph — NKI only reports `input_output_aliases` for
+> inputs the kernel *returns*, and ours deliberately doesn't, so `mutates_args` never
+> reaches the custom call. Mechanism and line references in `PREFILL_RECIPE.md`
+> ("Why the platform behaves this way").
+>
 > Post-fix reference at 40 layers / BS=128 / seq=256 / `--optlevel 1` / beta-4:
 > `per_group_nonzero_rows=[384]×10`, **TPOT 393.56 ms/token, 325.2 tok/s**. The fix is
 > correctness-only — 393.56 vs the broken 395.95 ms is noise, because masked attention

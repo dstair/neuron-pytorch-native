@@ -211,6 +211,24 @@ suggested — skipping the cache re-export is worth +9.8% on its own.
 > that switching between the two forces a **cold recompile** — input aliasing structure
 > is part of the graph key even when the traced ops are identical.
 
+> **Why the platform behaves this way (traced through torch-neuronx, 2026-08-05).** The
+> write-back has **no representation in the emitted graph at all**, which is why it
+> survives sometimes and not others. `dconfig.operand_output_aliases`
+> (`torch_neuronx/nki_kernel.py:172`) is inverted from the NKI compiler's
+> `result.input_output_aliases`, and NKI populates that **only for inputs the kernel
+> returns**. `gqa_rope_kv_35b.py:191` deliberately does *not* return `kv_key`/`kv_value`
+> (returning an *unaliased* output would materialize both full caches per call), so the
+> map is empty and the `ctx.replace` / `mark_mutation_hidden_from_autograd` /
+> `commit_update` / `sync` block at `torch_neuronx/nki_hop.py:391-398` never runs for
+> them. `mutates_args={"kv_key","kv_value"}` on the `nki_op` decorator only shapes the
+> **PyTorch-level schema**; it does not reach the custom call. (`nki_hop.py:451`
+> hardcodes `operand_output_aliases={}`, but that value is dead — every impl that
+> matters overwrites it from `dconfig` at `:263`, `:338`, `:378`.) So the writes landing
+> at all is the backend happening not to reorder or dead-code them, not a contract —
+> hence the occupancy gate, and hence the one-distinct-tensor-per-mutation rule. Whether
+> returning the cache *as a declared alias* fixes this without paying the
+> materialization is measured by `kernels/tests/probe_kv_alias_f4.py`.
+
 There is exactly **one** valid reference fingerprint for this recipe, and it holds
 across a compiler *and* a page-size change, so any mismatch is a real signal rather
 than fp noise:
