@@ -1302,6 +1302,55 @@ gate.
 The practical rule is unchanged and now has a measured basis: **one distinct tensor per
 mutation**, and gate on `PREFILL_KV_MAP=1` / `DECODE_KV_MAP=1` occupancy.
 
+#### Root cause, and the structural fix (2026-08-05): the mutation was never in the graph
+
+Everything above characterises a behaviour without explaining it. The mechanism, traced
+through the installed `torch_neuronx` and then measured:
+
+`dconfig.operand_output_aliases` (`nki_kernel.py:172-178`) is inverted from the NKI
+compiler's `result.input_output_aliases`, and **NKI populates that map only for inputs
+the kernel RETURNS**. Our kernels deliberately did not return the caches, so the map was
+empty, so the `ctx.replace` / `mark_mutation_hidden_from_autograd` / `commit_update` /
+`sync` block at `nki_hop.py:391-398` never ran. `mutates_args` on `@nki_op` shapes only
+the *PyTorch-level* schema; it never reaches the emitted custom call. So the in-place
+write had **no representation in the emitted graph at all** — writes landing was the
+backend happening not to reorder or DCE them, never a contract. That is the whole
+explanation for "sometimes lands, sometimes doesn't, scale-dependent".
+
+Isolated in `kernels/tests/probe_kv_alias_f4.py` — two micro-kernels with byte-identical
+write bodies, differing only in whether the kernel returns its mutated input:
+
+| kernel | `operand_output_aliases` | writes landed | HBM | wall |
+|---|---|---:|---:|---:|
+| does not return the cache | `{}` | **0/3** | 0.002 GB | 1.00× |
+| returns the cache | `{0: 1}` | **3/3** | 0.002 GB | 0.94× |
+
+**An aliased return does not materialize the buffer** — it *is* the input buffer, so
+there is no allocation and no copy. The "1.74 GB per region" cost the 2026-07 comments
+warned about applies to an *unaliased* output, and those comments are now corrected in
+place. The secondary finding also has its mechanism: reading the cache back through the
+op's *returned* value is ordered against the write, whereas reading the caller's own view
+is not — the prefill probe's read-before-return-value arm moved 0/3 → 3/3.
+
+Both ops now return their mutated caches (`gqa_rope_kv_35b.py`, `gqa_tail_35b.py`), and
+prefill reads the cache back through those returns. Gated on device at full depth:
+
+| | prefill (BS=2, N=20000, bucket 1024) | decode (BS=128, seq=256) |
+|---|---|---|
+| before | 9991.0 ms / **4003.6 tok/s** | TPOT 392.87 ms / **325.8 tok/s** |
+| aliased returns | 10140.9 ms / **3944.4 tok/s** (−1.5%) | TPOT 397.14 ms / **322.3 tok/s** (−1.1%) |
+| numerics | fingerprint bit-identical | `gen hash 0cc59fb25112` identical |
+| KV occupancy | all 10 groups full | `per_group_nonzero_rows=[384]×10` |
+| HBM | 8.95 GB/core (unchanged) | 7.09 GB/core (unchanged) |
+
+So the correctness contract costs **~1%**, at the edge of the run-to-run spread on these
+configs (prefill has landed at 3991.0 / 4002.1 / 4003.6 across identical builds), and
+costs **nothing** in memory — which is the point: it buys a modelled mutation in place of
+a lucky one. Note what this does *not* do: it does not make sharing one base across N
+mutations safe. The probes' shared-base arms now all land (0/10 → 10/10 on the decode
+one), so those files no longer discriminate, and the occupancy gate is the only remaining
+check. The per-layer buffers stay.
+
 ## Reference
 
 The validated NxDI implementation

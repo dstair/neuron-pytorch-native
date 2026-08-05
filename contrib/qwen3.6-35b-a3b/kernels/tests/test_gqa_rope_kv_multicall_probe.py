@@ -107,7 +107,7 @@ def _build_per_layer(digest_last=True):
             # group_index=0, num_groups=1 case.
             ck = kvk.reshape(B * KMAX, HEAD_DIM)
             cv = kvv.reshape(B * KMAX, HEAD_DIM)
-            _, key_out = torch.ops.gqa35b.rope_kv_dynamic(
+            _, key_out, _, _ = torch.ops.gqa35b.rope_kv_dynamic(
                 q, k, v, c, s, ck, cv, base, 0, 1
             )
             # In-graph read, reduced to a row digest so the cache is not exported.
@@ -129,7 +129,7 @@ def _build_shared_slices():
         for gi in range(N):
             ck = kvk[gi, :, 0].reshape(B * KMAX, HEAD_DIM)
             cv = kvv[gi, :, 0].reshape(B * KMAX, HEAD_DIM)
-            _, key_out = torch.ops.gqa35b.rope_kv_dynamic(
+            _, key_out, _, _ = torch.ops.gqa35b.rope_kv_dynamic(
                 q, k, v, c, s, ck, cv, base, 0, 1
             )
             outs.append(key_out)
@@ -151,7 +151,7 @@ def _build_shared_whole():
         for gi in GROUPS:
             ck = kvk.reshape(G * B * KMAX, HEAD_DIM)
             cv = kvv.reshape(G * B * KMAX, HEAD_DIM)
-            _, key_out = torch.ops.gqa35b.rope_kv_dynamic(
+            _, key_out, _, _ = torch.ops.gqa35b.rope_kv_dynamic(
                 q, k, v, c, s, ck, cv, base, gi, G
             )
             outs.append(key_out)

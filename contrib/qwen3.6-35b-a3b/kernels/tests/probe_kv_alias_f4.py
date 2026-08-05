@@ -83,10 +83,11 @@ def _write_body(cache, src, group_index, num_groups):
     base = group_index * rows
     loaded = nl.ndarray((TILE, HEAD_DIM), dtype=src.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=loaded, src=src)
-    nisa.dma_copy(
-        dst=cache.ap([[HEAD_DIM, TILE], [1, HEAD_DIM]], scalar_offset=base),
-        src=loaded,
-    )
+    # Static slice, not `.ap(scalar_offset=...)`: group_index is a compile-time
+    # constant here, and `.ap` rejects a Python int ("scalar_offset must be
+    # NkiTensor or VirtualRegister"). The runtime-offset form is what the shipped
+    # kernel needs; it is irrelevant to the aliasing question under test.
+    nisa.dma_copy(dst=cache[base : base + TILE, :], src=loaded)
     return loaded
 
 

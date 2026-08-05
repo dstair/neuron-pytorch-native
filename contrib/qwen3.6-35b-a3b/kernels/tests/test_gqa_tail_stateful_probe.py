@@ -85,11 +85,15 @@ def _build_per_layer():
             # layer_index=0 case -- same as static_decode_35b.py.
             ck = kvk.reshape(B * S, HEAD_DIM)
             cv = kvv.reshape(B * S, HEAD_DIM)
+            # [0] = attn_out. The op also returns the two caches (aliased, which
+            # is what declares the mutation), but appending those would export the
+            # cache as a graph output and destroy this probe's whole premise --
+            # each read would get its own buffer and look correct regardless.
             outs.append(
                 torch.ops.gqa35b.tail_stateful(
                     q, gate, qn, cos, sin, ck, cv, mask,
                     keys[slot], values[slot], pos, 0,
-                )
+                )[0]
             )
         return tuple(outs)
 
@@ -108,11 +112,12 @@ def _build_shared_whole():
         for gi in range(G):
             ck = kvk.reshape(G * B * S, HEAD_DIM)
             cv = kvv.reshape(G * B * S, HEAD_DIM)
+            # [0] = attn_out; see _build_per_layer on why the caches are dropped.
             outs.append(
                 torch.ops.gqa35b.tail_stateful(
                     q, gate, qn, cos, sin, ck, cv, mask,
                     keys[gi], values[gi], pos, gi,
-                )
+                )[0]
             )
         return tuple(outs)
 
@@ -128,11 +133,12 @@ def _build_shared_slices():
         for gi in range(G):
             ck = kvk[gi].reshape(B * S, HEAD_DIM)
             cv = kvv[gi].reshape(B * S, HEAD_DIM)
+            # [0] = attn_out; see _build_per_layer on why the caches are dropped.
             outs.append(
                 torch.ops.gqa35b.tail_stateful(
                     q, gate, qn, cos, sin, ck, cv, mask,
                     keys[gi], values[gi], pos, 0,
-                )
+                )[0]
             )
         return tuple(outs)
 

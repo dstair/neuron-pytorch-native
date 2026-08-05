@@ -382,4 +382,13 @@ def nki_gqa_tail_stateful(
         query, gate, q_norm, cos, sin, cached_k, cached_v, mask,
         key, value, position, layer_index=layer_index, cache_bf16=True,
     )
-    return out
+    # RETURN the mutated caches. This is what declares the aliasing: NKI reports
+    # `input_output_aliases` only for inputs a kernel returns, and that map is the
+    # only thing that turns the in-place write into a modelled mutation in
+    # torch-neuronx (nki_hop.py:391-398). `mutates_args` on the op reaches only the
+    # PyTorch-level schema, so without this the write survives or not depending on
+    # whether the backend reorders it -- which is how this path silently attended
+    # over zeros in nine of ten GQA layers (BENCHMARK.md 2026-08-05). An aliased
+    # return is the same buffer: no fresh allocation, no copy. Measured in
+    # kernels/tests/probe_kv_alias_f4.py.
+    return out, cached_k, cached_v

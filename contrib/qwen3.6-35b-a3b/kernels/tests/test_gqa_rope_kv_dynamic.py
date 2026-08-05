@@ -55,7 +55,7 @@ def main():
 
     @torch.compile(backend="neuron", fullgraph=True, dynamic=False)
     def run(q, k, v, c, s, kc, vc, base):
-        out, key_out = torch.ops.gqa35b.rope_kv_dynamic(
+        out, key_out, _, _ = torch.ops.gqa35b.rope_kv_dynamic(
             q, k, v, c, s, kc, vc, base, 0, 1
         )
         # The kernel mutates kc/vc in place and does NOT return them. Mirror the

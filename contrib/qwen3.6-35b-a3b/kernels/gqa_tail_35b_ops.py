@@ -2,7 +2,9 @@
 
 Q_HEADS comes from gqa_tail_35b's module constant (env-overridable). The
 stateful variant additionally writes the current K/V rows into aliased base
-cache arguments inside the same custom call.
+cache arguments inside the same custom call, and returns them -- returning a
+mutated input is what makes NKI declare the alias, and hence what makes the
+write-back modelled rather than incidental.
 """
 import torch
 from torch_neuronx import nki_op
@@ -41,7 +43,13 @@ def gqa35b_tail_stateful(
     value: torch.Tensor,     # [B, HEAD_DIM] bf16
     position: torch.Tensor,  # [1, 1] int32
     layer_index: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (attn_out, cached_k, cached_v).
+
+    The caches are returned as well as mutated so NKI emits
+    `input_output_aliases` and the write-back is actually modelled; the returns
+    are aliases, not copies. See the kernel's own comment and
+    kernels/tests/probe_kv_alias_f4.py."""
     return nki_gqa_tail_stateful(
         query, gate, q_norm, cos, sin, cached_k, cached_v, mask,
         key, value, position, layer_index,

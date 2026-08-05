@@ -89,7 +89,7 @@ def _build_contract(kmax, num_groups, group_index):
         # Whole-tensor reshape -- this is what aliases the buffer.
         ck = kvk.reshape(num_groups * B * kmax, HEAD_DIM)
         cv = kvv.reshape(num_groups * B * kmax, HEAD_DIM)
-        q_out, key_out = torch.ops.gqa35b.rope_kv_dynamic(
+        q_out, key_out, _, _ = torch.ops.gqa35b.rope_kv_dynamic(
             q, k, v, c, s, ck, cv, base, group_index, num_groups
         )
         # The in-graph read that production feeds into attention. Reduced to a
@@ -108,7 +108,7 @@ def _build_sliced(kmax, num_groups, group_index):
     def body(q, k, v, c, s, kvk, kvv, base):
         ck = kvk[group_index, :, 0].reshape(B * kmax, HEAD_DIM)
         cv = kvv[group_index, :, 0].reshape(B * kmax, HEAD_DIM)
-        q_out, key_out = torch.ops.gqa35b.rope_kv_dynamic(
+        q_out, key_out, _, _ = torch.ops.gqa35b.rope_kv_dynamic(
             q, k, v, c, s, ck, cv, base, 0, 1
         )
         return q_out, key_out

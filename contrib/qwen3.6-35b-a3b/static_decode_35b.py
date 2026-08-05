@@ -1996,7 +1996,12 @@ class StaticDecode35B(nn.Module):
                 mask.reshape(1, S).float(),
             )
             if USE_GQA_STATEFUL_KV:
-                attn_flat = torch.ops.gqa35b.tail_stateful(
+                # The returned caches are aliases of cache_k_arg/cache_v_arg, not
+                # copies; returning them is what makes NKI declare the alias and
+                # so what makes the in-place append modelled at all. Nothing here
+                # needs to read them back, so they are discarded -- the point is
+                # the declaration, which lives on the op.
+                attn_flat, _, _ = torch.ops.gqa35b.tail_stateful(
                     *args,
                     key_b.reshape(B, HD),
                     value_b.reshape(B, HD),
@@ -2247,15 +2252,22 @@ class StaticDecode35B(nn.Module):
 
         if USE_GQA_DYNAMIC_ROPE_KV:
             # Pass THIS LAYER'S OWN buffer, whole. The kernel mutates it in place
-            # and does not return it: returning the cache re-exported the full
-            # [B*max_seq_len, HD] buffers as graph outputs, 1.74 GB of HBM
-            # traffic per 10-layer region (21.7%) to publish 1024 changed rows.
+            # and RETURNS it, which is what declares the aliasing and gives the
+            # write-back a representation in the graph at all -- NKI emits
+            # input_output_aliases only for inputs a kernel returns, and
+            # mutates_args reaches only the PyTorch-level schema. An aliased return
+            # is the same buffer, so it does not re-export or copy the cache: the
+            # 1.74 GB-per-region figure this comment used to cite is the cost of an
+            # *unaliased* output. Measured aliased-vs-not in
+            # kernels/tests/probe_kv_alias_f4.py: 3/3 writes land vs 0/3, equal HBM,
+            # equal wall time, operand_output_aliases={0:1} vs {}.
             #
-            # ONE DISTINCT TENSOR PER MUTATION is the only form measured to be
-            # safe, and learning that cost a silent 60%-empty cache (BENCHMARK.md
-            # 2026-08-05). A compiled segment holds 2-3 GQA layers, so the buffers
-            # are allocated per layer in prefill_bucketed. What was measured, on
-            # device, at probe scale:
+            # ONE DISTINCT TENSOR PER MUTATION is kept as belt-and-braces (and is
+            # asserted by _assert_distinct_storage), because it is what made the
+            # unaliased path work and learning it cost a silent 60%-empty cache
+            # (BENCHMARK.md 2026-08-05). A compiled segment holds 2-3 GQA layers, so
+            # the buffers are allocated per layer in prefill_bucketed. What was
+            # measured on device WITHOUT the alias, at probe scale:
             #  * one mutation of a buffer per graph always lands, whole-tensor
             #    reshape or sliced view alike;
             #  * N mutations through N DISTINCT VIEWS of one base lose all N (this
@@ -2266,7 +2278,7 @@ class StaticDecode35B(nn.Module):
             # test_gqa_rope_kv_multicall_probe.py holds all three.
             cache_k = kv_k[gi].reshape(B * self.max_seq_len, HD)
             cache_v = kv_v[gi].reshape(B * self.max_seq_len, HD)
-            q_f, k_active = torch.ops.gqa35b.rope_kv_dynamic(
+            q_f, k_active, ck_out, cv_out = torch.ops.gqa35b.rope_kv_dynamic(
                 query.permute(0, 2, 1, 3).contiguous(),
                 key[:, :, 0].contiguous(),
                 value[:, :, 0].contiguous(),
@@ -2278,19 +2290,18 @@ class StaticDecode35B(nn.Module):
                 0,              # per-layer buffer -> group_index is always 0
                 1,              # ... and it holds exactly one group
             )
-            # Read the cache back in-graph, the same shape as the static branch
-            # below. NOT GUARANTEED, and do not copy this pattern without gating
-            # it: an in-graph read of a mutated buffer is not ordered against the
-            # mutation. Two byte-identical bodies differing only in graph-OUTPUT
-            # ORDER give opposite answers -- read emitted before the op's own
-            # return value sees the pre-mutation zeros, after it sees the write
+            # Read the cache back through the op's OWN RETURNS, not through
+            # kv_k[gi]. Both name the same buffer -- the returns are aliased, not
+            # copies -- but only this form is ordered against the write. An
+            # in-graph read of a mutated buffer is not: two byte-identical bodies
+            # differing only in graph-OUTPUT ORDER give opposite answers, the read
+            # emitted before the op's return value seeing pre-mutation zeros
             # (measured 2026-08-05, characterized in
-            # test_gqa_rope_kv_multicall_probe.py). This site is in the working
-            # order: its logits are bit-exact against the pre-2026-07-30 path that
-            # consumed the kernel's *returned* k_filled, which is what makes it
-            # safe today. That is why PREFILL_KV_MAP=1 occupancy stays the gate.
-            k_filled = kv_k[gi][:, 0]
-            v_filled = kv_v[gi][:, 0]
+            # test_gqa_rope_kv_multicall_probe.py). The previous form here
+            # (`kv_k[gi][:, 0]`) happened to sit in the working order; this one
+            # does not depend on that.
+            k_filled = ck_out.reshape(B, self.max_seq_len, HD)
+            v_filled = cv_out.reshape(B, self.max_seq_len, HD)
             qb = q_base.float()
         else:
             # Static offset path retained for eager controls and old compile caches.

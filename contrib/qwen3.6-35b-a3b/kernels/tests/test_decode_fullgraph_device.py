@@ -708,6 +708,26 @@ def capture(args):
             print(f"rank={rank} compiled; skipped incompatible target load")
             return
 
+    # Postcondition, not a diagnostic: every GQA layer's cache must hold
+    # something after stepping. The state starts at zeros here (unless
+    # --initial-state-dir), so any group still empty means its in-place KV
+    # write was dropped and that layer attended over zeros -- the 2026-08
+    # defect, which stayed all-finite and token-identical and so is invisible
+    # to every other assertion in this file.
+    # unbind(0) matters: the KV state is ONE stacked [NUM_GQA, ...] tensor, and
+    # _assert_kv_occupancy treats a bare tensor as a single group -- which would
+    # pass whenever any one layer wrote. Per-layer slices are what localize it.
+    kv_rows = (
+        S._assert_kv_occupancy(
+            list(state[2].cpu().unbind(0)), f"FULLGRAPH kv_k rank={rank}"
+        ),
+        S._assert_kv_occupancy(
+            list(state[3].cpu().unbind(0)), f"FULLGRAPH kv_v rank={rank}"
+        ),
+    )
+    if rank == 0 and kv_rows[0] is not None:
+        print(f"kv occupancy per_group_nonzero_rows k={kv_rows[0]} v={kv_rows[1]}")
+
     output_names = NAMES + (
         DIAGNOSTIC_NAMES if diagnostic_layers else ()
     )

@@ -100,10 +100,19 @@ def nki_gqa_rope_kv_dynamic(
 
     kv_key/kv_value are the WHOLE flattened cache for every layer, with this
     layer picked out by the static group_index -- the same convention as
-    gqa35b::tail_stateful (gqa_tail_35b.py:107). Passing a per-layer slice
-    instead would make the buffer a sliced view at the graph boundary, and an
-    in-place write to such a view is only carried back if the tensor is also
-    returned as an op output (which costs a full-cache materialization).
+    gqa35b::tail_stateful (gqa_tail_35b.py:107).
+
+    They are RETURNED as well as mutated, which is what makes the write-back
+    correct rather than lucky: NKI emits `input_output_aliases` only for inputs a
+    kernel returns, and that map is what torch-neuronx turns into the
+    `ctx.replace`/`commit_update`/`sync` that models the mutation
+    (torch_neuronx/nki_hop.py:391-398). Without it `mutates_args` reaches only the
+    PyTorch-level schema and the write survives or not depending on whether the
+    backend happens to reorder it. Measured, kernels/tests/probe_kv_alias_f4.py:
+    aliased 3/3 writes land where unaliased lands 0/3, at equal HBM and equal
+    wall time. An aliased return is the same buffer, so it does NOT materialize
+    the cache -- that cost applies to an unaliased output, which is what the
+    2026-07 version of this comment was actually about.
     """
     batch_size = query.shape[0]
     q_heads = query.shape[1]
@@ -188,11 +197,19 @@ def nki_gqa_rope_kv_dynamic(
                 src=value[batch, row : row + TILE, :],
             )
 
-    # Do NOT return kv_key/kv_value. They are mutated in place (declared in the
-    # op's mutates_args), and re-exporting them as graph outputs makes the
-    # backend materialize both full [B*KMAX, 256] caches on every call -- 1.74 GB
-    # of HBM traffic per 10-layer region for a ~2 MB payload of changed rows
-    # (~20x write amplification at 1024 of 20480 rows). The caller reads the
-    # aliased cache tensors directly instead; see test_kv_stateful_alias_device.py
-    # for the validated mutate-then-read pattern.
-    return query_out, key_out
+    # RETURN the caches. This is what declares the aliasing (see the docstring):
+    # returning a mutated input is the only way to get NKI to report
+    # input_output_aliases, and without that map the in-place write has no
+    # representation in the emitted graph at all.
+    #
+    # This is NOT the "materialize both full caches" cost the pre-2026-08-05
+    # comment here warned about. That cost is real for an *unaliased* output,
+    # which allocates a fresh [B*KMAX, 256] buffer and copies into it. An aliased
+    # output is by definition the same buffer as the input: no allocation, no
+    # copy. probe_kv_alias_f4.py measures it at equal HBM and equal wall time.
+    #
+    # Callers should read the cache back through THESE returns rather than
+    # through their own view of the buffer -- an in-graph read of a mutated
+    # buffer is not ordered against the mutation, but a read of the op's own
+    # return value is.
+    return query_out, key_out, kv_key, kv_value
