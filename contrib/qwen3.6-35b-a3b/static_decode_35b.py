@@ -490,6 +490,41 @@ def functional_all_reduce(x, op, group):
     return _functional_all_reduce(x, op, group)
 
 
+# ─── State-reporting helpers (a KV cache may be one tensor or a per-layer list) ─
+# The GQA caches are held as a LIST of per-layer buffers wherever a custom op
+# mutates them in place, because this stack carries back only the first in-place
+# mutation of a given buffer per traced graph. Diagnostics therefore have to
+# accept either layout without materialising the [NUM_GQA,...] stack.
+def _state_parts(tensor_or_list):
+    if isinstance(tensor_or_list, (list, tuple)):
+        return list(tensor_or_list)
+    return [tensor_or_list]
+
+
+def _state_finite(tensor_or_list):
+    return all(bool(torch.isfinite(t).all()) for t in _state_parts(tensor_or_list))
+
+
+def _state_sum(tensor_or_list):
+    return sum(float(t.detach().float().sum()) for t in _state_parts(tensor_or_list))
+
+
+def _state_norm(tensor_or_list):
+    sq = sum(
+        float(torch.linalg.vector_norm(t.detach().float())) ** 2
+        for t in _state_parts(tensor_or_list)
+    )
+    return math.sqrt(sq)
+
+
+def _state_nz(tensor_or_list):
+    return sum(int((t != 0).sum()) for t in _state_parts(tensor_or_list))
+
+
+def _state_numel(tensor_or_list):
+    return sum(int(t.numel()) for t in _state_parts(tensor_or_list))
+
+
 # ─── Norm / RoPE primitives (identical math to the 27B) ──────────────────────
 def rms_norm(x, weight):
     """RMSNorm with Qwen3.5 residual weight: (1 + weight) * normalize(x)."""
@@ -704,23 +739,32 @@ class StaticDecode35B(nn.Module):
                 raise RuntimeError(
                     "GQA_STATEFUL_KV requires one local KV head per rank"
                 )
+            # ONE BUFFER PER GQA LAYER — not a single [NUM_GQA,...] tensor.
+            # This stack carries back only the FIRST in-place mutation of a given
+            # buffer per traced graph; every later mutation of that same buffer is
+            # silently dropped. Under DECODE_FULLGRAPH=1 all NUM_GQA GQA layers
+            # share one graph, so a shared cache tensor kept only group 0's writes
+            # (measured: per_group_nz=[98304,0,0,0,0,0,0,0,0,0] at 40L/BS=128) and
+            # the other nine layers attended over zeros. Separate buffers mean each
+            # graph mutates each buffer exactly once. The buffer must also be passed
+            # WHOLE — a whole-tensor reshape aliases, a sliced view does not.
             cache_shape = (
-                D.NUM_GQA,
                 batch_size,
                 self.nkv,
                 max_seq_len,
                 D.GQA_HEAD_DIM,
             )
-            self.register_buffer(
-                "decode_kv_k",
-                torch.zeros(cache_shape, dtype=torch.bfloat16),
-                persistent=False,
-            )
-            self.register_buffer(
-                "decode_kv_v",
-                torch.zeros(cache_shape, dtype=torch.bfloat16),
-                persistent=False,
-            )
+            for gi in range(D.NUM_GQA):
+                self.register_buffer(
+                    f"decode_kv_k{gi}",
+                    torch.zeros(cache_shape, dtype=torch.bfloat16),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    f"decode_kv_v{gi}",
+                    torch.zeros(cache_shape, dtype=torch.bfloat16),
+                    persistent=False,
+                )
         # Layer segments for graph-split compile (default: single segment = whole
         # model). setup_segments() splits the layer range so each compiled NEFF
         # stays under the neuronx-cc PGTiling collective limit.
@@ -1293,8 +1337,8 @@ class StaticDecode35B(nn.Module):
             dn_states = deltanet_states.clone()
             cv_states = conv_states.clone()
         if USE_GQA_STATEFUL_KV:
-            kv_k = self.decode_kv_k
-            kv_v = self.decode_kv_v
+            kv_k = self.decode_kv_bufs("k")
+            kv_v = self.decode_kv_bufs("v")
         else:
             kv_k = kv_cache_k.clone()
             kv_v = kv_cache_v.clone()
@@ -1373,19 +1417,43 @@ class StaticDecode35B(nn.Module):
         next_id = logits.argmax(-1).to(torch.long)
         return logits, next_id, *outputs[1:]
 
+    def decode_kv_bufs(self, which):
+        """The per-GQA-layer aliased K (or V) decode caches, indexable by `gi`.
+
+        A list, not a stacked tensor: `kv[gi]` must hand the kernel a WHOLE
+        buffer so the in-place write aliases back, and each buffer must be
+        distinct so one traced graph never mutates the same buffer twice.
+        """
+        return [getattr(self, f"decode_kv_{which}{gi}") for gi in range(D.NUM_GQA)]
+
+    def decode_kv_stacked(self, which):
+        """Eager-only [NUM_GQA,B,NKV,S,HD] materialisation for diagnostics/compare.
+
+        Allocates a full copy — never call this inside a traced graph.
+        """
+        return torch.stack(self.decode_kv_bufs(which), dim=0)
+
+    def load_decode_kv(self, kv_k, kv_v):
+        """Seed the per-layer decode caches from prefill's [NUM_GQA,...] output."""
+        for gi in range(D.NUM_GQA):
+            getattr(self, f"decode_kv_k{gi}").copy_(kv_k[gi])
+            getattr(self, f"decode_kv_v{gi}").copy_(kv_v[gi])
+
     def decode_step_stateful(self, input_id, position, deltanet_states, conv_states):
         """Decode while carrying aliased K/V buffers outside the public result."""
         if not USE_GQA_STATEFUL_KV:
             raise RuntimeError(
                 "decode_step_stateful requires GQA_STATEFUL_KV=1"
             )
+        # K/V are module state under this flag; decode_step re-reads them from
+        # decode_kv_bufs() and ignores these positional slots.
         outputs = self.decode_step(
             input_id,
             position,
             deltanet_states,
             conv_states,
-            self.decode_kv_k,
-            self.decode_kv_v,
+            None,
+            None,
         )
         return outputs[0], outputs[1], outputs[2], outputs[3]
 
@@ -1430,8 +1498,8 @@ class StaticDecode35B(nn.Module):
         else:
             dn_states = deltanet_states.clone()
             cv_states = conv_states.clone()
-        kv_k = self.decode_kv_k
-        kv_v = self.decode_kv_v
+        kv_k = self.decode_kv_bufs("k")
+        kv_v = self.decode_kv_bufs("v")
         cos = self.rope_cos.squeeze(0).squeeze(0).index_select(
             0, position.unsqueeze(0)
         ).unsqueeze(0).unsqueeze(0)
@@ -1794,8 +1862,8 @@ class StaticDecode35B(nn.Module):
             query = query.unsqueeze(2)                   # [B,QH,1,HD]
             query, key = apply_rope(query, key, cos, sin)
             query = query.to(x.dtype).squeeze(2).reshape(B, QH, HD)
-        key_b = key.squeeze(2).reshape(B, NKV, HD).to(kv_k.dtype)
-        value_b = value.reshape(B, NKV, HD).to(kv_v.dtype)
+        key_b = key.squeeze(2).reshape(B, NKV, HD).to(kv_k[gi].dtype)
+        value_b = value.reshape(B, NKV, HD).to(kv_v[gi].dtype)
 
         # KV cache: kv_k/v[gi] = [B, NKV, max_seq, HD].
         if not USE_GQA_STATEFUL_KV:
@@ -1818,8 +1886,13 @@ class StaticDecode35B(nn.Module):
             # head — the kernel's [B*S,HD] layout. Pass PRE-NORM query, raw gate.
             S = self.max_seq_len
             if USE_GQA_STATEFUL_KV:
-                cache_k_arg = kv_k.reshape(D.NUM_GQA * B * S, HD)
-                cache_v_arg = kv_v.reshape(D.NUM_GQA * B * S, HD)
+                # WHOLE per-layer buffer (a whole-tensor reshape aliases; a slice
+                # of a shared [NUM_GQA,...] tensor does not, and a second write to
+                # a shared buffer in one graph is dropped outright). The kernel's
+                # row base is (layer_index * B + b) * S, so a per-layer buffer is
+                # addressed with layer_index=0.
+                cache_k_arg = kv_k[gi].reshape(B * S, HD)
+                cache_v_arg = kv_v[gi].reshape(B * S, HD)
             else:
                 cache_k_arg = cached_k.reshape(B * S, HD).float()
                 cache_v_arg = cached_v.reshape(B * S, HD).float()
@@ -1839,7 +1912,7 @@ class StaticDecode35B(nn.Module):
                     key_b.reshape(B, HD),
                     value_b.reshape(B, HD),
                     position.reshape(1, 1).to(torch.int32),
-                    gi,
+                    0,          # per-layer buffer -> layer_index is always 0
                 )
             else:
                 attn_flat = torch.ops.gqa35b.tail(*args)
@@ -2084,9 +2157,23 @@ class StaticDecode35B(nn.Module):
         key = rms_norm(key, k_norm_w)
 
         if USE_GQA_DYNAMIC_ROPE_KV:
-            cache_k = kv_k[gi, :, 0].reshape(B * self.max_seq_len, HD)
-            cache_v = kv_v[gi, :, 0].reshape(B * self.max_seq_len, HD)
-            q_f, k_active, k_filled, v_filled = torch.ops.gqa35b.rope_kv_dynamic(
+            # Pass THIS LAYER'S OWN buffer, whole. The kernel mutates it in place
+            # and does not return it: returning the cache re-exported the full
+            # [B*max_seq_len, HD] buffers as graph outputs, 1.74 GB of HBM
+            # traffic per 10-layer region (21.7%) to publish 1024 changed rows.
+            #
+            # Two constraints on how the buffer is handed over, both of which cost
+            # a silent 60%-empty cache to learn (see BENCHMARK.md 2026-08-05):
+            #  1. A whole-tensor reshape aliases the buffer, so the in-place write
+            #     lands; a *sliced* view does not (the write is dropped unless the
+            #     tensor is also returned) -- test_gqa_rope_kv_alias_probe.py.
+            #  2. Only the FIRST in-place mutation of a given buffer per traced
+            #     graph is carried back. Hence one buffer per GQA layer, allocated
+            #     in prefill_bucketed -- a shared [NUM_GQA,...] tensor kept only
+            #     the first GQA layer's write in each compiled segment.
+            cache_k = kv_k[gi].reshape(B * self.max_seq_len, HD)
+            cache_v = kv_v[gi].reshape(B * self.max_seq_len, HD)
+            q_f, k_active = torch.ops.gqa35b.rope_kv_dynamic(
                 query.permute(0, 2, 1, 3).contiguous(),
                 key[:, :, 0].contiguous(),
                 value[:, :, 0].contiguous(),
@@ -2095,9 +2182,13 @@ class StaticDecode35B(nn.Module):
                 cache_k,
                 cache_v,
                 q_base,
+                0,              # per-layer buffer -> group_index is always 0
+                1,              # ... and it holds exactly one group
             )
-            k_filled = k_filled.reshape(B, self.max_seq_len, HD)
-            v_filled = v_filled.reshape(B, self.max_seq_len, HD)
+            # These reads follow the mutating op, so functionalization orders
+            # them after it -- the same shape as the static branch below.
+            k_filled = kv_k[gi][:, 0]
+            v_filled = kv_v[gi][:, 0]
             qb = q_base.float()
         else:
             # Static offset path retained for eager controls and old compile caches.
@@ -2109,13 +2200,13 @@ class StaticDecode35B(nn.Module):
 
             # scatter_ was observed to miscompile here; index_copy_ is safe when
             # positions are static.
-            key_t = key.permute(0, 2, 1, 3).to(kv_k.dtype)
-            val_t = value.permute(0, 2, 1, 3).to(kv_v.dtype)
+            key_t = key.permute(0, 2, 1, 3).to(kv_k[gi].dtype)
+            val_t = value.permute(0, 2, 1, 3).to(kv_v[gi].dtype)
             kv_k[gi].index_copy_(2, positions, key_t)
             kv_v[gi].index_copy_(2, positions, val_t)
             q_f = query.permute(0, 2, 1, 3).reshape(B * QH, chunk, HD).float().contiguous()
-            k_filled = kv_k[gi, :, 0]
-            v_filled = kv_v[gi, :, 0]
+            k_filled = kv_k[gi][:, 0]
+            v_filled = kv_v[gi][:, 0]
             qb = torch.full((1, 1), float(q_base), dtype=torch.float32, device=x.device)
 
         if USE_GQA_CTE_PREFILL:
@@ -2218,13 +2309,43 @@ class StaticDecode35B(nn.Module):
         B, S = input_ids.shape
         dn_states = deltanet_states.clone()
         cv_states = conv_states.clone()
-        kv_k = kv_cache_k.clone()
-        kv_v = kv_cache_v.clone()
+        if USE_GQA_DYNAMIC_ROPE_KV:
+            # ONE BUFFER PER GQA LAYER. rope_kv_dynamic mutates the cache in place
+            # and does not return it; with a single shared [NUM_GQA,...] tensor only
+            # the FIRST GQA layer per traced segment kept its write, so at
+            # --prefill-splits 4 six of ten layers never populated the cache
+            # (measured kv_k occupancy 40%). Separate buffers make correctness
+            # independent of the split geometry.
+            #
+            # `.clone()`, NOT `.contiguous()`: a dim-0 slice of a contiguous
+            # tensor is already contiguous, so `.contiguous()` returns the view
+            # unchanged and all NUM_GQA "buffers" would still share one storage —
+            # exactly the condition the fix exists to break. Each buffer must own
+            # its storage. Total bytes are unchanged (this replaces the
+            # `kv_cache_k.clone()` the non-dynamic branch already does); the
+            # caller reads the returned list, not its input tensor.
+            kv_k = [kv_cache_k[gi].clone() for gi in range(D.NUM_GQA)]
+            kv_v = [kv_cache_v[gi].clone() for gi in range(D.NUM_GQA)]
+        else:
+            kv_k = kv_cache_k.clone()
+            kv_v = kv_cache_v.clone()
         n_chunks = (S + chunk - 1) // chunk
         dev = input_ids.device
 
         if compile_splits < 1 or compile_splits > D.NUM_LAYERS:
             raise ValueError("compile_splits must be in [1, NUM_LAYERS]")
+        # Every `segment` closure below shares ONE code object, and dynamo keys its
+        # cache per code object, so N segments = N cache entries against the default
+        # limit of 8. At compile_splits > 8 that raised FailOnRecompileLimitHit
+        # (fullgraph=True) rather than anything to do with the graphs themselves.
+        if compile_splits > 1:
+            import torch._dynamo
+            want = max(16, 2 * compile_splits + 4)
+            _dyn = torch._dynamo.config
+            _dyn.cache_size_limit = max(_dyn.cache_size_limit, want)
+            _dyn.accumulated_cache_size_limit = max(
+                getattr(_dyn, "accumulated_cache_size_limit", 0), 4 * want
+            )
         if compile_chunk and DN_CAPTURE_DIR:
             raise ValueError("DN_CAPTURE_DIR is supported only with --bucket-compile 0")
 
@@ -2266,6 +2387,9 @@ class StaticDecode35B(nn.Module):
         last_hidden = None
         last_valid = 0
         trace_finite = os.environ.get("PREFILL_TRACE_FINITE", "0") == "1"
+        # KV is ~2 GB and would be copied to host at all 80 (chunk, segment) points,
+        # so it gets its own flag rather than riding along with the cheap tensors.
+        trace_kv = os.environ.get("PREFILL_TRACE_KV", "0") == "1"
 
         def report_finite(chunk_idx, segment_idx):
             if not trace_finite or self.rank != 0:
@@ -2275,16 +2399,30 @@ class StaticDecode35B(nn.Module):
                 "dn": dn_states,
                 "conv": cv_states,
             }
+            if trace_kv:
+                tensors["kv_k"] = kv_k
+                tensors["kv_v"] = kv_v
             status = []
             for name, tensor in tensors.items():
-                host = tensor.detach().cpu().float()
+                host = torch.cat(
+                    [t.detach().cpu().float().reshape(-1) for t in _state_parts(tensor)]
+                )
                 finite = torch.isfinite(host)
+                # sum and norm alongside max: when comparing two builds, max is a
+                # single order statistic and routinely matches while the underlying
+                # distribution has already drifted. sum (signed, cancelling) and
+                # norm (unsigned, accumulating) are what localise the divergence to
+                # a chunk index (recurrence depth) and a segment index (layer depth).
                 status.append(
                     f"{name}={bool(finite.all())}"
                     f"/max={float(host[finite].abs().max()) if bool(finite.any()) else float('nan'):.4e}"
+                    f"/sum={float(host.sum()):.8e}"
+                    f"/norm={float(torch.linalg.vector_norm(host)):.8e}"
                 )
+            # N in the line: under --prefill-bench-sweep the chunk index restarts
+            # for every prompt length, so the trace is ambiguous without it.
             print(
-                f"  PREFILL finite chunk={chunk_idx} segment={segment_idx}: "
+                f"  PREFILL finite N={S} chunk={chunk_idx} segment={segment_idx}: "
                 + " ".join(status),
                 flush=True,
             )
@@ -2649,6 +2787,12 @@ def main():
     ap.add_argument("--prompt-ids", type=str, default="",
                     help="Comma-separated prompt token ids. Runs prefill then decodes "
                          "(coherence check). Empty = seed token 100 at position 0.")
+    ap.add_argument("--prefill-bench-sweep", type=str, default="",
+                    help="Comma-separated extra prompt lengths to bench in the same "
+                         "process after --prefill-bench, e.g. '1024,4096,8192'. Reuses "
+                         "the same compiled graphs (N is not a traced shape), so a "
+                         "sweep costs no extra compiles. Values above --max-seq-len "
+                         "are skipped.")
     ap.add_argument("--prefill-bench", type=int, default=0,
                     help="If >0, time a prefill of a synthetic N-token prompt "
                          "(prompt-ingest throughput) and exit. Reports tok/s.")
@@ -2757,15 +2901,13 @@ def main():
     dn_states = torch.zeros(D.NUM_DELTANET, B, vh * KD, VD, dtype=dtype, device=device)
     conv_states = torch.zeros(D.NUM_DELTANET, B, qkv_dim, D.DN_CONV_KERNEL - 1, dtype=dtype, device=device)
     nkv = max(1, D.GQA_KV_HEADS // world_size)
-    if USE_GQA_STATEFUL_KV:
-        kv_k = mod.decode_kv_k
-        kv_v = mod.decode_kv_v
-    else:
-        kv_k = torch.zeros(
-            D.NUM_GQA, B, nkv, args.max_seq_len, D.GQA_HEAD_DIM,
-            dtype=dtype, device=device,
-        )
-        kv_v = torch.zeros_like(kv_k)
+    # Prefill always works on a single [NUM_GQA,...] tensor; under stateful decode
+    # it is copied into the per-layer decode buffers via mod.load_decode_kv().
+    kv_k = torch.zeros(
+        D.NUM_GQA, B, nkv, args.max_seq_len, D.GQA_HEAD_DIM,
+        dtype=dtype, device=device,
+    )
+    kv_v = torch.zeros_like(kv_k)
 
     compiled_decode_step = None
     if not args.skip_compile and not args.cpu and args.prefill_bench == 0:
@@ -2799,7 +2941,7 @@ def main():
                 outputs = compiled_decode_step(input_id, pos, dns, cvs)
             else:
                 outputs = mod.decode_step_stateful(input_id, pos, dns, cvs)
-            return *outputs, mod.decode_kv_k, mod.decode_kv_v
+            return *outputs, mod.decode_kv_bufs("k"), mod.decode_kv_bufs("v")
         if compiled_decode_step is not None:
             return compiled_decode_step(input_id, pos, dns, cvs, keys, values)
         outputs = mod(input_id, pos, dns, cvs, keys, values)
@@ -2814,56 +2956,96 @@ def main():
     # prompt (prompt-ingest tok/s = TTFT regime). Prefill is eager; GQA prefill
     # is pure-torch full [S,S] causal, DeltaNet prefill is the chunked NKI kernel.
     if args.prefill_bench > 0:
-        N = args.prefill_bench
-        base_pid = torch.arange(N, dtype=torch.long) % D.VOCAB
-        # Distinct rows exercise KV/state isolation while retaining homogeneous
-        # sequence lengths and the same dynamic bucket offsets.
-        pid = (
-            base_pid.unsqueeze(0) + torch.arange(B).unsqueeze(1)
-        ) % D.VOCAB
-        pid = pid.to(device)
-        bchunk = args.bucket_chunk
-        use_bucket = bchunk > 0
-        # warmup (compiles any lazily-traced prefill graphs) + timed run
-        for w in range(2):
-            if not args.cpu:
-                dist.barrier()
-            t0 = time.time()
-            if use_bucket:
-                outputs = mod.prefill_bucketed(
-                    pid, dn_states, conv_states, kv_k, kv_v,
-                    chunk=bchunk,
-                    compile_chunk=(args.bucket_compile == 1),
-                    compile_splits=args.prefill_splits,
-                )
-            else:
-                outputs = mod.prefill(pid, dn_states, conv_states, kv_k, kv_v)
-            logits = outputs[0]
-            _ = int(logits[0].argmax())   # force materialization
-            if not args.cpu:
-                dist.barrier()
-            dt = time.time() - t0
-            if rank == 0:
-                cc = "c" if args.bucket_compile == 1 else "e"
-                mode = f"bucket{bchunk}{cc}" if use_bucket else "eager"
-                tag = "warmup" if w == 0 else "TIMED "
-                print(f"  PREFILL {tag} BS={B} N={N} ({mode}): {dt*1000:.1f} ms  |  {B*N/dt:.1f} aggregate prompt tok/s"
-                      f"{' (incl compile)' if w == 0 else ''}")
-                if os.environ.get("PREFILL_FINGERPRINT", "0") == "1":
-                    lf = logits.float()
-                    top = torch.topk(lf[0], 5).indices
-                    finite_names = ("logits", "deltanet", "conv", "kv_k", "kv_v")
-                    finite = ",".join(
-                        f"{name}={bool(torch.isfinite(tensor).all())}"
-                        for name, tensor in zip(finite_names, outputs)
+        # --prefill-bench-sweep benches several prompt lengths in ONE process.
+        # This is free of extra compiles: prefill_bucketed traces a single
+        # fixed `chunk`-sized graph and invokes it ceil(N/chunk) times, with
+        # q_base/valid_len as runtime scalars under GQA_DYNAMIC_ROPE_KV. So N
+        # changes only the invocation count, never a shape -- provided
+        # --max-seq-len is held fixed, since the KV buffer extent IS baked into
+        # the graph. Sweeping in-process matters because weight load+shard is
+        # minutes, and re-launching per N would dominate the measurement.
+        bench_ns = [args.prefill_bench]
+        if args.prefill_bench_sweep:
+            bench_ns += [
+                int(x) for x in args.prefill_bench_sweep.split(",") if x.strip()
+            ]
+        for N in bench_ns:
+            if N > args.max_seq_len:
+                if rank == 0:
+                    print(f"  PREFILL skip N={N}: exceeds --max-seq-len "
+                          f"{args.max_seq_len} (KV extent is compiled in)")
+                continue
+            base_pid = torch.arange(N, dtype=torch.long) % D.VOCAB
+            # Distinct rows exercise KV/state isolation while retaining homogeneous
+            # sequence lengths and the same dynamic bucket offsets.
+            pid = (
+                base_pid.unsqueeze(0) + torch.arange(B).unsqueeze(1)
+            ) % D.VOCAB
+            pid = pid.to(device)
+            bchunk = args.bucket_chunk
+            use_bucket = bchunk > 0
+            # warmup (compiles any lazily-traced prefill graphs) + timed run
+            for w in range(2):
+                if not args.cpu:
+                    dist.barrier()
+                t0 = time.time()
+                if use_bucket:
+                    outputs = mod.prefill_bucketed(
+                        pid, dn_states, conv_states, kv_k, kv_v,
+                        chunk=bchunk,
+                        compile_chunk=(args.bucket_compile == 1),
+                        compile_splits=args.prefill_splits,
                     )
-                    print(
-                        "  PREFILL fingerprint:"
-                        f" sum={float(lf.sum()):.8e}"
-                        f" norm={float(torch.linalg.vector_norm(lf)):.8e}"
-                        f" top5={[int(v) for v in top]}"
-                        f" finite[{finite}]"
-                    )
+                else:
+                    outputs = mod.prefill(pid, dn_states, conv_states, kv_k, kv_v)
+                logits = outputs[0]
+                _ = int(logits[0].argmax())   # force materialization
+                if not args.cpu:
+                    dist.barrier()
+                dt = time.time() - t0
+                if rank == 0:
+                    cc = "c" if args.bucket_compile == 1 else "e"
+                    mode = f"bucket{bchunk}{cc}" if use_bucket else "eager"
+                    tag = "warmup" if w == 0 else "TIMED "
+                    print(f"  PREFILL {tag} BS={B} N={N} ({mode}): {dt*1000:.1f} ms  |  {B*N/dt:.1f} aggregate prompt tok/s"
+                          f"{' (incl compile)' if w == 0 else ''}")
+                    if os.environ.get("PREFILL_FINGERPRINT", "0") == "1":
+                        lf = logits.float()
+                        top = torch.topk(lf[0], 5).indices
+                        finite_names = ("logits", "deltanet", "conv", "kv_k", "kv_v")
+                        finite = ",".join(
+                            f"{name}={_state_finite(tensor)}"
+                            for name, tensor in zip(finite_names, outputs)
+                        )
+                        print(
+                            f"  PREFILL fingerprint N={N}:"
+                            f" sum={float(lf.sum()):.8e}"
+                            f" norm={float(torch.linalg.vector_norm(lf)):.8e}"
+                            f" top5={[int(v) for v in top]}"
+                            f" finite[{finite}]"
+                        )
+                        # Occupancy, not just finiteness: a 60%-empty KV cache
+                        # produced an all-finite, token-identical run. sum/norm/nz
+                        # per carried state tensor is the gate that catches it.
+                        state = " ".join(
+                            f"{name}[sum={_state_sum(t):.8e},"
+                            f"norm={_state_norm(t):.8e},"
+                            f"nz={_state_nz(t)}/{_state_numel(t)}]"
+                            for name, t in zip(finite_names, outputs)
+                        )
+                        print(f"  PREFILL state N={N}: {state}", flush=True)
+                        if os.environ.get("PREFILL_KV_MAP", "0") == "1":
+                            # Per-GQA-layer occupancy. Under the shared-cache bug
+                            # this read [10485760,0,10485759,0,0,10485760,0,
+                            # 10485760,0,0] -- only the first GQA layer of each
+                            # compiled segment. A correct run is uniformly full.
+                            print(
+                                f"  PREFILL kvmap N={N} per_group_nz="
+                                f"{[int((t != 0).sum()) for t in _state_parts(outputs[3])]}"
+                                f" per_group_numel="
+                                f"{[int(t.numel()) for t in _state_parts(outputs[3])]}",
+                                flush=True,
+                            )
         return
 
     # Iterative-prefill coherence generation (PREFILL_GEN=1 + --prompt-ids): generate
@@ -2907,10 +3089,22 @@ def main():
             logits, dn_states, conv_states, kv_k, kv_v = mod.prefill(
                 in_t, dn_states, conv_states, kv_k, kv_v)
         if USE_GQA_STATEFUL_KV:
-            mod.decode_kv_k.copy_(kv_k)
-            mod.decode_kv_v.copy_(kv_v)
-            kv_k = mod.decode_kv_k
-            kv_v = mod.decode_kv_v
+            mod.load_decode_kv(kv_k, kv_v)
+            kv_k = mod.decode_kv_bufs("k")
+            kv_v = mod.decode_kv_bufs("v")
+        else:
+            # Non-stateful decode clones a single [NUM_GQA,...] tensor, but the
+            # dynamic-rope-KV prefill hands back per-layer buffers.
+            if isinstance(kv_k, list):
+                kv_k = torch.stack(kv_k, 0)
+                kv_v = torch.stack(kv_v, 0)
+        if os.environ.get("PREFILL_KV_MAP", "0") == "1" and rank == 0:
+            print(
+                f"  PREFILL kvmap per_group_nz="
+                f"{[int((t != 0).sum()) for t in _state_parts(kv_k)]}"
+                f" per_group_numel={[int(t.numel()) for t in _state_parts(kv_k)]}",
+                flush=True,
+            )
         nid0 = logits[0].argmax().to(torch.long)
         next_id = nid0.reshape(1).expand(B).contiguous()
         gen.append(next_id)
@@ -2997,6 +3191,15 @@ def main():
         if B > 1:
             last = [int(g[B - 1].item()) for g in gen]
             print(f"  gen hash(row{B-1}): {_hl.md5(str(last).encode()).hexdigest()[:12]}")
+        # A matching gen hash does NOT prove the KV cache is being written: two runs
+        # that share a dropped-write defect agree with each other. Under
+        # GQA_STATEFUL_KV each GQA layer must show non-zero rows.
+        if USE_GQA_STATEFUL_KV and os.environ.get("DECODE_KV_MAP", "0") == "1":
+            bufs = mod.decode_kv_bufs("k")
+            print(f"  DECODE kvmap groups={len(bufs)} shape={tuple(bufs[0].shape)}"
+                  f" per_group_nz={[int((t != 0).sum()) for t in bufs]}"
+                  f" per_group_nonzero_rows="
+                  f"{[int((t.reshape(-1, t.shape[-1]) != 0).any(dim=-1).sum()) for t in bufs]}")
         print("  DONE")
 
 

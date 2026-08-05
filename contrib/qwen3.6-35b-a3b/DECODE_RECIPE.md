@@ -67,6 +67,26 @@ docker run --rm --privileged --device=/dev/neuron0 \
 The compiled NEFF persists in `QWEN35_COMPILER_CACHE_DIR` (mounted `/ccache`), so
 re-runs are cache-hot (seconds, no recompile).
 
+> **Gate `GQA_STATEFUL_KV=1` on cache occupancy, not on `gen hash`.** Until
+> 2026-08-05 this flag combination wrote **only GQA group 0** — the ten GQA layers
+> share one traced graph under `DECODE_FULLGRAPH=1`, and this stack carries back
+> only the first in-place mutation of a given buffer per graph, so nine of ten
+> layers attended over zeros (`per_group_nz=[98304,0,0,0,0,0,0,0,0,0]`) while
+> producing finite, plausible output. Fixed by giving each GQA layer its own cache
+> buffer. Add `-e DECODE_KV_MAP=1` and require **all ten groups non-zero**:
+> ```
+> DECODE kvmap per_group_nz = [98304] * 10        # correct: every group written
+> ```
+> Every decode number measured with this flag pair before 2026-08-05 is invalid,
+> including the +5.5% originally attributed to stateful KV. See `BENCHMARK.md`.
+>
+> Post-fix reference at 40 layers / BS=128 / seq=256 / `--optlevel 1` / beta-4:
+> `per_group_nonzero_rows=[384]×10`, **TPOT 393.56 ms/token, 325.2 tok/s**. The fix is
+> correctness-only — 393.56 vs the broken 395.95 ms is noise, because masked attention
+> costs the same over a zero-filled cache as over a real one. Do not gate on `gen
+> hash`: it was **identical** across the fix (`0cc59fb25112`) despite nine of ten
+> attention inputs changing from zeros to real K/V.
+
 **Kicking it off headless** (compile is long; don't hold an interactive
 session): wrap the above in a script, `nohup` it, and write to a log:
 ```bash

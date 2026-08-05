@@ -20,8 +20,16 @@ enabled, a single 40-layer prefill region also cross-compiles. The fastest
 prefill runs at **TP=8/LNC=1** once both replicated `[V, H]` vocab tensors are
 load-time sharded to fit the ~12 GB/rank budget (3,456.8 tok/s, +24.5%; see the
 prefill throughput table and the TP=8/LNC=1 resolution below). On the **beta-4
-container** the identical build measures **3,889.4 tok/s** (+12.5%) with no source
-change — see "beta-4 container" below.
+container** that became **3,645.0 tok/s** (+5.4% over 3,456.8, same source, same page
+size 256 — a clean compiler-only win, verified numerically bit-identical). The current
+best is **4,002.1 tok/s** (+9.8% over 3,645.0), from the in-place rope-KV write now
+that it is **correct**: one cache buffer per GQA layer.
+
+The previously headlined **3,889.4 tok/s** is **withdrawn** — that build of the
+in-place rope-KV rewrite **dropped ~60% of its KV-cache writes**, so part of its gain
+was work not done. The mechanism (only the first in-place mutation of a buffer per
+traced graph survives) and the fix are below; the fixed path is both faster than the
+defective one and populates the cache 100%, at the exact reference logits fingerprint.
 
 ## Architecture
 
@@ -673,7 +681,10 @@ historical results in this section must not be attributed to it.
 
 | Test | Framework | Config | Latency | Prompt tok/s |
 |---|---|---|---|---|
-| **Same build on the beta-4 container (compiler-only win)** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256 | **10.284 s** | **3,889.4 aggregate** |
+| **beta-4 + in-place rope-KV write, one buffer per GQA layer (CORRECT: cache 100% populated)** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256, splits=4 | **9.995 s** | **4,002.1 aggregate** |
+| **beta-4 container, unchanged source (compiler-only win, numerics bit-identical)** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256 | **10.974 s** | **3,645.0 aggregate** |
+| ~~beta-4 + in-place rope-KV write~~ — **INVALID**, drops ~60% of KV writes | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256 | ~~10.284 s~~ | ~~3,889.4 aggregate~~ |
+| ~~In-place rope-KV write, old container~~ — **INVALID**, same defect | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg64 | ~~10.913 s~~ | ~~3,665.5 aggregate~~ |
 | **Packed DeltaNet C32 n=4 + vocab-sharded head/embed, TP=8/LNC=1** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256 | **11.572 s** | **3,456.8 aggregate** |
 | Packed DeltaNet C32 n=4 (SBUF-resident + transpose-once), TP=4/LNC=2 | PyTorch Native | BS=2, N=20000 each, bucket=1024 | 14.411 s | 2,775.6 aggregate |
 | **Batched compiled CTE-GQA + fused NKI-routed CTE-MoE + stable DeltaNet C32 (block-diagonal)** | PyTorch Native | BS=2, N=20000 each, bucket=1024 | **17.568 s** | **2,276.9 aggregate** |
@@ -833,48 +844,419 @@ watchdog on every core (`FATAL-RT-UNDEFINED-STATE`) at BS=2 — the doubled
 per-chunk working set is not viable at this batch (historically 2048 only ran at
 BS=1, 969.4 tok/s). **1024 remains the recommended prefill bucket.**
 
-### beta-4 container (2026-08-03): +12.5% prefill for free, decode still blocked
+### beta-4 container (2026-08-03): prefill faster, and numerically bit-identical
 
-Swapping only the PyTorch-Native DLC — no source change, same flags, same cache
-key inputs — moved 20k prefill from **3,456.8 → 3,889.4 aggregate prompt tok/s**
-(11,571.5 → 10,284.3 ms, **+12.5%**). Config is the recipe verbatim: 40L, BS=2,
-N=20,000, bucket 1024, O1, `DN_PACK_C32=1 DN_PACK_N=4`,
-`--scratchpad-page-size-mb 256`, `PREFILL_SHARDED_LM_HEAD=1
-PREFILL_SHARDED_EMBED=1`, TP=8/LNC=1. **Module resident stayed 8.95 GB/core**, so
-the win is pure compiler scheduling, not a memory-headroom trade.
+> **Correction (2026-08-04).** An earlier revision of this section reported
+> "**+12.5%** prefill for free, no source change" and attributed a **+1.80% norm**
+> fingerprint drift to beta-4's compiler, complete with a transpose-retiling
+> mechanism derived from the two on-disk compile caches. **Both claims were wrong,
+> and for the same reason:** the two runs being compared did *not* share source. The
+> `gqa_rope_kv_35b` kernel, its op wrapper, and the `static_decode_35b.py` call site
+> were rewritten on **2026-07-30 00:44–00:45 UTC** — after the old cache was built
+> (07-29 20:07) and before beta-4's (08-03 17:18). The full-tree `diff -rq` between
+> the two on-host snapshots (`src-old` vs `src`) confirms exactly three runtime files
+> differ (65 changed lines); everything else is docs, `experiments/`, and tests that
+> the run does not import. The transpose-retiling analysis compared two *different
+> programs* and has been withdrawn — the `[2,1024,256]` bf16 class it leaned on is
+> better read as the GQA K/V tensor (256 = 2 KV heads × 128) for a 1024-token chunk,
+> i.e. the very path that was rewritten, than as the DeltaNet packed layout.
 
-| Image | Digest | TIMED (BS=2, N=20000) | Aggregate prompt tok/s |
-|---|---|---:|---:|
-| previous | `sha256:9d37a773…` | 11,571.5 ms | 3,456.8 |
-| **beta-4** | `sha256:ad7f7bbcd468…` | **10,284.3 ms** | **3,889.4** |
+The four recorded runs at this config, in order, give a clean attribution:
 
-**Numerics: gate passed, but the fingerprint is not bit-identical.** beta-4 gives
-`sum=-3.29478219e+05 norm=1.22990430e+03 top5=[517,607,15089,258,261]` (warm ≡
-timed, all-finite across logits/deltanet/conv/kv_k/kv_v) against the recorded
-LNC=1 reference `sum=-3.17835375e+05 norm=1.20818213e+03
-top5=[517,607,261,294,15089]`. Drift is norm **+1.80%**, sum **+3.66%**, top-1 and
-top-2 identical, 4 of 5 top-5 shared (`294`→`258` substituted, `15089` moved rank
-5→3). This is the same class of fp-reordering artifact a compiler change produces
-(cf. the O3 run at `sum=-3.19872438e+05`, 0.3% norm drift) — but it is **larger
-than any previously accepted same-topology drift**, so magnitude alone does not
-certify it.
+| # | date | compiler | source | page | TIMED | agg prompt tok/s | fingerprint `sum` / `norm` |
+|---|---|---|---|---:|---:|---:|---|
+| 1 | 07-29 20:30 | old `9d37a773…` | pre-07-30 | 256 | 11,571.5 ms | 3,456.8 | `-3.17835375e+05` / `1.20818213e+03` |
+| 2 | 07-30 01:30 | old `9d37a773…` | pre-07-30 (`src-old` replay) | 256 | 11,573.7 ms | 3,456.1 | `-3.17835375e+05` / `1.20818213e+03` |
+| 3 | 07-30 01:12 | old `9d37a773…` | rope-KV rev2 | 64 | 10,912.5 ms | 3,665.5 | **`-3.29478219e+05`** / **`1.22990430e+03`** |
+| 4 | 08-03 17:37 | **beta-4** `ad7f7bbcd468…` | rope-KV rev2 | 256 | **10,284.3 ms** | **3,889.4** | **`-3.29478219e+05`** / **`1.22990430e+03`** |
 
-The decisive gate is the greedy coherence continuation, and it **passed
-token-identically**: prompt `760,6511,314,9338,369` →
+**Numerics: beta-4 introduces no drift at all.** Runs 3 and 4 are **bit-identical** —
+same `sum`, same `norm` to all printed digits, same `top5=[517,607,15089,258,261]` —
+across both a compiler change *and* a page-size change. Runs 1 and 2 likewise
+reproduce each other to the bit (3,456.8 vs 3,456.1 tok/s is 0.02% timing noise),
+which makes run 2 a validated control rather than a lucky repeat. So the
+`-3.17835375e+05 → -3.29478219e+05` shift (norm +1.80%, sum +3.66%, `294`→`258`,
+`15089` rank 5→3) belongs **entirely to the 2026-07-30 rope-KV source change**, and
+the earlier framing of a "beta-4 correctness issue" was a misattribution against a
+stale baseline. Module resident is 8.95 GB/core on both sides.
+
+**Throughput: the +12.5% is real but is not all the compiler's.** It spans two
+changes plus a page-size difference, and the one cell that would separate them —
+old compiler + rope-KV rev2 + page 256 — was never run, and can no longer be run
+because the host holds only `sha256:ad7f7bbcd468fc27accfde039421e9367614a8d12dc9fa452d587feb514c2798`
+(the swap was a re-pull of the same `concourse-release-0461d3b:latest` tag, so
+`9d37a773…` was replaced, not co-installed; no dangling layers, and ECR
+`DescribeImages` is denied to this host's role). What the data does support:
+the rope-KV rewrite alone is worth **+6.0%** at page 64 (3,456 → 3,665.5), and
+beta-4 plus the page-64→256 change together add a further **+6.1%**
+(3,665.5 → 3,889.4). Attributing the whole +12.5% to "compiler scheduling" is not
+supported.
+
+#### The remaining open question: is rope-KV rev2 correct?
+
+The rewrite stops returning `kv_key`/`kv_value` (they were re-exported as graph
+outputs, 1.74 GB of HBM traffic per 10-layer region to publish 1024 changed rows —
+the #1 prefill hotspot at 25% of instruction time) and instead mutates the cache in
+place, passing the *whole* flattened cache and selecting the layer with a static
+`group_index`. The addressing is provably unchanged: the new
+`(group_index * batch_size + batch) * kmax` with `kmax = rows/(B*num_groups)` lands
+on the same rows as the old `batch * kmax` within `kv_k[gi, :, 0]`. The consumer
+changed from the kernel's returned output to `k_filled = kv_k[gi, :, 0]`, a read of
+the mutated buffer ordered only by functionalization.
+
+That read-after-write hazard is the obvious suspect, and it is **already refuted on
+device**: `test_gqa_rope_kv_alias_probe.py` checks the write is observable through
+both the `base_slice` pattern the prefill caller uses and the flat view passed to the
+op, exactly (`torch.equal`, so a lost write reads back as zeros), at production
+geometry (`NUM_GQA=10, max_seq_len=20480, gi=9`, flat row 409,471 / byte offset
+2.1e8); `test_gqa_rope_kv_multicall_probe.py` confirms ordering across 3 in-place
+calls and 2 chunks. Both passed (`logs/ropekv_probe.log`,
+`logs/ropekv_multicall.log`, 2026-07-30 02:03/02:06).
+
+So: identical arithmetic, identical addressing, both paths individually
+device-validated — yet a 1.8% norm difference at 20k context. Something is
+unaccounted for, and it cannot be settled by reading code. Note also that rev1 of
+this rewrite was *grossly* wrong (`sum=-3.98127219e+05`, norm `1.39189014e+03`,
++15%) before rev2 brought it to within 1.8%, which is not reassuring about rev2
+being the fixpoint.
+
+#### Localised (2026-08-05): the divergence is seeded by the cross-chunk KV readback
+
+The matched A/B ran. Both arms are one source tree apart (the rope-KV hunk and
+nothing else — `diff` is 24 ± lines), under **one** container (beta-4) at **one**
+page size (256), with identical `PREFILL_TRACE_FINITE=1` instrumentation. The
+instrumentation is empirically HLO-neutral: the rev2 arm hit its existing beta-4
+cache with **102/102 NEFFs unchanged**.
+
+**First: beta-4 is exonerated for the third and final time.** The `src-old` arm under
+beta-4 reproduced the pre-07-30 fingerprint *exactly* —
+`sum=-3.17835375e+05 norm=1.20818213e+03 top5=[517, 607, 261, 294, 15089]`. That is
+the missing cell of the 2×2: old source now has a datapoint under the new compiler,
+so source and compiler are fully separated. beta-4 changes no numerics on either
+path.
+
+**Second: chunk 0 is bit-identical, and chunk 1 is not.** All four segments × three
+tensors × two metrics are exactly `0.000000%` apart at chunk 0. Every cell from
+chunk 1 on differs:
+
+| | `conv.norm` | `dn.norm` | `hidden.norm` |
+|---|---:|---:|---:|
+| chunk 0, all segments | 0.000000% | 0.000000% | 0.000000% |
+| chunk 1, segment 0 | 0.005216% | 0.021286% | 0.482412% |
+| worst cell (chunk 19, segment 3) | 1.454% | 0.524% | **13.660%** |
+
+This is the KV-write signature, not compounding-from-the-start. It also explains why
+chunk 0 matches: `cte_prefill` takes `k_active` (this chunk's keys) *and* `k_filled` +
+`q_base` separately, so at chunk 0 the prefix `[0:q_base]` is empty and `k_filled` is
+never read. **Chunk 1 is the first invocation that reads rows written by a previous
+invocation** — and it is the first that differs.
+
+`hidden.norm` per segment (segment 0 = layers 0–9, segment 3 = layers 30–39):
+
+```
+chunk    seg0      seg1      seg2      seg3
+    0   0.000%    0.000%    0.000%    0.000%
+    1   0.482%    1.067%    0.251%    1.267%
+    5   0.160%    2.126%    0.136%    6.958%
+   10   0.410%    1.730%    0.139%   10.114%
+   19   0.487%    1.842%    1.768%   13.660%
+```
+
+Segment 0 stays **bounded** at ~0.1–0.5% with no growth in chunk index — so the
+per-chunk seed is a roughly constant-magnitude perturbation, and the recurrent state
+is not diverging exponentially. The growth is in *depth*: by layer 39 the deep-layer
+divergence reaches 13.7%, which is far too large to be fp reassociation. This is a
+semantic difference, not noise, and the final-logits 1.80% is the attenuated tail of
+it.
+
+**Third: the shape hypothesis is dead.** `kv_k` is
+`[NUM_GQA, B, nkv, max_seq_len, GQA_HEAD_DIM]` (`static_decode_35b.py:2799`), so
+`kv_k[gi, :, 0]` is `[B, max_seq_len, HD]` — identical to the old
+`k_filled.reshape(B, max_seq_len, HD)`, and identical to what the static
+`index_copy_` branch already uses. No silent rank/stride change.
+
+**What this leaves, and it inverts the question.** The old path passed a *sliced*
+view (`kv_k[gi, :, 0].reshape(...)`) as `cache_k` and consumed the kernel's
+**returned** `k_filled`. Per the rewrite's own comment, a sliced view is exactly the
+case where the in-place write is **dropped** unless the tensor is also returned. If
+that is right, the old path never persisted anything into `kv_k` across chunk
+invocations, and its cross-chunk prefix was whatever the kernel handed back — in
+which case **rev2 is the fix and the old, "gated" fingerprint is the wrong one.**
+The alias/multicall probes cannot adjudicate this: they assert the *new* pattern
+works, never that the *old* one did.
+
+That is directly measurable, and it was measured. The prefill already returns
+`kv_k`/`kv_v` as `outputs[3:5]` and already materialises them for the `finite[...]`
+check, so adding eager `sum`/`norm`/`nz` per output is HLO-neutral (both arms keep
+their caches). Both arms, one container, page 256:
+
+| arm | `kv_k` nz / numel | `kv_k` norm | `kv_v` norm | tok/s |
+|---|---:|---:|---:|---:|
+| `src-old` (pre-07-30) | **104,857,600 / 104,857,600 = 100%** | 1.54342100e+04 | 6.88771240e+03 | 3,645.0 |
+| `src` (rope-KV rev2) | **41,943,040 / 104,857,600 = 40%** | 9.63778613e+03 | 2.98420020e+03 | 3,898.4 |
+
+The old path populates the cache **completely**. rev2 populates **40%** of it, and
+`(9637.79 / 15434.21)² = 0.39` — rev2's cache is the old cache with ~60% of it
+**zeroed**, not filled with different values. The hypothesis above is refuted: the old
+path was fine; rev2 is losing writes.
+
+#### Root cause (2026-08-05): only the FIRST in-place cache mutation per graph is carried back
+
+The occupancy map (`PREFILL_KV_MAP=1`, also eager) localises it exactly:
+
+```
+kvmap shape=(10, 2, 1, 20480, 256) numel=104857600
+per_group_nz         = [10485760, 0, 10485759, 0, 0, 10485760, 0, 10485760, 0, 0]
+per_rowblock1024_nz  = [2097152 × 20]        <- every chunk writes
+```
+
+Row blocks are uniformly full, so nothing is wrong with the chunk loop or the runtime
+`q_base` offset. The loss is entirely in the **group** dimension: groups **0, 2, 5, 7**
+are populated and the other six are bit-zero. GQA sits on every 4th layer
+(`gi = 0…9` ↔ layers 3, 7, …, 39) and the run used `--prefill-splits 4`:
+
+| segment | layers | GQA `gi` in segment | populated |
+|---|---|---|---|
+| 0 | 0–9 | 0, 1 | **0** |
+| 1 | 10–19 | 2, 3, 4 | **2** |
+| 2 | 20–29 | 5, 6 | **5** |
+| 3 | 30–39 | 7, 8, 9 | **7** |
+
+Exactly one per segment — the *first* one. **Only the first in-place mutation of a
+given buffer inside a single traced graph is carried back to the caller; every
+subsequent mutation of that buffer in the same graph is silently dropped.** No error,
+no warning, and the output stays finite and superficially plausible.
+
+This is also why the two probes passed and proved nothing about the production path:
+`test_gqa_rope_kv_alias_probe.py` issues one mutation, and
+`test_gqa_rope_kv_multicall_probe.py`'s three calls do not sit inside one compiled
+segment the way ten GQA layers do. **A probe that validates an aliasing pattern must
+reproduce the number of mutations per graph, not just the addressing.**
+
+Consequences:
+
+- **rev2 must not be landed as-is.** Its fingerprint
+  (`sum=-3.29478219e+05 norm=1.22990430e+03`) is the signature of a model attending
+  over a 60%-empty KV cache. The reference fingerprint is the `src-old` one,
+  `sum=-3.17835375e+05 norm=1.20818213e+03`.
+- **The +6% was partly work not done.** Six of ten GQA layers skipped their cache
+  DMA entirely. The honest beta-4 prefill number is the `src-old` arm's
+  **3,645.0 tok/s** (+5.4% over 3,456.8 at identical source and page size).
+- **The optimisation itself is still valid and still the top prefill lever** —
+  re-exporting the cache is genuinely 25% of instruction time and 21.7% of HBM
+  traffic. It just needs a form where each graph mutates each buffer at most once,
+  e.g. **one cache tensor per GQA layer** (each segment then touches ≤3 *distinct*
+  buffers, one write each) rather than one shared `[NUM_GQA, …]` slab.
+- **Full-graph decode uses the identical pattern and is now suspect.**
+  `gqa35b::tail_stateful` takes the whole flattened cache plus a static
+  `layer_index` and mutates in place (`static_decode_35b.py:1821`), and
+  `DECODE_FULLGRAPH=1` puts all ten GQA layers in **one** graph — the worst case for
+  this defect. Every decode validation to date compared two runs that would share it,
+  so a token-identical `gen hash` cannot rule it out. Checked directly with an eager
+  `DECODE_KV_MAP=1` occupancy read of `mod.decode_kv_k` (see below).
+
+The greedy coherence continuation **passed token-identically** on both arms —
+prompt `760,6511,314,9338,369` →
 `[11751, 13, 198, 760, 6511, 314, 9338, 369, 11751, 13, 198, …]`, matching the
-reference continuation `[11751, 13, 198, 760, 6511, 314, …]` documented in
-`PREFILL_RECIPE.md` for exactly this LNC=1 config. The apparent "degenerate
-repetition" is the expected behaviour of that reference prompt (it is a cyclic
-prompt), not a failure — the LNC=2/C16/C32 baselines produce the same cycle.
+reference in `PREFILL_RECIPE.md`. That is worth recording as a **negative result about
+the gate itself**: greedy argmax over a cyclic reference prompt survived a 60%-empty
+KV cache and a 13.7% deep-layer perturbation. The coherence gate is not sensitive
+enough to catch a defect of this size, and must not be treated as sufficient. The
+cheap eager state fingerprint (`nz` + `norm` per state tensor) catches it instantly
+and should run alongside every fingerprint from now on.
 
-**Decode on beta-4 is blocked by host OOM, not by the device.** Two full-graph
-decode compiles died after ~48 min each with
+**Decode on beta-4 was blocked by host OOM, not by the device — now resolved with
+`--optlevel 1`; see below.** Two full-graph decode compiles died after ~48 min each with
 `[F137] neuronx-cc was forcibly killed` (exit 70) — 2026-08-03T18:29:52Z (rank6)
 and 2026-08-03T20:40:57Z (rank5). **159 GB of swap across three swapfiles was
 insufficient**; the compiler is killed while the graph is still one region.
-Reducing rank count is *not* an option (the LNC=1 fit depends on 8 shards), so the
-viable fallback is **`--graph-splits 2`**, trading one region for two smaller
-compiles. Untried as of this entry.
+Reducing rank count is *not* an option (the LNC=1 fit depends on 8 shards).
+
+> **`--graph-splits 2` is NOT the fallback — it is a no-op here.** An earlier
+> revision of this entry recommended it. Under `DECODE_FULLGRAPH=1`,
+> `static_decode_35b.py:2804` hardcodes `setup_segments(1, compile_each=False)` and
+> compiles the whole decode step with one `torch.compile`; `args.graph_splits` is
+> read **only** in the `else` branch. Passing `--graph-splits 2` changes nothing —
+> the log still prints `compiled as one graph ...: [(0, 40)]`. Splitting is also not
+> a drop-in: `DN_DIRECT_STATE_OUT=1` and `GQA_STATEFUL_KV=1` both *require*
+> `DECODE_FULLGRAPH=1` (`:470-473`), so leaving full-graph mode means giving up the
+> max-throughput decode config, not just resegmenting it. A run launched with
+> `--graph-splits 2` was confirmed to be a bit-for-bit repeat of the OOM config and
+> was killed rather than re-paid.
+
+#### Resolved: `--optlevel 1` compiles it (2026-08-04)
+
+The lever was **compiler optlevel**. Decode had been running with
+`NEURON_CC_FLAGS="--target trn2 --lnc 1"` — no `--optlevel`, i.e. the neuronx-cc
+default — while prefill compiled successfully at an explicit **O1** on the same host.
+Adding `--optlevel 1` (`run_decode_beta4_o1.sh`, one variable changed, no extra swap)
+**compiled and ran on the first attempt**:
+
+| | beta-4 + O1 | baseline (old container, default optlevel) |
+|---|---:|---:|
+| compile outcome | `DOCKER_EXIT=0`, **24m21s** total wall | ok |
+| weights load+shard | 420.0 s | — |
+| first decode step (incl. compile) | 997.5 s | — |
+| module resident | **7.09 GB/core** | — |
+| TPOT (BS=128, seq=256, synced, 20 iter) | **395.11 ms/tok** | 289.53 ms/tok |
+| throughput | **324.0 tok/s** | 442.1 tok/s |
+| `gen hash` row0 / row127 | **`0cc59fb25112`** / `0cc59fb25112` | `0cc59fb25112` |
+
+**Numerics: token-identical.** The generated-token hash matches the baseline exactly,
+on both the first and last row of the batch. Taken with the prefill result above
+(bit-identical fingerprints on matched source), beta-4 has now produced **no
+numerical change on either path**. The fp8 expert conversion also reports its usual
+`cosine=0.9996470, normalized RMSE=2.66934%`.
+
+**Throughput: −26.7%, and not yet attributable.** 395.11 vs 289.53 ms/tok is a real
+regression, but it confounds O1-vs-default with old-vs-beta-4, and **neither
+confound can be lifted on this host**: beta-4 at the default optlevel is the
+configuration that OOMs, and the old image is gone (only `ad7f7bbcd468…` remains, no
+dangling layers, ECR `DescribeImages` denied to this role). The honest statement is
+that the only configuration in which beta-4 full-graph decode compiles is O1, and
+that configuration is 26.7% slower than the recorded default-optlevel baseline.
+O1 cutting optimization passes is the likely cause and is the cheaper hypothesis;
+testing it needs an old-container O1 run, i.e. the image by digest.
+
+**Swap was never touched** — peak host use was 64/124 GB with 0 B of the 63 GB
+swapfile consumed, which retrospectively explains why 159 GB of swap did not save
+the default-optlevel attempts: the compiler was killed on a fast allocation spike
+rather than gradually exhausting RAM, so more swap was never the fix.
+
+#### CONFIRMED (2026-08-05): full-graph decode had the same defect, and worse
+
+The `DECODE_KV_MAP=1` occupancy read predicted above was run on exactly the O1
+configuration in the table (40 layers, BS=128, seq=256, `GQA_STATEFUL_KV=1
+DECODE_FULLGRAPH=1`, three generated tokens):
+
+```
+DECODE kvmap shape=(10, 128, 1, 256, 256) numel=83886080 total_nz=98304
+DECODE kvmap per_group_nz           = [98304, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+DECODE kvmap per_group_nonzero_rows = [384,   0, 0, 0, 0, 0, 0, 0, 0, 0]
+```
+
+384 = 128 batch rows × 3 tokens, so **GQA group 0 is written completely and correctly
+and groups 1–9 never receive a single write.** Full-graph decode is the worst case for
+this defect: all ten GQA layers share one traced graph, so nine of ten GQA layers
+attend over an all-zero cache.
+
+Three things to record about how this went undetected:
+
+- **It is not the 07-30 rewrite's bug.** `git blame` puts the pattern at `ad342fbf`,
+  **2026-07-17** (`static_decode_35b.py:1821`). It predates the prefill rewrite by
+  two weeks; the prefill rewrite copied it *because* decode appeared to validate.
+- **The original gate could not have caught it.** The validation recorded above —
+  *"A paired 100-step four-layer run (one GQA layer) … K and V state were
+  bit-identical"* — used **four layers**, which is **exactly one GQA layer**, i.e.
+  exactly one mutation per graph. Same failure mode as the two prefill alias probes:
+  the geometry that exposes the defect was never exercised.
+- **`gen hash` cannot detect it.** Both flags are opt-in and every recorded decode
+  comparison had them on both sides, so the two runs shared the defect and agreed.
+
+Scope of invalidated numbers: **anything measured with `GQA_STATEFUL_KV=1` and
+`DECODE_FULLGRAPH=1` together**, which is the configuration in `DECODE_RECIPE.md` and
+in `deploy/compile_decode_fp8_trn2.sh`. That includes the `+5.5%` (105.31 → 99.80
+ms/token, 303.9 → 320.6 tok/s) attributed to stateful KV above, and the BS=128 O1
+rows in the table. The `GQA_STATEFUL_KV=0` path returns the cache as a graph output
+and is unaffected.
+
+#### The fix: one cache buffer per GQA layer (both paths)
+
+Landed in `static_decode_35b.py`, no new flag — it is a bug fix, not a variant:
+
+| | before | after |
+|---|---|---|
+| decode cache | one `decode_kv_k` `[NUM_GQA,B,NKV,S,HD]` buffer | `decode_kv_k{0..9}`, each `[B,NKV,S,HD]` |
+| decode call | `kv_k.reshape(NUM_GQA*B*S,HD)`, `layer_index=gi` | `kv_k[gi].reshape(B*S,HD)`, `layer_index=0` |
+| prefill cache | `kv_cache_k.clone()` | `[kv_cache_k[gi].contiguous() for gi in …]` |
+| prefill call | `kv_k.reshape(NUM_GQA*B*S,HD)`, `gi`, `NUM_GQA` | `kv_k[gi].reshape(B*S,HD)`, `0`, `1` |
+
+The kernels need no change: `nki_gqa_tail`'s row base is
+`(layer_index * B + b) * S` and `nki_gqa_rope_kv_dynamic`'s is
+`(group_index * B + b) * kmax` with `kmax = shape[0] // (B * num_groups)`, so a
+per-layer buffer is just the `layer_index = 0, num_groups = 1` case. Each buffer is
+still passed **whole** (a whole-tensor reshape aliases; a slice does not), and total
+KV memory is unchanged — it is the same bytes, differently owned. Correctness is now
+independent of `--prefill-splits`, which matters because the cheap
+`--prefill-splits 10` confirmation (4-layer segments, one GQA layer each) is not
+actually available: dynamo keys its cache **per code object**, and all N `segment`
+closures in `prefill_bucketed` share one, so N > 8 hits
+`FailOnRecompileLimitHit` under `fullgraph=True`. That is now raised to
+`max(16, 2*splits+4)` at the top of `prefill_bucketed`.
+
+Gates, both now in-source rather than sed patches:
+`PREFILL_FINGERPRINT=1` prints `sum`/`norm`/`nz`/`numel` per carried state tensor,
+`PREFILL_KV_MAP=1` adds `per_group_nz`, and `DECODE_KV_MAP=1` prints decode's
+`per_group_nz` + `per_group_nonzero_rows`. A correct 40-layer BS=2 @20480 prefill has
+`kv_k` **100% non-zero** (104,857,600) at `norm=1.54342100e+04`; a correct decode has
+every one of the ten groups populated.
+
+#### Gated 2026-08-05: the fixed in-place write is a real +9.8% — NEW PREFILL RECORD
+
+40 layers, BS=2, N=20000, bucket=1024, `--prefill-splits 4`, pg256, beta-4 container.
+Both variants of "one buffer per GQA layer" were run; the second is what landed.
+
+| variant | `kv_k` per-group nz | TIMED | tok/s | logits fingerprint |
+|---|---|---:|---:|---|
+| ten views of one base (`[gi].contiguous()`) | 10,485,760 × 10 | 10,021.2 ms | 3,991.6 | exact |
+| **ten owned buffers (`[gi].clone()`)** — landed | 10,485,760 × 10 | **9,994.6 ms** | **4,002.1** | **exact** |
+| baseline: beta-4, cache returned as graph output | 10,485,760 × 10 | 10,974.1 ms | 3,645.0 | exact |
+| ~~defective in-place write~~ | [10485760,0,10485759,0,0,10485760,0,10485760,0,0] | ~~10,284.3 ms~~ | ~~3,889.4~~ | mismatched |
+
+Reading these:
+
+- **The win is real and it is bigger than the defective one claimed.** 4,002.1 vs
+  3,645.0 = **+9.8%**, against the withdrawn 3,889.4's +6.7%. Not returning a 1.74 GB
+  cache per 10-layer region pays for itself even when the writes actually happen; the
+  earlier number was *both* inflated by skipped work *and* an underestimate of the
+  lever. HBM is unchanged at **8.95 GB/core** — same bytes, differently owned.
+- **`nz` is 10,485,760 for every group** bar 3 elements total across 209 MB
+  (`[…,10485759,…,10485758]`), which are genuine bf16 zeros in the data, not gaps.
+  `kv_k norm=1.54342275e+04` vs the old path's `1.54342100e+04` — agreement to 6
+  significant figures, a 1.1e-5 relative difference from the kernel's accumulation
+  order. The **logits fingerprint is exact**: `sum=-3.17835375e+05
+  norm=1.20818213e+03 top5=[517,607,261,294,15089]`.
+- **`clone()`, not `contiguous()`.** A dim-0 slice of a contiguous tensor is already
+  contiguous, so `[gi].contiguous()` returns the view unchanged and all ten "buffers"
+  still share one storage. That happened to work — so the dropped-write behaviour is
+  keyed on graph-input *tensor* identity, not on storage — but it makes correctness
+  rest on the compiler never canonicalising ten views of one base into one input. The
+  clone variant has no such dependency and measured 0.26% faster, i.e. the same.
+- **Input aliasing structure is part of the graph key.** Swapping views for clones
+  changed nothing about the traced ops, yet forced a full cold recompile (8
+  `neuronx-cc` processes against a cache already holding the view-variant NEFFs).
+  Worth knowing before assuming an allocation-only change will be cache-hot.
+
+#### Gated 2026-08-05: decode is correct now, and it was never the fast path it claimed
+
+Same fix, re-gated at 40 layers, BS=128, seq=256, `--optlevel 1`, beta-4,
+`GQA_STATEFUL_KV=1 DECODE_FULLGRAPH=1 DECODE_KV_MAP=1`:
+
+| | `per_group_nz` | `per_group_nonzero_rows` | TPOT | tok/s |
+|---|---|---|---:|---:|
+| before (one shared buffer) | `[98304, 0 × 9]` | `[384, 0 × 9]` | 395.95 ms | 323.3 |
+| **after (per-layer buffers)** | **`[98304 × 9, 98176]`** | **`[384] × 10`** | **393.56 ms** | **325.2** |
+
+All ten GQA layers now write, `384 = 128 batch × 3 tokens` uniformly (the one 98,176
+is 128 genuine bf16 zeros in the data, not missing rows).
+
+**Unlike prefill, this fix buys no throughput — and that is the expected result.**
+393.56 vs 395.95 ms/token is 0.6%, i.e. noise. The attention kernel does dense masked
+work over the whole `S=256` buffer regardless of what is *in* it, so nine caches full
+of zeros cost exactly what nine correct caches cost. The defect was pure lost
+correctness with no compensating speed, which is also why no profile ever flagged it.
+
+**`gen hash` was identical on both sides** (`0cc59fb25112`, rows 0 and 127) — before
+and after a fix that changed nine of ten attention inputs from zeros to real keys and
+values. Under `--skip-prefill` only 2–3 tokens are generated from a seed token at
+position 0, and greedy argmax simply does not resolve the difference. This is the
+same insensitivity that let the defect live for two and a half weeks, now measured
+from the other direction: **a matching `gen hash` is not evidence of equivalence.**
+
+What this does *not* do is restore the withdrawn `+5.5%`. That claim (105.31 → 99.80
+ms/token) was measured at BS=32 on the older container, and has **not** been
+re-measured on a correct path; it should be treated as unknown, not as recovered. The
+datum above is the first honest number for stateful-KV decode.
 
 ## Reference
 

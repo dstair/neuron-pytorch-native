@@ -55,7 +55,14 @@ def main():
 
     @torch.compile(backend="neuron", fullgraph=True, dynamic=False)
     def run(q, k, v, c, s, kc, vc, base):
-        return torch.ops.gqa35b.rope_kv_dynamic(q, k, v, c, s, kc, vc, base)
+        out, key_out = torch.ops.gqa35b.rope_kv_dynamic(
+            q, k, v, c, s, kc, vc, base, 0, 1
+        )
+        # The kernel mutates kc/vc in place and does NOT return them. Mirror the
+        # production caller (static_decode_35b.py `_gqa_prefill_chunk`) and read
+        # them back inside the same graph: this is the ordering gate, i.e. that
+        # functionalization sequences these reads after the mutating op.
+        return out, key_out, kc.reshape(1, KMAX, HEAD_DIM), vc.reshape(1, KMAX, HEAD_DIM)
 
     qn = query.to("neuron")
     kn = key.to("neuron")
@@ -66,7 +73,10 @@ def main():
     vc = torch.zeros_like(kc)
 
     for base in (0, 256):
-        out, key_out, kc, vc = run(
+        # kc/vc are deliberately NOT rebound from the return value -- the kernel
+        # mutates these exact tensors, so the same two buffers accumulate both
+        # runtime offsets across iterations.
+        out, key_out, kc_graph, vc_graph = run(
             qn,
             kn,
             vn,
@@ -85,8 +95,6 @@ def main():
         )
         q_ref = q_ref.transpose(0, 1)
         q_actual = out[0].cpu()
-        kc_actual = kc.cpu()
-        vc_actual = vc.cpu()
         assert torch.allclose(q_actual, q_ref, rtol=2e-2, atol=2e-2)
         assert torch.allclose(
             key_out[0].cpu().float(),
@@ -94,13 +102,20 @@ def main():
             rtol=2e-2,
             atol=2e-2,
         )
-        assert torch.allclose(
-            kc_actual[base : base + CHUNK].float(),
-            k_ref.float(),
-            rtol=2e-2,
-            atol=2e-2,
-        )
-        assert torch.equal(vc_actual[base : base + CHUNK], value[0])
+        # Two independent views of the mutation: read back inside the graph
+        # (kc_graph/vc_graph, what the prefill consumer actually sees) and from
+        # the host after synchronize (kc/vc, the persistent cache buffers).
+        for k_seen, v_seen in (
+            (kc_graph[0].cpu(), vc_graph[0].cpu()),
+            (kc.cpu(), vc.cpu()),
+        ):
+            assert torch.allclose(
+                k_seen[base : base + CHUNK].float(),
+                k_ref.float(),
+                rtol=2e-2,
+                atol=2e-2,
+            )
+            assert torch.equal(v_seen[base : base + CHUNK], value[0])
 
     assert torch.count_nonzero(kc.cpu()[128:256]) == 0
     assert torch.count_nonzero(kc.cpu()[384:]) == 0

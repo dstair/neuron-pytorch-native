@@ -124,7 +124,7 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
 | `MOE_DECODE_TP=1` | BF16, one-token decode: TP within each routed expert to avoid dummy non-local weight reads |
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
 | `DN_DIRECT_STATE_OUT=1` | Full-graph decode: write BF16 recurrent state directly to disjoint output buffers |
-| `GQA_STATEFUL_KV=1` | Full-graph decode: persist aliased BF16 K/V buffers and append only current rows |
+| `GQA_STATEFUL_KV=1` | Full-graph decode: persist aliased BF16 K/V buffers (one per GQA layer) and append only current rows — **wrote only group 0 before the 2026-08-05 fix; see gotcha** |
 | `MOE_FUSED_W8=fp8|int8` | Experimental high-batch all-expert block-W8 kernel; requires the official FP8 checkpoint |
 | `MOE_FUSED_W8_FP8_IMPL=block_pow2_coalesced` | Exact-scale 128x512 coalesced FP8 path for BS=32/64/128; remains non-default |
 | `MOE_OFFICIAL_FP8_REFERENCE=1` | BF16 hybrid oracle made by exactly dequantizing the official FP8 expert blocks |
@@ -135,6 +135,31 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
 
 ## Hard-won gotchas (each cost real time)
 
+- **Only the FIRST in-place mutation of a given buffer per traced graph is carried
+  back.** A custom NKI op that mutates an aliased tensor and does not return it
+  works exactly once per buffer per graph; every later mutation of that *same*
+  buffer inside that graph is **silently dropped** — no error, output stays finite
+  and plausible. It is per-buffer, not per-graph (`kv_k` and `kv_v` each kept their
+  own first write). This cost two multi-session investigations, one withdrawn
+  prefill record, and every `GQA_STATEFUL_KV=1 DECODE_FULLGRAPH=1` decode number.
+  Rules that follow:
+  - **One buffer per mutation site.** Both KV paths now allocate one cache tensor
+    per GQA layer (`decode_kv_k{0..9}`; a list in prefill) so each graph writes
+    each buffer once. The kernels are unchanged — a per-layer buffer is just
+    `layer_index=0` / `group_index=0, num_groups=1`.
+  - **Pass the buffer whole.** `buf.reshape(...)` on a contiguous whole tensor
+    aliases; `buf[gi].reshape(...)` on a shared tensor does not, and its write is
+    lost unless the tensor is also returned. `.contiguous()` on a per-layer slice
+    at allocation time is load-bearing.
+  - **An aliasing probe must reproduce the number of mutations per graph**, not
+    just the addressing. Two probes at production geometry passed while the real
+    path lost 6 of 10 writes, because each issued one mutation per graph.
+  - **Gate on state occupancy, never on logits.** `PREFILL_KV_MAP=1` /
+    `DECODE_KV_MAP=1` print per-group `nz`. Both trusted gates failed here: the
+    greedy coherence continuation was token-identical on a 60%-empty cache (the
+    reference prompt is cyclic, so argmax is insensitive) and `finite[...]` was
+    all-True. A matching `gen hash` between two runs that share the defect proves
+    nothing.
 - **Pure-torch DeltaNet decode does not compile past ~20 layers.** neuronx-cc trips
   a `PGTiling` assertion on the recurrent-state einsum. `DN_NKI=1` (opaque kernel)
   cures it — the full 40 layers then compile. Not TP, not MoE (both ruled out).
@@ -253,6 +278,18 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   The full 40-layer graph measured **99.80 ms/token / 320.6 tok/s**, versus the
   repeated direct-recurrent-state control at 105.31/105.28 ms and 303.9/304.0
   tok/s.
+  > **WITHDRAWN 2026-08-05 — that path wrote only one of ten GQA caches.** A
+  > `DECODE_KV_MAP=1` occupancy read at 40 layers / BS=128 returned
+  > `per_group_nz=[98304,0,0,0,0,0,0,0,0,0]`, so nine of ten GQA layers attended
+  > over an all-zero cache. Cause: this stack carries back only the **first**
+  > in-place mutation of a given buffer per traced graph, and `DECODE_FULLGRAPH=1`
+  > puts all ten GQA layers in one graph. The 99.80 ms figure and the +5.5% are
+  > void. The four-layer validation quoted above holds exactly **one** GQA layer,
+  > i.e. one mutation, so it could not have caught this; nor could `gen hash`,
+  > since both sides of every comparison had the flag on. Fixed by giving each GQA
+  > layer its own cache buffer (`decode_kv_k{0..9}`, `layer_index=0`) — no kernel
+  > change, same total bytes. Gate with `DECODE_KV_MAP=1` and require all ten
+  > groups non-zero. Full writeup in `BENCHMARK.md`.
 - **BS=64 exceeds short-context BF16 full-graph HBM.**
   The S=256 stateful graph compiled all eight rank NEFFs and placed the
   10.89 GB/rank module, but execution failed allocating the next 240 MB BF16
@@ -448,20 +485,56 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   512, and N=10,000 (which would also require a matched LNC=2 re-baseline, since agg
   tok/s is seq-length-sensitive and a 20k-vs-10k cross-topology comparison is
   meaningless).
-- **beta-4 container = 3,889.4 agg prompt tok/s, +12.5% over 3,456.8, source-identical
-  (2026-08-03).** Swap the DLC only (`sha256:9d37a773…` → `sha256:ad7f7bbcd468…`);
-  same recipe, same flags, 10,284.3 ms vs 11,571.5 ms. **Module resident unchanged at
-  8.95 GB/core** — pure compiler scheduling, no memory trade. Fingerprint is *not*
-  bit-identical: `sum=-3.29478219e+05 norm=1.22990430e+03 top5=[517,607,15089,258,261]`
-  vs the LNC=1 reference (norm +1.80%, sum +3.66%, top-1/top-2 identical, 4/5 top-5
-  shared). That drift is bigger than any previously accepted same-topology drift, so
-  **the coherence continuation is what certifies it** — and it passed token-identically
-  (`[11751,13,198,760,6511,314,...]`). Note the continuation *looks* degenerate (it
-  cycles the prompt); that is the reference prompt's documented behaviour, not a bug —
-  do not re-flag it. **Decode on beta-4 is blocked upstream of the device:** two
-  ~48-min compiles died with `[F137] neuronx-cc was forcibly killed` even with 159 GB
-  of swap. Rank-count reduction is not available (the LNC=1 fit needs 8 shards), so the
-  untried fallback is **`--graph-splits 2`**.
+- **beta-4 container = 3,645.0 agg prompt tok/s (+5.4%), and it changes no numerics.**
+  ~~source-identical, +12.5% pure compiler win~~ ~~3,889.4 tok/s~~ — **settled
+  2026-08-05.** The original A/B was not source-pinned (`gqa_rope_kv_35b`, its op
+  wrapper and the call site were rewritten 2026-07-30 00:44–00:45 UTC, between the two
+  compiles). Running the **pre-07-30 source under beta-4** closes the 2×2: it
+  reproduces `sum=-3.17835375e+05 norm=1.20818213e+03 top5=[517,607,261,294,15089]`
+  **exactly**, at 10,974.1 ms / 3,645.0 tok/s vs 3,456.8 on the old image at the same
+  page size. So beta-4 is a clean +5.4% compiler win with zero numerical effect, on
+  both source revisions. Module resident 8.95 GB/core throughout.
+  **The 3,889.4 figure is withdrawn: it was a broken build** — see the rope-KV bullet
+  below. Lessons that keep applying: **pin the source before attributing anything to a
+  compiler**, and note `run_prefill_lnc1.sh` defaults `PAGE=64`, so a tag without
+  `pg256` is a page-64 run.
+- **rope-KV in-place write (2026-07-30) drops ~60% of its cache writes — do not land
+  it as-is (root-caused 2026-08-05).** Only the **first in-place mutation of a given
+  buffer inside one traced graph** is carried back; every later mutation of that buffer
+  in the same graph is silently dropped, with no error and finite output. With
+  `--splits 4` and GQA on every 4th layer, that means only the first GQA layer of each
+  segment writes: `per_group_nz=[10485760,0,10485759,0,0,10485760,0,10485760,0,0]`
+  (groups 0/2/5/7), `kv_k` occupancy 41,943,040 / 104,857,600 = **40%**, while
+  `src-old` is **100%** (`norm` 9.63778613e+03 vs 1.54342100e+04 — the ratio² is 0.39,
+  i.e. the same values with 60% zeroed). Its `sum=-3.29478219e+05
+  norm=1.22990430e+03` fingerprint is a defect signature, not a valid variant.
+  It is **per-buffer, not per-graph** (`kv_k` and `kv_v` both keep their first write in
+  the same graph), so the fix is one cache tensor per GQA layer. The optimisation is
+  still the top prefill lever (cache re-export = 25% of instruction time / 21.7% of HBM).
+- **Two gates that failed to catch a 60%-empty KV cache — do not trust them alone.**
+  The greedy coherence continuation passed *token-identically* on the broken build
+  (`[11751,13,198,760,6511,314,...]`; it looks degenerate only because the reference
+  prompt is cyclic — do not re-flag that), and so did `finite[...]`. Deep-layer
+  `hidden.norm` was 13.7% off. **Gate on state occupancy**: print `nz` + `norm` per
+  returned state tensor (`PREFILL_FINGERPRINT=1`), and `PREFILL_KV_MAP=1` for a
+  per-group map. Also: **an aliasing probe must reproduce the number of mutations per
+  graph, not just the addressing** — `test_gqa_rope_kv_alias_probe.py` and
+  `test_gqa_rope_kv_multicall_probe.py` both passed while the production path was
+  losing 6 of 10 writes.
+- **beta-4 full-graph decode: use `--optlevel 1` (2026-08-04).** Three attempts died
+  with `[F137] neuronx-cc was forcibly killed` because decode was compiling at the
+  neuronx-cc *default* optlevel while prefill used an explicit O1. Adding
+  `--optlevel 1` compiled on the first try in **24m21s** (`run_decode_beta4_o1.sh`),
+  7.09 GB/core, **TPOT 395.11 ms/tok / 324.0 tok/s** at BS=128/seq=256, and
+  **`gen hash 0cc59fb25112` — token-identical to the baseline** on rows 0 and 127.
+  That is **−26.7%** vs the 289.53 ms/tok / 442.1 tok/s default-optlevel baseline, and
+  the O1-vs-default and old-vs-beta-4 confounds **cannot be separated on this host**
+  (default optlevel is the config that OOMs; the old image is gone). **Swap is not the
+  lever** — peak use was 64/124 GB with 0 B of 63 GB swap touched, which is why 159 GB
+  of swap never helped: the kill is a fast allocation spike, not gradual exhaustion.
+  Rank-count reduction is not available (the LNC=1 fit needs 8 shards), and
+  **`--graph-splits 2` is a no-op** under `DECODE_FULLGRAPH=1`
+  (`static_decode_35b.py:2804`).
 - **FP8 CTE prefill lever (scoped 2026-07-23; no longer needed for LNC=1).** Kept
   for reference only — the LNC=1 fit was solved by LM-head sharding above, so do not
   start this for that reason. To make experts resident FP8 and dequantized in-kernel

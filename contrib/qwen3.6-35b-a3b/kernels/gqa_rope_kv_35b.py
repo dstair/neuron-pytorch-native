@@ -85,6 +85,8 @@ def nki_gqa_rope_kv_dynamic(
     kv_key,
     kv_value,
     q_base,
+    group_index=0,
+    num_groups=1,
 ):
     """Rotate Q/K and write K/V at runtime-selected contiguous cache rows.
 
@@ -92,13 +94,21 @@ def nki_gqa_rope_kv_dynamic(
       query: [B, Q_HEADS, CHUNK, 256] bf16
       key/value: [B, CHUNK, 256] bf16
       rope_cos/rope_sin: [KMAX, 64] f32
-      kv_key/kv_value: [B*KMAX, 256] bf16, mutated in place
+      kv_key/kv_value: [NUM_GROUPS*B*KMAX, 256] bf16, mutated in place
       q_base: [1, 1] int32
+      group_index/num_groups: static ints selecting this layer's cache slab
+
+    kv_key/kv_value are the WHOLE flattened cache for every layer, with this
+    layer picked out by the static group_index -- the same convention as
+    gqa35b::tail_stateful (gqa_tail_35b.py:107). Passing a per-layer slice
+    instead would make the buffer a sliced view at the graph boundary, and an
+    in-place write to such a view is only carried back if the tensor is also
+    returned as an op output (which costs a full-cache materialization).
     """
     batch_size = query.shape[0]
     q_heads = query.shape[1]
     chunk = query.shape[2]
-    kmax = kv_key.shape[0] // batch_size
+    kmax = kv_key.shape[0] // (batch_size * num_groups)
     assert chunk % TILE == 0, "GQA dynamic RoPE/KV requires CHUNK divisible by 128"
 
     query_out = nl.ndarray(
@@ -139,16 +149,16 @@ def nki_gqa_rope_kv_dynamic(
             ),
         )
 
-        # Keep the batch base static. Combining an affine batch index with the
-        # runtime row offset makes the driver conservatively bound the scalar
-        # DMA against the full flattened address range and reject the NEFF.
+        # Keep the batch and group bases static. Combining an affine batch index
+        # with the runtime row offset makes the driver conservatively bound the
+        # scalar DMA against the full flattened address range and reject the NEFF.
         for batch in range(batch_size):
             cache_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
             nisa.tensor_scalar(
                 dst=cache_base,
                 data=tile_base,
                 op0=nl.add,
-                operand0=batch * kmax,
+                operand0=(group_index * batch_size + batch) * kmax,
             )
             for head in nl.affine_range(q_heads):
                 q_rot = _rotate_tile(
@@ -178,4 +188,11 @@ def nki_gqa_rope_kv_dynamic(
                 src=value[batch, row : row + TILE, :],
             )
 
-    return query_out, key_out, kv_key, kv_value
+    # Do NOT return kv_key/kv_value. They are mutated in place (declared in the
+    # op's mutates_args), and re-exporting them as graph outputs makes the
+    # backend materialize both full [B*KMAX, 256] caches on every call -- 1.74 GB
+    # of HBM traffic per 10-layer region for a ~2 MB payload of changed rows
+    # (~20x write amplification at 1024 of 20480 rows). The caller reads the
+    # aliased cache tensors directly instead; see test_kv_stateful_alias_device.py
+    # for the validated mutate-then-read pattern.
+    return query_out, key_out

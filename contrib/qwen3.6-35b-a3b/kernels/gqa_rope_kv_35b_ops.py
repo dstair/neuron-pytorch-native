@@ -16,7 +16,13 @@ def gqa35b_rope_kv_dynamic(
     kv_key: torch.Tensor,
     kv_value: torch.Tensor,
     q_base: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    group_index: int,
+    num_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (query_out, key_out). kv_key/kv_value are the whole flattened
+    KV cache, mutated in place and deliberately NOT returned -- returning them
+    costs a full-cache materialization at the graph boundary. Read them back
+    through the caller's own view of the buffer instead."""
     return nki_gqa_rope_kv_dynamic(
         query,
         key,
@@ -26,4 +32,6 @@ def gqa35b_rope_kv_dynamic(
         kv_key,
         kv_value,
         q_base,
+        group_index=group_index,
+        num_groups=num_groups,
     )

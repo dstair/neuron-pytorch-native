@@ -169,16 +169,59 @@ tokens `[11751, 13, 198, 760, 6511, 314, ...]`, matching the C32/C16 baseline.
 > (C16, C32, LNC=2, LNC=1, beta-4) produces this same cycle. Do not read it as
 > degenerate output or as a failed gate.
 
-**beta-4 container (2026-08-03): same recipe, 3,889.4 tok/s (+12.5%).** Swapping only
-the DLC (`sha256:9d37a773…` → `sha256:ad7f7bbcd468…`) with no source or flag change
-measures 10,284.3 ms / **3,889.4 aggregate prompt tok/s** at an unchanged 8.95 GB/core.
-Its fingerprint is `sum=-3.29478219e+05 norm=1.22990430e+03
-top5=[517,607,15089,258,261]` — norm +1.80% / sum +3.66% off the LNC=1 reference
-above, i.e. a larger fp-reordering drift than any previously accepted same-topology
-change, so **certify beta-4 on the coherence continuation (which passes
-token-identically), not on the fingerprint.** Use this as the LNC=1 beta-4 reference
-fingerprint for future A/Bs. Full-graph *decode* does not yet compile on beta-4
-(`[F137]` host OOM at 159 GB swap; try `--graph-splits 2`) — see `BENCHMARK.md`.
+**beta-4 container: 3,645.0 tok/s (+5.4%), numerics bit-identical.** The DLC swap
+(`sha256:9d37a773…` → `sha256:ad7f7bbcd468…`) with **this recipe's source unchanged**
+measures 10,974.1 ms / **3,645.0 aggregate prompt tok/s** at an unchanged
+8.95 GB/core, reproducing this recipe's fingerprint *exactly*
+(`sum=-3.17835375e+05 norm=1.20818213e+03 top5=[517,607,261,294,15089]`). Same source,
+same page size 256 — a clean compiler-only win. beta-4 changes no numerics.
+
+> **The 3,889.4 tok/s figure previously reported here is withdrawn (2026-08-05).**
+> That run carried the 2026-07-30 rope-KV rewrite (in-place cache write, cache no
+> longer returned as a graph output), which is now proven to **drop ~60% of its KV
+> writes**: only the *first* in-place mutation of a buffer inside a traced graph is
+> carried back, so with `--splits 4` just 4 of the 10 GQA layers ever populate the
+> cache (`kv_k` occupancy 41,943,040 / 104,857,600). Part of that "gain" was work not
+> done. Its fingerprint `sum=-3.29478219e+05 norm=1.22990430e+03
+> top5=[517,607,15089,258,261]` is the signature of a **defect**, not an alternative
+> valid build — do not use it as a reference. Root cause and the re-land plan are in
+> `BENCHMARK.md`.
+
+**Re-landed correctly: 4,002.1 tok/s (+9.8%) — current best.** The fix is one cache
+buffer per GQA layer (`kv_k = [kv_cache_k[gi].clone() for gi …]`, kernel called with
+`group_index=0, num_groups=1`), so each traced segment mutates each buffer exactly
+once and correctness no longer depends on `--prefill-splits`. Gated at 40 layers,
+BS=2, N=20000, bucket=1024, splits=4, pg256: **9,994.6 ms / 4,002.1 aggregate prompt
+tok/s** at an unchanged **8.95 GB/core**, `kv_k` **100% non-zero** in *every* group
+(`per_group_nz = 10,485,760 × 10`), and this recipe's reference fingerprint reproduced
+**exactly**. The real lever is therefore *larger* than the defective build's +6.7%
+suggested — skipping the cache re-export is worth +9.8% on its own.
+>
+> Use `.clone()`, not `.contiguous()`: a dim-0 slice of a contiguous tensor is already
+> contiguous, so `[gi].contiguous()` hands back ten views of one storage. That variant
+> did gate correctly (3,991.6 tok/s, same occupancy), but it leaves correctness resting
+> on the compiler never merging ten views of one base into a single graph input. Note
+> that switching between the two forces a **cold recompile** — input aliasing structure
+> is part of the graph key even when the traced ops are identical.
+
+There is exactly **one** valid reference fingerprint for this recipe, and it holds
+across a compiler *and* a page-size change, so any mismatch is a real signal rather
+than fp noise:
+
+```
+sum=-3.17835375e+05  norm=1.20818213e+03  top5=[517, 607, 261, 294, 15089]
+```
+
+**Gate on state occupancy, not just the logits fingerprint.** The coherence
+continuation passed token-identically *on the broken build*, and so did the finiteness
+check — greedy argmax over the cyclic reference prompt is simply not sensitive to a
+60%-empty KV cache. Print `nz` and `norm` for each returned state tensor
+(`PREFILL_FINGERPRINT=1` now does; `PREFILL_KV_MAP=1` adds a per-group occupancy map).
+A correct 40-layer BS=2 run at `--max-seq-len 20480` has `kv_k` **100% non-zero**
+(104,857,600 / 104,857,600) with `norm=1.54342100e+04`.
+
+Full-graph *decode* on beta-4 needs `--optlevel 1` (`[F137]` host OOM otherwise;
+`--graph-splits 2` is a **no-op** under `DECODE_FULLGRAPH=1`) — see `BENCHMARK.md`.
 
 Its own `--cache-dir` is mandatory — topology + the sharding flags change the
 traced graph, and the metadata guard refuses to mix it with the LNC=2 cache.
@@ -192,6 +235,8 @@ batch ÷ prefill wall-time). References for the two configs:
 
 | Config | Wall time | Aggregate prompt tok/s |
 |---|---:|---:|
+| **Packed C32 ×4, TP=8/LNC=1, in-place rope-KV write (per-GQA-layer buffers), beta-4** | **9.995 s** | **4,002.1** |
+| Packed C32 ×4, TP=8/LNC=1, cache returned as graph output, beta-4 | 10.974 s | 3,645.0 |
 | **Packed C32 ×4, TP=8/LNC=1** (§3c, vocab-sharded head+embed, pg256; pre-hoisted-transpose) | **11.572 s** | **3,456.8** |
 | Packed C32 ×4, SBUF-resident + hoisted-transpose finish, TP=4/LNC=2 (`DN_PACK_C32=1 DN_PACK_N=4`) — LNC=2 default | 14.328 s | 2,791.7 |
 | Packed C32 ×4, SBUF-resident + transpose-once finish, TP=4/LNC=2 | 14.411 s | 2,775.6 |

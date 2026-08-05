@@ -550,8 +550,8 @@ def capture(args):
                 outputs = compiled_step(token, position, state[0], state[1])
                 return (
                     *outputs[:4],
-                    model.decode_kv_k,
-                    model.decode_kv_v,
+                    model.decode_kv_stacked("k"),
+                    model.decode_kv_stacked("v"),
                     *outputs[4:],
                 )
         else:
@@ -616,13 +616,12 @@ def capture(args):
         )
     state = tuple(tensor.to(device) for tensor in state_cpu)
     if S.USE_GQA_STATEFUL_KV:
-        model.decode_kv_k.copy_(state[2])
-        model.decode_kv_v.copy_(state[3])
+        model.load_decode_kv(state[2], state[3])
         state = (
             state[0],
             state[1],
-            model.decode_kv_k,
-            model.decode_kv_v,
+            model.decode_kv_stacked("k"),
+            model.decode_kv_stacked("v"),
         )
     if initial_token_capture is not None:
         token = initial_token_capture["next_id"].to(device)
