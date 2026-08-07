@@ -39,6 +39,13 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
+import os as _os
+# trn1 (NeuronCore-v2) lacks the trn2 on-chip shared-memory ISA. KERNEL_TRN1=1
+# places HBM *scratch* (not returned outputs) in per-core private HBM (nl.hbm).
+# Returned outputs must stay nl.shared_hbm (NKI frontend requirement). Default
+# OFF keeps trn2 codegen byte-identical.
+_SCRATCH = nl.hbm if _os.environ.get("KERNEL_TRN1", "0") == "1" else nl.shared_hbm
+
 K_DIM = 128
 V_DIM = 128
 V_HEADS = 12

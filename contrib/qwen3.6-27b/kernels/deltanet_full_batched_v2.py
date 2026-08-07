@@ -31,6 +31,13 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
+import os as _os
+# trn1 (NeuronCore-v2) lacks the trn2 on-chip shared-memory ISA. KERNEL_TRN1=1
+# places HBM *scratch* (not returned outputs) in per-core private HBM (nl.hbm).
+# Returned outputs must stay nl.shared_hbm (NKI frontend requirement). Default
+# OFF keeps trn2 codegen byte-identical.
+_SCRATCH = nl.hbm if _os.environ.get("KERNEL_TRN1", "0") == "1" else nl.shared_hbm
+
 
 K_DIM = 128
 V_DIM = 128
@@ -65,7 +72,7 @@ def nki_deltanet_full_batched(
     # v2: exp_g/beta gates kept in per-b SBUF TRANSPOSED to [1,V_HEADS] (head on free dim
     # → row-h slice has partition start 0, accepted as matmul moving). silu_z stays in HBM
     # scratch (consumed by tensor_tensor, which needs partition-0 and a [1,V_DIM] row).
-    silu_z_hbm = nl.ndarray((B * V_HEADS, V_DIM), dtype=nl.float32, buffer=nl.shared_hbm)
+    silu_z_hbm = nl.ndarray((B * V_HEADS, V_DIM), dtype=nl.float32, buffer=_SCRATCH)
 
     PMAX = nl.tile_size.pmax  # 128
     NUM_QKV_TILES = QKV_DIM // PMAX  # 20
@@ -151,7 +158,7 @@ def nki_deltanet_full_batched(
 
             conv_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.activation(
-                dst=prod, op=nl.copy, data=prod, bias=zb_p, scale=1.0,
+                dst=prod, op=nl.copy, data=prod, bias=0.0, scale=1.0,
                 reduce_op=nl.add, reduce_res=conv_sum,
                 reduce_cmd=nisa.reduce_cmd.reset_reduce,
             )
@@ -224,7 +231,7 @@ def nki_deltanet_full_batched(
             q_colS = nl.ndarray((K_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
             zb_k1 = nl.ndarray((K_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.memset(dst=zb_k1, value=0.0)
-            nisa.activation(dst=q_colS, op=nl.copy, data=q_pre, bias=zb_k1, scale=Q_SCALE)
+            nisa.activation(dst=q_colS, op=nl.copy, data=q_pre, bias=0.0, scale=Q_SCALE)
 
             k_slot = K_HEADS + kh
             k_col_in = nl.ndarray((K_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -348,7 +355,7 @@ def nki_deltanet_full_batched(
                 gated_f = nl.ndarray((1, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_tensor(dst=gated_f, data1=weighted, data2=sz, op=nl.multiply)
                 gated_bf = nl.ndarray((1, V_DIM), dtype=z.dtype, buffer=nl.sbuf)
-                nisa.activation(dst=gated_bf, op=nl.copy, data=gated_f, bias=zb1, scale=1.0)
+                nisa.activation(dst=gated_bf, op=nl.copy, data=gated_f, bias=0.0, scale=1.0)
                 nisa.dma_copy(dst=output[gh:gh + 1, 0:V_DIM], src=gated_bf)
 
     return new_state, new_conv_state, output

@@ -40,6 +40,13 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
+import os as _os
+# trn1 (NeuronCore-v2) lacks the trn2 on-chip shared-memory ISA. KERNEL_TRN1=1
+# places HBM *scratch* (not returned outputs) in per-core private HBM (nl.hbm).
+# Returned outputs must stay nl.shared_hbm (NKI frontend requirement). Default
+# OFF keeps trn2 codegen byte-identical.
+_SCRATCH = nl.hbm if _os.environ.get("KERNEL_TRN1", "0") == "1" else nl.shared_hbm
+
 
 K_DIM = 128
 V_DIM = 128
@@ -70,10 +77,10 @@ def nki_deltanet_full(
     output = nl.ndarray((V_HEADS, V_DIM), dtype=z.dtype, buffer=nl.shared_hbm)
     # Opt 3 scratch: silu(z) precomputed in HBM so per-head DMA back into
     # SBUF works — same pattern recurrent_v2 uses for its g/beta scalars.
-    silu_z_hbm = nl.ndarray((V_HEADS, V_DIM), dtype=nl.float32, buffer=nl.shared_hbm)
+    silu_z_hbm = nl.ndarray((V_HEADS, V_DIM), dtype=nl.float32, buffer=_SCRATCH)
     # Opt 5 scratch: exp_g and beta precomputed in HBM. Per-head DMA back.
-    exp_g_hbm = nl.ndarray((V_HEADS, 1), dtype=nl.float32, buffer=nl.shared_hbm)
-    beta_hbm = nl.ndarray((V_HEADS, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+    exp_g_hbm = nl.ndarray((V_HEADS, 1), dtype=nl.float32, buffer=_SCRATCH)
+    beta_hbm = nl.ndarray((V_HEADS, 1), dtype=nl.float32, buffer=_SCRATCH)
 
     PMAX = nl.tile_size.pmax  # 128
     NUM_QKV_TILES = QKV_DIM // PMAX  # 20
@@ -97,12 +104,12 @@ def nki_deltanet_full(
         cs_bf = nl.ndarray((PMAX, 3), dtype=conv_state.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=cs_bf, src=conv_state[ch_start:ch_start + PMAX, 0:3])
         cs_f = nl.ndarray((PMAX, 3), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(dst=cs_f, op=nl.copy, data=cs_bf, bias=zb_p, scale=1.0)
+        nisa.activation(dst=cs_f, op=nl.copy, data=cs_bf, bias=0.0, scale=1.0)
 
         nq_bf = nl.ndarray((PMAX, 1), dtype=mixed_qkv.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=nq_bf, src=mixed_qkv[ch_start:ch_start + PMAX])
         nq_f = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(dst=nq_f, op=nl.copy, data=nq_bf, bias=zb_p, scale=1.0)
+        nisa.activation(dst=nq_f, op=nl.copy, data=nq_bf, bias=0.0, scale=1.0)
 
         conv_in = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=conv_in[0:PMAX, 0:3], src=cs_f)
@@ -110,7 +117,7 @@ def nki_deltanet_full(
 
         # Write back updated conv_state (drop oldest column)
         ncs = nl.ndarray((PMAX, 3), dtype=conv_state.dtype, buffer=nl.sbuf)
-        nisa.activation(dst=ncs, op=nl.copy, data=conv_in[0:PMAX, 1:4], bias=zb_p, scale=1.0)
+        nisa.activation(dst=ncs, op=nl.copy, data=conv_in[0:PMAX, 1:4], bias=0.0, scale=1.0)
         nisa.dma_copy(dst=new_conv_state[ch_start:ch_start + PMAX, 0:3], src=ncs)
 
         cw = nl.ndarray((PMAX, CONV_KERNEL), dtype=nl.float32, buffer=nl.sbuf)
@@ -120,7 +127,7 @@ def nki_deltanet_full(
 
         conv_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(
-            dst=prod, op=nl.copy, data=prod, bias=zb_p, scale=1.0,
+            dst=prod, op=nl.copy, data=prod, bias=0.0, scale=1.0,
             reduce_op=nl.add, reduce_res=conv_sum,
             reduce_cmd=nisa.reduce_cmd.reset_reduce,
         )
@@ -254,7 +261,7 @@ def nki_deltanet_full(
         q_colS = nl.ndarray((K_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
         zb_k1 = nl.ndarray((K_DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=zb_k1, value=0.0)
-        nisa.activation(dst=q_colS, op=nl.copy, data=q_pre, bias=zb_k1, scale=Q_SCALE)
+        nisa.activation(dst=q_colS, op=nl.copy, data=q_pre, bias=0.0, scale=Q_SCALE)
 
         # ----- k for k-head kh: qkv_act[:, K_HEADS+kh] -> normed -----
         # Opt 4: keep k in column form. Same nc_matmul(k.T @ k) trick for
@@ -421,7 +428,7 @@ def nki_deltanet_full(
             nisa.tensor_tensor(dst=gated_f, data1=weighted, data2=sz, op=nl.multiply)
             # cast to bf16 + DMA out
             gated_bf = nl.ndarray((1, V_DIM), dtype=z.dtype, buffer=nl.sbuf)
-            nisa.activation(dst=gated_bf, op=nl.copy, data=gated_f, bias=zb1, scale=1.0)
+            nisa.activation(dst=gated_bf, op=nl.copy, data=gated_f, bias=0.0, scale=1.0)
             nisa.dma_copy(dst=output[h:h + 1, 0:V_DIM], src=gated_bf)
 
     return new_state, new_conv_state, output

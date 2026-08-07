@@ -26,6 +26,26 @@ _KERNELS_DIR = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels"),
 )
 sys.path.insert(0, _KERNELS_DIR)
+
+# torch-neuronx version gate. 2.11 (beta-4 container) ships torch_neuronx.nki_op
+# and uses the c10d backend="neuron" + torch.compile(backend="neuron") path.
+# 2.9 (host DLAMI venv on the trn1) has NO nki_op and runs via torch_xla/PJRT:
+# backend="xla" collectives, xm.xla_device(), torch.compile(backend="openxla").
+# Detect BEFORE the kernel imports below (they do `from torch_neuronx import
+# nki_op`) and install the 2.9 shim so those files import unmodified.
+import torch_neuronx
+_USE_XLA = not hasattr(torch_neuronx, "nki_op")
+if _USE_XLA:
+    import nki_op_compat  # installs torch_neuronx.nki_op (2.9 shim)
+_COMPILE_BACKEND = "openxla" if _USE_XLA else "neuron"
+
+# torch-neuronx 2.9's custom aten::silu lowering (Silu.forward_impl -> lazy-only
+# _xla_user_computation) has no fake impl and crashes torch.compile(backend=
+# "openxla") fake-tensor tracing. silu(x) = x*sigmoid(x) is bit-identical and
+# traces cleanly, so decompose on the XLA/PJRT path; keep native F.silu on
+# backend="neuron" (2.11).
+_silu = (lambda x: x * torch.sigmoid(x)) if _USE_XLA else F.silu
+
 import deltanet_full_ops  # registers torch.ops.deltanet.full
 import deltanet_full_batched_ops  # registers torch.ops.deltanet.full_batched (whole batch, 1 call/layer)
 import deltanet_chunked_ops  # registers torch.ops.deltanet.chunked_prefill (1 call/layer compiled prefill)
@@ -88,6 +108,20 @@ USE_DN_F32_STATE = os.environ.get("DNF32STATE", "0") == "1"
 # — measure the lever before building it. Default off = byte-identical baseline.
 NO_REDUCE = os.environ.get("NOREDUCE", "0") == "1"
 
+# ── Vocab (row) sharding of the two replicated [V, H] tensors (T1b) ──
+# embed and lm_head are the only weights TP leaves REPLICATED (2.54 GB bf16
+# each). Row-sharding both across TP frees ~3.8 GB/rank — the headroom that
+# lets the full 64-layer bf16 model fit at TP=4 on trn1 (16 GB/core). Each rank
+# owns a disjoint CONTIGUOUS vocab range so reconstruction is EXACT.
+USE_SHARDED_EMBED = os.environ.get("SHARDED_EMBED", "0") == "1"
+USE_SHARDED_LM_HEAD = os.environ.get("SHARDED_LM_HEAD", "0") == "1"
+
+if (USE_SHARDED_EMBED or USE_SHARDED_LM_HEAD) and NO_REDUCE:
+    raise SystemExit(
+        "SHARDED_EMBED/SHARDED_LM_HEAD require real all-reduces; NOREDUCE=1 would "
+        "silently return one rank's partial vocab slice. Pick one."
+    )
+
 
 def functional_all_reduce(x, op, group):
     """TP all-reduce, or identity when NOREDUCE=1 (cost-probe only — not correct)."""
@@ -107,27 +141,39 @@ INTERMEDIATE = 17408
 VOCAB = 248320
 RMS_EPS = 1e-6
 
-# DeltaNet constants (per-core after TP=4)
-DN_QKV_DIM = 2560       # in_proj_qkv output dim per core
-DN_K_HEADS = 4          # key heads per core
-DN_V_HEADS = 12         # value heads per core
+# ── Tensor-parallel degree. torchrun sets WORLD_SIZE; every per-core dim
+# below is derived from it so ONE file serves TP=4 (trn2, 2 devices) and
+# TP=8 (trn1, where a valid NeuronLink collective needs 4 devices = 8 cores;
+# TP=4 = 2 devices is an INVALID trn1 topology). Full (unsharded) counts: ──
+_TP = int(os.environ.get("WORLD_SIZE", "4"))
+DN_K_HEADS_FULL = 16
+DN_V_HEADS_FULL = 48
+GQA_Q_HEADS_FULL = 24
+GQA_KV_HEADS_FULL = 4
+
+# DeltaNet constants (per-core after TP)
+DN_K_HEADS = DN_K_HEADS_FULL // _TP           # 4 @ TP4, 2 @ TP8
+DN_V_HEADS = DN_V_HEADS_FULL // _TP           # 12 @ TP4, 6 @ TP8
 DN_K_DIM = 128          # per-head key dim
 DN_V_DIM = 128          # per-head value dim
-DN_VALUE_DIM = 1536     # total value dim per core (12*128)
+DN_VALUE_DIM = DN_V_HEADS * DN_V_DIM          # 1536 @ TP4, 768 @ TP8
+DN_QKV_DIM = 2 * DN_K_HEADS * DN_K_DIM + DN_V_HEADS * DN_V_DIM  # q+k+v: 2560@TP4, 1280@TP8
 DN_CONV_KERNEL = 4
 
-# GQA constants (per-core after TP=4)
-GQA_Q_HEADS = 6         # query heads per core
-GQA_KV_HEADS = 1        # KV heads per core
+# GQA constants (per-core after TP). Only 4 KV heads exist, so for TP>4 each
+# KV head is REPLICATED across (TP//4) ranks (see shard_gqa_kv); per-core KV
+# heads stays 1 for TP in {4,8} and the decode forward assumes 1 KV head/core.
+GQA_Q_HEADS = GQA_Q_HEADS_FULL // _TP         # 6 @ TP4, 3 @ TP8
+GQA_KV_HEADS = max(1, GQA_KV_HEADS_FULL // _TP)   # 1 @ TP4 and TP8
 GQA_HEAD_DIM = 256      # head dimension
-GQA_Q_DIM = 3072        # q_proj output per core (6*256*2 for query+gate)
+GQA_Q_DIM = GQA_Q_HEADS * GQA_HEAD_DIM * 2    # query+gate: 3072 @ TP4, 1536 @ TP8
 # RoPE is PARTIAL: config partial_rotary_factor=0.25 -> rotary applies to the
 # first 64 of 256 head dims; dims [64:256] pass through unrotated. theta=1e7.
 ROPE_DIM = int(GQA_HEAD_DIM * 0.25)  # 64
 ROPE_THETA = 10000000.0              # config rope_theta (1e7, NOT 1e6)
 
-# MLP constants (per-core after TP=4)
-MLP_DIM = 4352          # intermediate / tp
+# MLP constants (per-core after TP)
+MLP_DIM = INTERMEDIATE // _TP           # 4352 @ TP4, 2176 @ TP8
 
 
 def layer_type(i: int) -> str:
@@ -207,6 +253,25 @@ def build_random_sharded_weights(num_layers: int, seed: int) -> dict:
             })
         w["layers"].append(lw)
     return w
+
+
+def shard_vocab_rows(w: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
+    """This rank's contiguous row (vocab-dim) slice of a [V, H] tensor."""
+    vocab = w.shape[0]
+    assert vocab % world_size == 0, (
+        f"vocab {vocab} not divisible by world_size {world_size}; "
+        "vocab sharding needs equal contiguous ranges"
+    )
+    per_rank = vocab // world_size
+    return w[rank * per_rank:(rank + 1) * per_rank].clone()
+
+
+def apply_vocab_sharding(weights: dict, rank: int, world_size: int) -> None:
+    """In-place, flag-gated row-sharding of weights["embed"] / ["lm_head"]."""
+    if USE_SHARDED_EMBED:
+        weights["embed"] = shard_vocab_rows(weights["embed"], rank, world_size)
+    if USE_SHARDED_LM_HEAD:
+        weights["lm_head"] = shard_vocab_rows(weights["lm_head"], rank, world_size)
 
 
 def extract_weights(model) -> dict:
@@ -339,7 +404,7 @@ def rms_norm_gated(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor) ->
     """RMSNormGated: rms_norm(x) * weight * silu(gate). Applied per-head."""
     x_f32 = x.float()
     norm = x_f32 * torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + RMS_EPS)
-    return (weight * norm.to(x.dtype)) * F.silu(gate.float()).to(x.dtype)
+    return (weight * norm.to(x.dtype)) * _silu(gate.float()).to(x.dtype)
 
 
 def l2_norm(x: torch.Tensor) -> torch.Tensor:
@@ -386,10 +451,13 @@ class StaticDecodeModule(nn.Module):
     }
 
     def __init__(self, weights: dict, max_seq_len: int, world_size: int,
-                 fp8_weights: bool = False, batch_size: int = 1):
+                 fp8_weights: bool = False, batch_size: int = 1, rank: int = 0):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.world_size = world_size
+        # Needed by _embed_tokens / _lm_head_logits to locate this rank's
+        # vocab range when SHARDED_EMBED / SHARDED_LM_HEAD are on.
+        self.rank = rank
         self.tp_group = list(range(world_size))
         self.fp8_weights = fp8_weights
         self.batch_size = batch_size  # decode batch B; layers read this for B>1
@@ -486,6 +554,30 @@ class StaticDecodeModule(nn.Module):
                 w = w.t()
             return F.linear(x.to(w.dtype), w)
 
+    def _embed_tokens(self, ids: torch.Tensor) -> torch.Tensor:
+        """Embedding lookup, transparently handling a vocab-row-sharded table."""
+        if not USE_SHARDED_EMBED:
+            return F.embedding(ids, self.embed)
+        per_rank = self.embed.shape[0]
+        local_ids = ids - self.rank * per_rank
+        in_range = (local_ids >= 0) & (local_ids < per_rank)
+        safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
+        rows = F.embedding(safe_ids, self.embed)
+        rows = rows * in_range.unsqueeze(-1).to(rows.dtype)
+        return functional_all_reduce(rows, "sum", self.tp_group)
+
+    def _lm_head_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """LM head, transparently handling a vocab-row-sharded weight."""
+        if not USE_SHARDED_LM_HEAD:
+            return self._lin("lm_head_w", x)
+        local = self._lin("lm_head_w", x)
+        per_rank = local.shape[-1]
+        full_vocab = per_rank * self.world_size
+        lo = self.rank * per_rank
+        return functional_all_reduce(
+            F.pad(local, (lo, full_vocab - lo - per_rank)), "sum", self.tp_group
+        )
+
     def _init_rope(self, max_seq_len: int):
         """Precompute PARTIAL RoPE cos/sin tables (matches HF Qwen3.5).
 
@@ -515,7 +607,7 @@ class StaticDecodeModule(nn.Module):
         Returns: (logits, new_deltanet_states, new_conv_states, new_kv_cache_k, new_kv_cache_v)
         """
         # Embedding lookup: [B] -> [B, 1, 5120] (one token per batch row)
-        hidden = F.embedding(input_id, self.embed).unsqueeze(1)  # [B, 1, 5120]
+        hidden = self._embed_tokens(input_id).unsqueeze(1)  # [B, 1, 5120]
 
         # Clone mutable state for functional style
         dn_states = deltanet_states.clone()
@@ -543,7 +635,7 @@ class StaticDecodeModule(nn.Module):
 
         # Final norm + LM head
         hidden = rms_norm(hidden, self.final_norm)
-        logits = self._lin("lm_head_w", hidden.to(torch.bfloat16))  # [B, 1, vocab]
+        logits = self._lm_head_logits(hidden.to(torch.bfloat16))  # [B, 1, vocab]
 
         return logits.squeeze(1), dn_states, cv_states, kv_k, kv_v  # [B, vocab]
 
@@ -560,7 +652,7 @@ class StaticDecodeModule(nn.Module):
         Returns: (last_logits, dn_states, conv_states, kv_k, kv_v)
         """
         seq_len = input_ids.shape[0]
-        hidden = F.embedding(input_ids, self.embed).unsqueeze(0).float()  # [1, S, 5120] fp32
+        hidden = self._embed_tokens(input_ids).unsqueeze(0).float()  # [1, S, 5120] fp32
 
         dn_states = deltanet_states.clone()
         cv_states = conv_states.clone()
@@ -579,7 +671,7 @@ class StaticDecodeModule(nn.Module):
             hidden = hidden + self._mlp_prefill(i, normed)
 
         hidden = rms_norm(hidden, self.final_norm)
-        logits = self._lin("lm_head_w", hidden[:, -1:, :].to(torch.bfloat16))  # [1, 1, vocab]
+        logits = self._lm_head_logits(hidden[:, -1:, :].to(torch.bfloat16))  # [1, 1, vocab]
         return logits.squeeze(0), dn_states, cv_states, kv_k, kv_v
 
     def _deltanet_prefill(
@@ -611,7 +703,7 @@ class StaticDecodeModule(nn.Module):
             conv_out = conv_out + conv_b.unsqueeze(0).unsqueeze(-1)
         # Update conv_state: last 3 timesteps of the raw input
         cv_states[di, 0] = mixed_qkv.t()[:, -3:]  # [2560, 3]
-        mixed_qkv = F.silu(conv_out.squeeze(0).t())  # [S, 2560]
+        mixed_qkv = _silu(conv_out.squeeze(0).t())  # [S, 2560]
 
         # Split and reshape
         q = mixed_qkv[:, :DN_K_HEADS * DN_K_DIM].reshape(seq_len, DN_K_HEADS, DN_K_DIM)
@@ -745,7 +837,7 @@ class StaticDecodeModule(nn.Module):
         x_2d = x.squeeze(0).to(torch.bfloat16)  # [S, 5120]
         gate = self._lin(f"l{i}_mlp_gate", x_2d)
         up = self._lin(f"l{i}_mlp_up", x_2d)
-        hidden = F.silu(gate) * up
+        hidden = _silu(gate) * up
         out = self._lin(f"l{i}_mlp_down", hidden)
         out = functional_all_reduce(out, "sum", self.tp_group)
         return out.unsqueeze(0)  # [1, S, 5120]
@@ -954,7 +1046,7 @@ class StaticDecodeModule(nn.Module):
 
         gate = self._lin(f"l{i}_mlp_gate", x_2d)  # [1, 4352]
         up = self._lin(f"l{i}_mlp_up", x_2d)      # [1, 4352]
-        hidden = F.silu(gate) * up
+        hidden = _silu(gate) * up
         out = self._lin(f"l{i}_mlp_down", hidden)  # [1, 5120]
 
         # All-reduce after rowwise down_proj
@@ -1022,6 +1114,27 @@ def shard_qkv_colwise(linear, rank, world_size, key_dim, value_dim):
     linear.out_features = q_shard + q_shard + v_shard
 
 
+def shard_gqa_kv(linear, rank, world_size, head_dim):
+    """Shard (or, for TP > num_kv_heads, REPLICATE) a GQA k/v projection so
+    each rank holds exactly the single KV head its query-head slice attends to.
+
+    q_proj is colwise-sharded contiguously (head-major), so rank r owns query
+    heads [r*qpr:(r+1)*qpr]; with (Q_full/KV_full) query heads per KV group
+    those all map to KV head r // (world_size // num_kv). For world_size <=
+    num_kv this is exactly plain contiguous colwise sharding (TP=4 unchanged).
+    """
+    num_kv = linear.weight.shape[0] // head_dim
+    if world_size <= num_kv:
+        return shard_linear_colwise(linear, rank, world_size)
+    rep = world_size // num_kv          # ranks sharing one KV head (2 @ TP8)
+    kv_head = rank // rep
+    sl = slice(kv_head * head_dim, (kv_head + 1) * head_dim)
+    linear.weight = nn.Parameter(linear.weight.data[sl].clone())
+    if linear.bias is not None:
+        linear.bias = nn.Parameter(linear.bias.data[sl].clone())
+    linear.out_features = head_dim
+
+
 def shard_model(model, rank, world_size):
     """Apply TP=4 sharding to the model (on CPU, before weight extraction)."""
     lang = model.model.language_model
@@ -1044,8 +1157,9 @@ def shard_model(model, rank, world_size):
         else:
             attn = layer.self_attn
             shard_linear_colwise(attn.q_proj, rank, world_size)
-            shard_linear_colwise(attn.k_proj, rank, world_size)
-            shard_linear_colwise(attn.v_proj, rank, world_size)
+            # 4 KV heads: shard cleanly for TP<=4, replicate for TP=8.
+            shard_gqa_kv(attn.k_proj, rank, world_size, GQA_HEAD_DIM)
+            shard_gqa_kv(attn.v_proj, rank, world_size, GQA_HEAD_DIM)
             shard_linear_rowwise(attn.o_proj, rank, world_size)
 
         shard_linear_colwise(layer.mlp.gate_proj, rank, world_size)
@@ -1107,12 +1221,21 @@ def main():
         NUM_GQA = sum(1 for i in range(nl) if layer_type(i) == "gqa")
         VOCAB = 4096  # shrink embed/lm_head; decode graph shape is layer-driven
 
-    import torch_neuronx
-
-    dist.init_process_group(backend="neuron")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    device = torch.neuron.current_device()
+    if _USE_XLA:
+        # torch-neuronx 2.9 / PJRT: register the "xla" c10d backend, use the
+        # torch_xla device. (Validated on trn1 driver 2.29: 2-core all_reduce
+        # returns correctly where backend="neuron" SIGSEGVs.)
+        import torch_xla.core.xla_model as xm
+        import torch_xla.distributed.xla_backend  # noqa: F401  (registers "xla")
+        dist.init_process_group(backend="xla")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = xm.xla_device()
+    else:
+        dist.init_process_group(backend="neuron")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = torch.neuron.current_device()
 
     if rank == 0:
         tag = f"TINY({NUM_LAYERS}L, full-width)" if args.tiny else "Qwen 3.6 27B"
@@ -1146,11 +1269,18 @@ def main():
         weights = extract_weights(model)
         del model  # Free CPU memory
 
+    # Flag-gated row-sharding of the two replicated [V, H] vocab tensors.
+    apply_vocab_sharding(weights, rank, world_size)
+    if rank == 0 and (USE_SHARDED_EMBED or USE_SHARDED_LM_HEAD):
+        which = [n for n, on in (("embed", USE_SHARDED_EMBED),
+                                 ("lm_head", USE_SHARDED_LM_HEAD)) if on]
+        print(f"  Vocab-sharded across TP={world_size}: {', '.join(which)}")
+
     # 4. Create static decode module and move to device
     t0 = time.time()
     static_module = StaticDecodeModule(
         weights, args.max_seq_len, world_size, fp8_weights=args.fp8_weights,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size, rank=rank,
     )
     del weights
     static_module = static_module.to(device)
@@ -1178,10 +1308,10 @@ def main():
     # 6. Compile
     if not args.skip_compile:
         if rank == 0:
-            print("  Compiling with backend='neuron', fullgraph=True...")
+            print(f"  Compiling with backend='{_COMPILE_BACKEND}', fullgraph=True...")
         t0 = time.time()
         static_module.forward = torch.compile(
-            static_module.forward, backend="neuron", fullgraph=True, dynamic=False
+            static_module.forward, backend=_COMPILE_BACKEND, fullgraph=True, dynamic=False
         )
         if rank == 0:
             print(f"  torch.compile setup: {time.time()-t0:.1f}s")
@@ -1256,10 +1386,10 @@ def main():
                         f"({CHUNK_SIZE}); got S={S}."
                     )
                 if rank == 0:
-                    print(f"  Compiling prefill (backend='neuron', fullgraph=True, "
+                    print(f"  Compiling prefill (backend='{_COMPILE_BACKEND}', fullgraph=True, "
                           f"chunked DeltaNet C={CHUNK_SIZE})...")
                 static_module.prefill = torch.compile(
-                    static_module.prefill, backend="neuron", fullgraph=True, dynamic=False
+                    static_module.prefill, backend=_COMPILE_BACKEND, fullgraph=True, dynamic=False
                 )
 
             # COLD prefill: first call includes eager-graph trace + neuronx-cc compile.
@@ -1356,14 +1486,14 @@ def main():
                 logits, dn_states, conv_states, kv_k, kv_v = static_module(
                     const_it, const_pos, dn_states, conv_states, kv_k, kv_v
                 )
-            torch.neuron.synchronize()
+            xm.wait_device_ops() if _USE_XLA else torch.neuron.synchronize()
         dist.barrier()
         with torch.no_grad():
             for _ in range(profile_steps):
                 logits, dn_states, conv_states, kv_k, kv_v = static_module(
                     const_it, const_pos, dn_states, conv_states, kv_k, kv_v
                 )
-            torch.neuron.synchronize()
+            xm.wait_device_ops() if _USE_XLA else torch.neuron.synchronize()
         if rank == 0:
             print(f"  [profile] ran {profile_steps} decode steps for tracing; exiting")
         dist.barrier()
@@ -1429,7 +1559,7 @@ def main():
             logits, dn_states, conv_states, kv_k, kv_v = static_module(
                 const_it, const_pos, dn_states, conv_states, kv_k, kv_v
             )
-        torch.neuron.synchronize()
+        xm.wait_device_ops() if _USE_XLA else torch.neuron.synchronize()
     dist.barrier()
 
     # C1: no synchronize (reproduces the old measurement)
@@ -1449,7 +1579,7 @@ def main():
             logits, dn_states, conv_states, kv_k, kv_v = static_module(
                 const_it, const_pos, dn_states, conv_states, kv_k, kv_v
             )
-        torch.neuron.synchronize()
+        xm.wait_device_ops() if _USE_XLA else torch.neuron.synchronize()
     elapsed_c2_sync = time.time() - t0
 
     if rank == 0:
