@@ -15,7 +15,8 @@ from deltanet_chunked_v2_ref import build_constants, ref_chunk_single_head
 
 K_DIM = 128
 V_DIM = 128
-V_HEADS = 12
+# Env-driven so this validates the kernel at TP=4 (12, default) and TP=8 (6).
+V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))
 
 
 def run(C=16, S=64, seed=0, realistic_gates=True):

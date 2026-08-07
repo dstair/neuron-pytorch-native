@@ -41,10 +41,13 @@ _SCRATCH = nl.hbm if _os.environ.get("KERNEL_TRN1", "0") == "1" else nl.shared_h
 
 K_DIM = 128
 V_DIM = 128
-K_HEADS = 4
-V_HEADS = 12
-HEAD_GROUP = V_HEADS // K_HEADS  # 3
-QKV_DIM = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM  # 2560
+# Per-core head counts. Default = TP=4 per-core (trn2 path byte-identical);
+# static_decode injects DN_K_HEADS/DN_V_HEADS from WORLD_SIZE before import so
+# one kernel body serves TP=4 (4/12) and TP=8 (2/6). Mirrors the 35B kernels.
+K_HEADS = int(_os.environ.get("DN_K_HEADS", "4"))   # 4@TP4, 2@TP8
+V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))  # 12@TP4, 6@TP8
+HEAD_GROUP = V_HEADS // K_HEADS  # 3 @ both TP4 (12//4) and TP8 (6//2)
+QKV_DIM = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM  # 2560@TP4, 1280@TP8
 CONV_KERNEL = 4
 RMS_EPS = 1e-6
 

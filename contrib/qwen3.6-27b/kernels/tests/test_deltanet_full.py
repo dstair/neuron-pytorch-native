@@ -10,8 +10,10 @@ from deltanet_full import nki_deltanet_full
 
 K_DIM = 128
 V_DIM = 128
-K_HEADS = 4
-V_HEADS = 12
+# Env-driven per-core head counts so this test can validate the kernel at both
+# TP=4 (4/12, default) and TP=8 (DN_K_HEADS=2 DN_V_HEADS=6) shapes.
+K_HEADS = int(_os.environ.get("DN_K_HEADS", "4"))
+V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))
 HEAD_GROUP = V_HEADS // K_HEADS
 QKV_DIM = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM
 RMS_EPS = 1e-6
