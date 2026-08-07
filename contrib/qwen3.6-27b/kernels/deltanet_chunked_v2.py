@@ -48,7 +48,9 @@ _SCRATCH = nl.hbm if _os.environ.get("KERNEL_TRN1", "0") == "1" else nl.shared_h
 
 K_DIM = 128
 V_DIM = 128
-V_HEADS = 12
+# Per-core value-head count. Default = TP=4 per-core; static_decode injects
+# DN_V_HEADS from WORLD_SIZE before import (12@TP4, 6@TP8). Mirrors 35B.
+V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))  # 12@TP4, 6@TP8
 RMS_EPS = 1e-6
 
 
@@ -128,15 +130,26 @@ def _T(x, P, F):
 
 
 def _l2norm_rows(x, C, D, eps1, zC1):
-    """Per-row (per-partition) L2 normalize x[C,D] over the free axis D."""
+    """Per-row (per-partition) L2 normalize x[C,D] over the free axis D.
+
+    MUST match torch F.normalize(p=2, eps=1e-6) = x / max(||x||, eps), NOT the
+    old x / sqrt(ss + eps). For near-zero rows (conv+SiLU can produce them) the
+    two differ by ~1000x: old gave x/sqrt(1e-6)=x/1e-3, F.normalize gives
+    x/max(~0,1e-6)=x/1e-6. That mismatch = the real-model coherence bug (10%
+    near-zero rows -> cos 0.95/layer -> layer-5 cliff). Floor semantics fixes it.
+    Ported from the 35B deltanet_chunked_prefill_35b.py:_l2norm_rows."""
     ss = nl.ndarray((C, 1), dtype=nl.float32, buffer=nl.sbuf)
     sq = nl.ndarray((C, D), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=sq,
                     op=nl.square, data=x, bias=zC1, scale=1.0,
                     reduce_op=nl.add, reduce_res=ss, reduce_cmd=nisa.reduce_cmd.reset_reduce)
+    # norm = sqrt(ss); denom = max(norm, eps); rinv = 1/denom  (F.normalize floor)
+    norm = nl.ndarray((C, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=norm, op=nl.sqrt, data=ss, bias=zC1, scale=1.0)
+    denom = nl.ndarray((C, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=denom, data=norm, op0=nl.maximum, operand0=RMS_EPS)
     rinv = nl.ndarray((C, 1), dtype=nl.float32, buffer=nl.sbuf)
-    # rsqrt(ss + eps)  (no mean-divide: L2 norm, not RMS)
-    nisa.activation(dst=rinv, op=nl.rsqrt, data=ss, bias=eps1, scale=1.0)
+    nisa.activation(dst=rinv, op=nl.reciprocal, data=denom, bias=zC1, scale=1.0)
     o = nl.ndarray((C, D), dtype=nl.float32, buffer=nl.sbuf)
     # per-partition scalar broadcast over free axis
     nisa.tensor_scalar(dst=o, data=x, op0=nl.multiply, operand0=rinv)

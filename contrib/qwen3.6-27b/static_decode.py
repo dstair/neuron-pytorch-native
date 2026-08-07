@@ -27,6 +27,18 @@ _KERNELS_DIR = os.environ.get(
 )
 sys.path.insert(0, _KERNELS_DIR)
 
+# Inject per-core head counts into os.environ BEFORE the kernel modules are
+# imported below (they read DN_K_HEADS/DN_V_HEADS/GQA_Q_HEADS at import time to
+# size their tiles). The module-level DN_*_HEADS constants further down derive
+# from _TP too, but those run AFTER the kernel imports, so the head counts must
+# be materialized into the environment here. setdefault preserves any manual
+# override (e.g. for cross-TP debugging). Full model: 16 K / 48 V DeltaNet
+# heads, 24 GQA Q heads; per-core = full // TP.
+_TP_early = int(os.environ.get("WORLD_SIZE", "4"))
+os.environ.setdefault("DN_K_HEADS", str(16 // _TP_early))   # 4@TP4, 2@TP8
+os.environ.setdefault("DN_V_HEADS", str(48 // _TP_early))   # 12@TP4, 6@TP8
+os.environ.setdefault("GQA_Q_HEADS", str(24 // _TP_early))  # 6@TP4, 3@TP8
+
 # torch-neuronx version gate. 2.11 (beta-4 container) ships torch_neuronx.nki_op
 # and uses the c10d backend="neuron" + torch.compile(backend="neuron") path.
 # 2.9 (host DLAMI venv on the trn1) has NO nki_op and runs via torch_xla/PJRT:
@@ -1200,6 +1212,11 @@ def main():
     parser.add_argument("--fp8-weights", action="store_true",
                         help="Quantize Linear weights to FP8 E4M3 (W8A16). "
                              "Halves weight bandwidth, the dominant cost in decode.")
+    parser.add_argument("--gate-tp8-gqa", action="store_true",
+                        help="After a real prefill, assert that ranks sharing a "
+                             "REPLICATED GQA KV head (world_size > 4) hold "
+                             "bit-identical KV caches. End-to-end check of the "
+                             "shard_gqa_kv routing at TP=8 (adds an all-gather).")
     parser.add_argument("--tiny", action="store_true",
                         help="Fast-iteration mode: random, full-WIDTH, few-LAYER "
                              "checkpoint. Skips the real 27B load+shard+tokenizer. "
@@ -1330,10 +1347,45 @@ def main():
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        prompt = "The meaning of life is"
+        prompt = os.environ.get("QWEN27_PROMPT") or (
+            "The history of artificial intelligence began in antiquity with myths "
+            "and stories of artificial beings endowed with intelligence by master "
+            "craftsmen. In the twentieth century, the field of AI research was "
+            "founded at a workshop held on the campus of Dartmouth College during "
+            "the summer of 1956. The attendees became the founders and leaders of "
+            "AI research. They and their students produced programs that the press "
+            "described as astonishing: computers were learning checkers strategies, "
+            "solving word problems in algebra, proving logical theorems, and "
+            "speaking English. By the middle of the 1960s, research in the United "
+            "States was heavily funded by the Department of Defense, and laboratories "
+            "had been established around the world. Researchers in the field were "
+            "deeply optimistic about the future of their work, believing that a "
+            "machine as intelligent as a human being would exist within a generation. "
+            "The central goal of the field, they agreed, was to understand and build "
+            "intelligent machines that could reason, learn, and act autonomously."
+        )
         input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        # The chunked-DeltaNet prefill kernel requires S to be a multiple of
+        # CHUNK_SIZE. --prompt-len (a multiple of CHUNK_SIZE) left-pads the real
+        # prompt with pad tokens so the meaningful text stays at the end and its
+        # final-position logits drive generation. Only used in real mode here.
+        plen = getattr(args, "prompt_len", None)
+        _adj = "exact"
+        if plen is not None and plen != len(input_ids):
+            if len(input_ids) < plen:
+                # Left-pad with EOS. NOTE: DeltaNet is a recurrent linear-attention
+                # state that integrates EVERY token (no masking), so leading pads
+                # corrupt the state — pass a prompt LONGER than --prompt-len so this
+                # truncates instead. Padding is only a last resort to satisfy the
+                # chunked kernel's S % CHUNK_SIZE constraint.
+                pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                input_ids = [pad_id] * (plen - len(input_ids)) + input_ids
+                _adj = "LEFT-PADDED (DeltaNet state may be corrupted)"
+            else:
+                input_ids = input_ids[-plen:]  # keep the tail; no pad tokens
+                _adj = "truncated to last N real tokens"
         if rank == 0:
-            print(f"  Prompt: '{prompt}' ({len(input_ids)} tokens)")
+            print(f"  Prompt: {len(input_ids)} tokens ({_adj})")
 
     dist.barrier()
 
@@ -1422,6 +1474,48 @@ def main():
             logits, dn_states, conv_states, kv_k, kv_v = static_module.prefill(
                 input_tensor, dn_states, conv_states, kv_k, kv_v
             )
+
+            # --gate-tp8-gqa: verify the GQA KV-head REPLICATION on device. When
+            # world_size > GQA_KV_HEADS_FULL each KV head is shared by rep ranks
+            # (shard_gqa_kv). Since the residual stream (k_proj input) is
+            # all-reduced identical across ranks and rep-group ranks hold
+            # identical k/v weights, their post-prefill KV caches MUST be
+            # bit-identical. A mismatch localizes a routing bug. Order-sensitive
+            # fingerprint (sum, sumsq, index-weighted sum) makes a wrong-head
+            # collision astronomically unlikely.
+            if getattr(args, "gate_tp8_gqa", False):
+                if world_size <= GQA_KV_HEADS_FULL:
+                    if rank == 0:
+                        print(f"  [gate-tp8-gqa] world_size={world_size} <= "
+                              f"{GQA_KV_HEADS_FULL} KV heads; no replication to check.")
+                else:
+                    import torch_xla.core.xla_model as _xm
+                    rep = world_size // GQA_KV_HEADS_FULL
+
+                    def _fp(t):
+                        tf = t.float().reshape(-1)
+                        idx = torch.arange(tf.numel(), dtype=torch.float32, device=tf.device)
+                        return torch.stack([tf.sum(), (tf * tf).sum(), (tf * idx).sum()])
+
+                    fp = torch.cat([_fp(kv_k), _fp(kv_v)]).reshape(1, -1)  # [1,6]
+                    allfp = _xm.all_gather(fp, dim=0)                      # [world_size,6]
+                    _xm.mark_step()
+                    allfp = allfp.cpu()
+                    ok = True
+                    for gidx in range(GQA_KV_HEADS_FULL):
+                        members = [r for r in range(world_size) if r // rep == gidx]
+                        base = allfp[members[0]]
+                        for r in members[1:]:
+                            if not torch.equal(allfp[r], base):
+                                ok = False
+                                if rank == 0:
+                                    print(f"  [gate-tp8-gqa] FAIL rep-group {gidx}: rank {r} "
+                                          f"{allfp[r].tolist()} != rank {members[0]} {base.tolist()}")
+                    if rank == 0:
+                        print(f"  [gate-tp8-gqa] {'PASS ✓' if ok else 'FAIL ✗'}: "
+                              f"{GQA_KV_HEADS_FULL} rep-groups × {rep} ranks, "
+                              f"KV caches bit-identical within each replicated head")
+
             # prefill is BS=1; broadcast its next token across the B decode rows
             nid0 = logits[0, :].argmax().to(torch.long)
             next_id = nid0.reshape(1).expand(B).contiguous()  # [B] on device

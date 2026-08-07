@@ -31,8 +31,8 @@ from deltanet_chunked_v2_ref import build_constants, ref_chunk_single_head
 from chunked_prefill import neuron_chunk_gated_delta_rule
 
 # ── per-core DeltaNet dims (TP=4) ────────────────────────────────────────────
-K_HEADS = 4
-V_HEADS = 12
+K_HEADS = int(_os.environ.get("DN_K_HEADS", "4"))
+V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))
 K_DIM = 128
 V_DIM = 128
 CONV_K = 4

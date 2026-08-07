@@ -35,7 +35,7 @@ import os as _os
 _SCRATCH = nl.hbm if _os.environ.get("KERNEL_TRN1", "0") == "1" else nl.shared_hbm
 
 HEAD_DIM = 256
-Q_HEADS = 6
+Q_HEADS = int(_os.environ.get("GQA_Q_HEADS", "6"))  # 6@TP4, 3@TP8
 ROPE_DIM = 64
 HALF_ROPE = 32          # ROPE_DIM // 2
 RMS_EPS = 1e-6
