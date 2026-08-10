@@ -96,6 +96,10 @@ if USE_NKI_NORM:
 # Default off = eager torch path (unchanged baseline). C must divide S.
 USE_CHUNKED_PREFILL = os.environ.get("CHUNKEDPREFILL", "0") == "1"
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "64"))
+# Chunk size for the DECODE chunked-DeltaNet path (DECODE_VIA_CHUNKED). Independent of
+# the prefill CHUNK_SIZE: decode is a single token, so DECODE_CHUNK=1 is exact and avoids
+# the ~CHUNK_SIZE× padding waste. Default 1.
+DECODE_CHUNK = int(os.environ.get("DECODE_CHUNK", "1"))
 
 # ── trn1 coherence fixes (default off; trn2/TP=4 path byte-identical when off) ──
 # The full 64-layer prefill, compiled as ONE fullgraph NEFF (--compile-prefill) or
@@ -116,6 +120,17 @@ USE_DECODE_VIA_CHUNKED = os.environ.get("DECODE_VIA_CHUNKED", "0") == "1"
 # (forward run eager, NOT torch.compiled) so each layer executes as its own sub-graph.
 # Verified coherent on device (token-identical to the CPU reference) with DECODE_VIA_CHUNKED.
 USE_DECODE_SEGMENTED = os.environ.get("DECODE_SEGMENTED", "0") == "1"
+# Segment STRIDE: mark_step every N layers instead of every layer. N=1 (default) is the
+# original per-layer break; larger N runs each N-layer span as one (cached) PJRT sub-graph,
+# cutting graph-break/sync overhead. The monolithic case (N>=NUM_LAYERS) miscompiles; the
+# largest coherent N is the perf sweet spot (swept on device). Only active when the matching
+# *_SEGMENTED flag is on.
+PREFILL_SEGMENT_EVERY = max(1, int(os.environ.get("PREFILL_SEGMENT_EVERY", "1")))
+DECODE_SEGMENT_EVERY = max(1, int(os.environ.get("DECODE_SEGMENT_EVERY", "1")))
+# A2: compile the decode step into this many coarse segments (each a cached NEFF over an
+# N-layer span), instead of the monolithic forward NEFF (which miscompiles at TP=8) or the
+# eager per-layer path. 0 = off. NUM_LAYERS => per-layer; smaller => larger spans/fewer NEFFs.
+DECODE_COMPILE_SPLITS = int(os.environ.get("DECODE_COMPILE_SPLITS", "0"))
 
 # Lean KV-cache write. The decode KV write puts one token (position p, shared
 # across the B batch rows) into kv[gi] = [B, max_seq, 256]. The scatter_ path
@@ -510,6 +525,10 @@ class StaticDecodeModule(nn.Module):
         # F.linear expects [out, in]. Kept as a set so _lin can branch by name.
         self._transposed_w: set[str] = set()
 
+        # A2: list of (lo, hi, compiled_fn) coarse decode segments, or None for the
+        # eager flat loop. Populated by setup_decode_segments().
+        self._decode_segments = None
+
         # Register-and-pop helper — drops the source-dict entry as we go so
         # the original bf16 weights get freed during construction. Without
         # this, peak memory ~doubles on a 27B model and OOMs across 4 ranks.
@@ -582,6 +601,17 @@ class StaticDecodeModule(nn.Module):
         self.register_buffer("chunk_m_strict", (_i > _j).float())
         self.register_buffer("chunk_eye", torch.eye(C, dtype=torch.float32))
 
+        # Separate [Cd,Cd] constants for the DECODE chunked path (DECODE_VIA_CHUNKED).
+        # Decode is one token, so Cd=1 (DECODE_CHUNK=1) is exact and avoids padding a
+        # single token up to CHUNK_SIZE (~CHUNK_SIZE× wasted DeltaNet work). Verified
+        # bit-identical to the CHUNK_SIZE-padded path on device.
+        Cd = DECODE_CHUNK
+        _di = torch.arange(Cd).view(Cd, 1)
+        _dj = torch.arange(Cd).view(1, Cd)
+        self.register_buffer("dchunk_m_incl", (_di >= _dj).float())
+        self.register_buffer("dchunk_m_strict", (_di > _dj).float())
+        self.register_buffer("dchunk_eye", torch.eye(Cd, dtype=torch.float32))
+
     def _lin(self, name: str, x: torch.Tensor) -> torch.Tensor:
         """Linear by attribute name. Picks bf16 weight or FP8 weight+scale
         based on self.fp8_weights, set at __init__ time."""
@@ -636,6 +666,48 @@ class StaticDecodeModule(nn.Module):
         self.register_buffer("rope_cos", emb.cos().unsqueeze(0).unsqueeze(0))  # [1, 1, max_seq, rope_dim]
         self.register_buffer("rope_sin", emb.sin().unsqueeze(0).unsqueeze(0))  # [1, 1, max_seq, rope_dim]
 
+    def _run_decode_layers(self, lo, hi, hidden, cos, sin, position,
+                           dn_states, cv_states, kv_k, kv_v):
+        """Decode layers [lo, hi): the body of one compiled coarse segment (A2).
+        Threads `hidden` (returned) and mutates the state tensors in place."""
+        for i in range(lo, hi):
+            normed = rms_norm(hidden, getattr(self, f"l{i}_input_norm"))
+            if layer_type(i) == "deltanet":
+                hidden = hidden + self._deltanet_layer(i, normed, dn_states, cv_states)
+            else:
+                hidden = hidden + self._gqa_layer(i, normed, cos, sin, position, kv_k, kv_v)
+            normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
+            hidden = hidden + self._mlp_layer(i, normed)
+        return hidden
+
+    def setup_decode_segments(self, n_splits: int):
+        """Split the NUM_LAYERS decode loop into n_splits ~even spans and torch.compile
+        each into its own (cached) NEFF. n_splits=NUM_LAYERS => per-layer; n_splits=1 =>
+        the monolithic graph (miscompiles at TP=8). forward() dispatches through the
+        resulting self._decode_segments and is NOT itself compiled. Returns the [(lo,hi)]
+        bounds. Call with n_splits<=0 to disable (revert to the eager flat loop)."""
+        if n_splits <= 0:
+            self._decode_segments = None
+            return []
+        # Each span is a distinct graph sharing one closure code object, so Dynamo counts
+        # them as recompiles of that code object; raise the cache limit above the span count
+        # (default 8 would fail for n_splits>8, and the sweep accumulates across configs).
+        import torch._dynamo as _dyn
+        _dyn.config.cache_size_limit = max(_dyn.config.cache_size_limit, 4 * NUM_LAYERS)
+        NL = NUM_LAYERS
+        bounds = [round(k * NL / n_splits) for k in range(n_splits + 1)]
+        segs = []
+        for k in range(n_splits):
+            lo, hi = bounds[k], bounds[k + 1]
+            if lo == hi:
+                continue
+            def fn(hidden, cos, sin, position, dn, cv, kk, vv, _lo=lo, _hi=hi):
+                return self._run_decode_layers(_lo, _hi, hidden, cos, sin, position, dn, cv, kk, vv)
+            fn = torch.compile(fn, backend=_COMPILE_BACKEND, fullgraph=True, dynamic=False)
+            segs.append((lo, hi, fn))
+        self._decode_segments = segs
+        return [(lo, hi) for (lo, hi, _) in segs]
+
     def forward(
         self,
         input_id: torch.Tensor,       # [B] - one token id per batch row
@@ -662,23 +734,23 @@ class StaticDecodeModule(nn.Module):
         cos = self.rope_cos.squeeze(0).squeeze(0).index_select(0, position.unsqueeze(0)).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, 64]
         sin = self.rope_sin.squeeze(0).squeeze(0).index_select(0, position.unsqueeze(0)).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, 64]
 
-        # ─── Layer Loop (unrolled at trace time) ─────────────────────────
-        for i in range(NUM_LAYERS):
-            # Pre-attention norm
-            normed = rms_norm(hidden, getattr(self, f"l{i}_input_norm"))
-
-            if layer_type(i) == "deltanet":
-                hidden = hidden + self._deltanet_layer(i, normed, dn_states, cv_states)
-            else:
-                hidden = hidden + self._gqa_layer(i, normed, cos, sin, position, kv_k, kv_v)
-
-            # Post-attention norm + MLP
-            normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
-            hidden = hidden + self._mlp_layer(i, normed)
-            # trn1: break the monolithic decode graph into per-layer sub-graphs
-            # (forward must be run eager — not torch.compiled — when this is set).
-            if USE_DECODE_SEGMENTED:
-                _mark_step()
+        # ─── Layer Loop ──────────────────────────────────────────────────
+        # A2: when compiled coarse segments are set up (setup_decode_segments), dispatch
+        # through them — each is a torch.compile'd NEFF over an N-layer span, threading
+        # `hidden` and mutating the state tensors by reference. This recovers most of the
+        # single-NEFF perf while sidestepping the monolithic-decode miscompile at TP=8.
+        if self._decode_segments is not None:
+            for (lo, hi, fn) in self._decode_segments:
+                hidden = fn(hidden, cos, sin, position, dn_states, cv_states, kv_k, kv_v)
+        else:
+            for i in range(NUM_LAYERS):
+                hidden = self._run_decode_layers(
+                    i, i + 1, hidden, cos, sin, position, dn_states, cv_states, kv_k, kv_v
+                )
+                # trn1: break the monolithic decode graph into N-layer sub-graphs
+                # (forward run eager — not torch.compiled — when this is set).
+                if USE_DECODE_SEGMENTED and (i + 1) % DECODE_SEGMENT_EVERY == 0:
+                    _mark_step()
 
         # Final norm + LM head
         hidden = rms_norm(hidden, self.final_norm)
@@ -716,8 +788,8 @@ class StaticDecodeModule(nn.Module):
 
             normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
             hidden = hidden + self._mlp_prefill(i, normed)
-            # trn1: break the monolithic prefill graph into per-layer sub-graphs.
-            if USE_PREFILL_SEGMENTED:
+            # trn1: break the monolithic prefill graph into N-layer sub-graphs.
+            if USE_PREFILL_SEGMENTED and (i + 1) % PREFILL_SEGMENT_EVERY == 0:
                 _mark_step()
 
         hidden = rms_norm(hidden, self.final_norm)
@@ -908,7 +980,7 @@ class StaticDecodeModule(nn.Module):
         norm_w = getattr(self, f"l{i}_dn_norm")
         A_log = getattr(self, f"l{i}_dn_A_log")
         dt_bias = getattr(self, f"l{i}_dn_dt_bias")
-        C = CHUNK_SIZE
+        C = DECODE_CHUNK
         H = DN_V_HEADS
 
         mixed = self._lin(f"l{i}_dn_qkv", x_2d)              # [1, QKV]
@@ -945,7 +1017,7 @@ class StaticDecodeModule(nn.Module):
         state_in = dn_states[di, 0].float()                  # [H*Kd, Vd]
         out_hm, new_state = torch.ops.deltanet.chunked_prefill(
             state_in, q_hm, k_hm, v_hm, g_hm, beta_hm,
-            self.chunk_m_incl, self.chunk_m_strict, self.chunk_eye,
+            self.dchunk_m_incl, self.dchunk_m_strict, self.dchunk_eye,
         )
         dn_states[di, 0] = new_state.reshape(DN_V_HEADS * DN_K_DIM, DN_V_DIM).to(dn_states.dtype)
         attn_out = out_hm.reshape(H, C, DN_V_DIM)[:, 0, :]    # [H, Vd] (row 0 = real token)
@@ -1430,7 +1502,15 @@ def main():
                         dtype=dtype, device=device)
 
     # 6. Compile
-    if not args.skip_compile and not USE_DECODE_SEGMENTED:
+    if DECODE_COMPILE_SPLITS > 0:
+        # A2: compile the decode step into coarse per-span NEFFs (forward stays eager and
+        # dispatches through them). Sidesteps the monolithic-decode miscompile at TP=8.
+        t0 = time.time()
+        bounds = static_module.setup_decode_segments(DECODE_COMPILE_SPLITS)
+        if rank == 0:
+            print(f"  Decode compiled into {len(bounds)} segments {bounds} "
+                  f"(backend='{_COMPILE_BACKEND}'); setup {time.time()-t0:.1f}s")
+    elif not args.skip_compile and not USE_DECODE_SEGMENTED:
         if rank == 0:
             print(f"  Compiling with backend='{_COMPILE_BACKEND}', fullgraph=True...")
         t0 = time.time()
