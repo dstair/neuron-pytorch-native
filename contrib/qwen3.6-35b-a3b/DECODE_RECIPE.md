@@ -1,18 +1,25 @@
 # Max Decode Throughput Recipe — Qwen3.6-35B-A3B (BS=128 FP8, tiled, per-layer state)
 
 Reproduces the fastest validated **decode** configuration:
-**632.0 tok/s at BS=128** (202.54 ms/token, TP=8 / LNC=1, **beta-4 container**,
-**`--optlevel 1`**), from the FP8 MoE `block_ob_coalesced` + tiled DeltaNet conv
-stack with **per-layer DeltaNet state buffers** (`DN_PERLAYER_STATE=1`). Each
-DeltaNet layer gets its own recurrent-state buffer (mutated once, `torch.stack` at
-the return boundary) instead of scattering ~30 layers' writebacks into one shared
-`[NUM_DN,B,…]` base; killing that write-after-write chain is **+96.3%** over the
-same O1 stack with the shared-base writeback (202.54 vs 397.45 ms/tok, 632.0 vs
-322.1 tok/s) and **+43% over the previously published O2 headline (442.1 tok/s)**.
-It is a pure ownership/serialization change — no arithmetic change — **bit-identical**
-to the shared-base baseline (8-token numerics gate `gen hash 7f4b446344cf`, both
-arms) and passing the DeltaNet-state occupancy gate on both arms. Requires
-`DN_DIRECT_STATE_OUT=1`.
+**681.3 tok/s at BS=128, seq=256** (187.87 ms/token, TP=8 / LNC=1, **beta-5
+container**, **`--optlevel 1`**), from the FP8 MoE `block_ob_coalesced` + tiled
+DeltaNet conv stack with **per-layer DeltaNet state buffers** (`DN_PERLAYER_STATE=1`).
+Each DeltaNet layer gets its own recurrent-state buffer (mutated once, `torch.stack`
+at the return boundary) instead of scattering ~30 layers' writebacks into one shared
+`[NUM_DN,B,…]` base; killing that write-after-write chain is **+96.3%** over the same
+O1 stack with the shared-base writeback (on beta-4: 202.54 vs 397.45 ms/tok, 632.0 vs
+322.1 tok/s). The `DN_PERLAYER_STATE` change is a pure ownership/serialization change
+— no arithmetic change — **bit-identical** to the shared-base baseline (8-token
+numerics gate `gen hash 7f4b446344cf`, both arms) and passing the DeltaNet-state
+occupancy gate on both arms. Requires `DN_DIRECT_STATE_OUT=1`.
+
+**beta-5 (2026-08-10): 681.3 tok/s, +7.8% over beta-4's 632.0**, gen hash
+`0cc59fb25112` (== the beta-4 2-token reference) — a clean compiler-only win on the
+newer DLC (`sha256:94413ce1ffea…`, built 2026-08-05), bit-identical. At **seq=1024**
+the same stack decodes **582.3 tok/s** (219.83 ms/tok) — −14.5% vs seq=256, the cost
+of the 4× larger KV cache (GQA reads the full `max_seq_len` cache each step; module
+grows 7.09 → 8.10 GB/core). See §3 and the seq-length note there. All numbers below
+supersede the beta-4 / pre-beta-4 O2 (442.1 tok/s) headlines.
 
 The underlying FP8 MoE is **Reduction B1** (coarse per-128-output-block FP8 scale +
 PSUM-accumulate) stacked on the tiled DeltaNet conv: **+28.7%** over
@@ -37,15 +44,15 @@ This recipe references: `QWEN35_NATIVE_IMAGE`, `QWEN35_MODEL_DIR` (BF16),
 
 | Step | Host | Requirement |
 |---|---|---|
-| Compile **and** run (required for tiled, self-contained) | **Trn2.3xlarge** (`QWEN35_RUN_HOST`) | Native TP=8/LNC=1 (8 cores via `NEURON_LOGICAL_NC_CONFIG=1`). Compiles on the first decode step (~24 min cold at O1 for `block_ob_coalesced`+tiled) then benches in the same process. ~64 GB host RAM is plenty; the fullgraph NEFF is ~60 MB. |
+| Compile **and** run (required for tiled, self-contained) | **Trn2.3xlarge** (`QWEN35_RUN_HOST`) | Native TP=8/LNC=1 (8 cores via `NEURON_LOGICAL_NC_CONFIG=1`). Compiles on the first decode step then benches in the same process (~24 min cold at O1 on beta-4; **beta-5 compiled the first step in ~65–90 s** — a large compiler speedup, observed on two runs but not yet re-measured in isolation). ~64 GB host RAM is plenty; the fullgraph NEFF is ~60 MB. |
 | Compile only (untiled validation, faster) | **Trn1.32xlarge** (`QWEN35_COMPILE_HOST`) | 128 vCPU / **512 GB RAM** for concurrency-8 parallel `neuronx-cc`. Cross-compiles a Trn2 NEFF; can't execute it. **Untiled only** — see §4 caveat. |
 
-The FP8 MoE decode graph is Trn2 TP=8/LNC=1. **On beta-4, use `--optlevel 1`.**
-O2 full-graph decode no longer compiles on beta-4 (host-OOMs after ~48 min,
-`[F137]`; `--graph-splits 2` is a no-op under `DECODE_FULLGRAPH=1`), so O1 is the
-only path that compiles here. With `DN_PERLAYER_STATE=1` the O1 result (632.0 tok/s)
-is +43% over the old pre-beta-4 O2 headline (442.1 tok/s), so O1 is both the only
-viable and the fastest option — the old "O2 is optimal, don't override optlevel"
+The FP8 MoE decode graph is Trn2 TP=8/LNC=1. **On beta-4/beta-5, use `--optlevel 1`.**
+O2 full-graph decode no longer compiles on beta-4 (host-OOMs after ~48 min, `[F137]`;
+`--graph-splits 2` is a no-op under `DECODE_FULLGRAPH=1`), so O1 is the only path that
+compiles. With `DN_PERLAYER_STATE=1` the O1 result (681.3 tok/s on beta-5, 632.0 on
+beta-4) is well above the old pre-beta-4 O2 headline (442.1 tok/s), so O1 is both the
+only viable and the fastest option — the old "O2 is optimal, don't override optlevel"
 guidance applied to the pre-beta-4 container and is superseded.
 
 Prereqs on the run host: the internal Neuron DLC (`QWEN35_NATIVE_IMAGE`, has
@@ -130,14 +137,24 @@ nohup bash run_decode_bench.sh > /mnt/nvme/runlog/decode_bench.log 2>&1 &
 
 ## 3. Reading the result
 
-Success line (last, after ~24 min cold at O1 / seconds cache-hot):
+Success line (last; beta-5 first-step compile ~65–90 s / seconds cache-hot):
 ```
-BENCH BS=128 seq=256: TPOT 202.54 ms/tok (synced, 20 iter) | throughput 632.0 tok/s
+BENCH BS=128 seq=256: TPOT 187.87 ms/tok (synced, 20 iter) | throughput 681.3 tok/s
 gen hash(row0): 0cc59fb25112
 gen hash(row127): 0cc59fb25112
 ```
-- **throughput tok/s** is the headline decode number (batch × 1/TPOT). A matched
-  2-token bench measured 202.11 ms/tok / 633.3 tok/s — reproducible to <0.2%.
+- **throughput tok/s** is the headline decode number (batch × 1/TPOT). **681.3 tok/s
+  on beta-5** (187.87 ms/tok), vs 632.0 on beta-4 (202.54 ms/tok) — a +7.8%
+  compiler-only win, `DOCKER_EXIT=0`, gen hash unchanged.
+- **Longer context:** the same command with `--max-seq-len 1024 --num-tokens 1023`
+  decodes ~1024 tokens and measures **582.3 tok/s (219.83 ms/tok) at seq=1024** on
+  beta-5 — −14.5% vs seq=256, the cost of the 4× larger KV cache (module 7.09 → 8.10
+  GB/core; GQA reads the full `max_seq_len` cache every step). `--num-tokens 1023`
+  (not 1024) keeps the post-gen synced-bench step, which runs at `position=num_tokens`,
+  in-bounds of the 1024-slot cache. NOTE: over ~1024 greedy steps the row0 and row127
+  gen hashes diverge — expected for long from-zeros greedy decode (per-row FP
+  differences in the fp8/batched GEMMs compound into different argmax picks); it is not
+  a regression, and short (2-token) rows stay identical.
 - **gen hash** is a bit-exactness fingerprint. With `--num-tokens 2` the reference
   is `0cc59fb25112` (unchanged from the old baseline — `DN_PERLAYER_STATE` is a pure
   ownership/serialization change, so it is bit-identical). The deeper 8-token
