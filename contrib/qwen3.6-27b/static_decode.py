@@ -58,6 +58,17 @@ _COMPILE_BACKEND = "openxla" if _USE_XLA else "neuron"
 # backend="neuron" (2.11).
 _silu = (lambda x: x * torch.sigmoid(x)) if _USE_XLA else F.silu
 
+# Per-layer graph break for PREFILL_SEGMENTED (XLA/PJRT only). On backend="neuron"
+# there is no lazy accumulation to break, so it is a no-op.
+if _USE_XLA:
+    import torch_xla.core.xla_model as _xm_mod
+
+    def _mark_step():
+        _xm_mod.mark_step()
+else:
+    def _mark_step():
+        pass
+
 import deltanet_full_ops  # registers torch.ops.deltanet.full
 import deltanet_full_batched_ops  # registers torch.ops.deltanet.full_batched (whole batch, 1 call/layer)
 import deltanet_chunked_ops  # registers torch.ops.deltanet.chunked_prefill (1 call/layer compiled prefill)
@@ -85,6 +96,26 @@ if USE_NKI_NORM:
 # Default off = eager torch path (unchanged baseline). C must divide S.
 USE_CHUNKED_PREFILL = os.environ.get("CHUNKEDPREFILL", "0") == "1"
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "64"))
+
+# ── trn1 coherence fixes (default off; trn2/TP=4 path byte-identical when off) ──
+# The full 64-layer prefill, compiled as ONE fullgraph NEFF (--compile-prefill) or
+# accumulated as one PJRT lazy graph, MISCOMPILES at TP=8 (coherent per-layer/
+# segmented; incoherent 'long' monolithic). PREFILL_SEGMENTED=1 inserts an
+# xm.mark_step() between prefill layers so each layer executes as its own sub-graph.
+USE_PREFILL_SEGMENTED = os.environ.get("PREFILL_SEGMENTED", "0") == "1"
+# The B=1 decode DeltaNet kernel (deltanet_full) is numerically wrong at TP=8/H=6
+# (device decode is incoherent from step 0, whether compiled or segmented, while a
+# torch decode from the same state is coherent). DECODE_VIA_CHUNKED=1 routes the B=1
+# decode DeltaNet through the VALIDATED chunked_prefill NKI kernel instead — the
+# single decode token is zero-padded to a CHUNK_SIZE chunk (pad rows have beta=g=0 =>
+# state-preserving no-ops), and output row 0 / the final state are taken.
+USE_DECODE_VIA_CHUNKED = os.environ.get("DECODE_VIA_CHUNKED", "0") == "1"
+# The single-token decode forward, compiled as ONE fullgraph NEFF, ALSO miscompiles at
+# TP=8 (garbage regardless of which DeltaNet kernel it uses) — same failure class as the
+# monolithic prefill. DECODE_SEGMENTED=1 inserts an xm.mark_step() between decode layers
+# (forward run eager, NOT torch.compiled) so each layer executes as its own sub-graph.
+# Verified coherent on device (token-identical to the CPU reference) with DECODE_VIA_CHUNKED.
+USE_DECODE_SEGMENTED = os.environ.get("DECODE_SEGMENTED", "0") == "1"
 
 # Lean KV-cache write. The decode KV write puts one token (position p, shared
 # across the B batch rows) into kv[gi] = [B, max_seq, 256]. The scatter_ path
@@ -644,6 +675,10 @@ class StaticDecodeModule(nn.Module):
             # Post-attention norm + MLP
             normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
             hidden = hidden + self._mlp_layer(i, normed)
+            # trn1: break the monolithic decode graph into per-layer sub-graphs
+            # (forward must be run eager — not torch.compiled — when this is set).
+            if USE_DECODE_SEGMENTED:
+                _mark_step()
 
         # Final norm + LM head
         hidden = rms_norm(hidden, self.final_norm)
@@ -681,6 +716,9 @@ class StaticDecodeModule(nn.Module):
 
             normed = rms_norm(hidden, getattr(self, f"l{i}_post_norm"))
             hidden = hidden + self._mlp_prefill(i, normed)
+            # trn1: break the monolithic prefill graph into per-layer sub-graphs.
+            if USE_PREFILL_SEGMENTED:
+                _mark_step()
 
         hidden = rms_norm(hidden, self.final_norm)
         logits = self._lm_head_logits(hidden[:, -1:, :].to(torch.bfloat16))  # [1, 1, vocab]
@@ -854,6 +892,70 @@ class StaticDecodeModule(nn.Module):
         out = functional_all_reduce(out, "sum", self.tp_group)
         return out.unsqueeze(0)  # [1, S, 5120]
 
+    def _deltanet_decode_chunked(self, i: int, x_2d: torch.Tensor,
+                                 dn_states: torch.Tensor, cv_states: torch.Tensor):
+        """B=1 decode DeltaNet via the validated chunked_prefill NKI kernel.
+
+        Mirrors the eager chunked-prefill assembly for a single token: rolling
+        single-token causal conv (bias-free, matching HF), RAW q/k/v (the kernel
+        L2-norms + applies the 1/sqrt(K) scale internally), then the recurrence with
+        the token zero-padded to a full CHUNK_SIZE chunk (pad rows: beta=g=0 => the
+        recurrence leaves the state unchanged). State layout matches _deltanet_prefill
+        exactly, so it consumes the prefill's returned state directly.
+        """
+        di = deltanet_index(i)
+        conv_w = getattr(self, f"l{i}_dn_conv_w")            # [QKV,1,4]
+        norm_w = getattr(self, f"l{i}_dn_norm")
+        A_log = getattr(self, f"l{i}_dn_A_log")
+        dt_bias = getattr(self, f"l{i}_dn_dt_bias")
+        C = CHUNK_SIZE
+        H = DN_V_HEADS
+
+        mixed = self._lin(f"l{i}_dn_qkv", x_2d)              # [1, QKV]
+        cur = mixed.t()                                      # [QKV, 1] raw frame
+        conv_in = torch.cat([cv_states[di, 0], cur], dim=-1)  # [QKV, 4]
+        conv_out = F.conv1d(conv_in.unsqueeze(0), conv_w, groups=DN_QKV_DIM)  # [1,QKV,1]
+        cv_states[di, 0] = conv_in[:, 1:].to(cv_states.dtype)  # rolling last-3
+        mixed = _silu(conv_out.reshape(1, DN_QKV_DIM))       # [1, QKV]
+
+        q = mixed[:, :DN_K_HEADS * DN_K_DIM].reshape(1, DN_K_HEADS, DN_K_DIM)
+        k = mixed[:, DN_K_HEADS * DN_K_DIM:2 * DN_K_HEADS * DN_K_DIM].reshape(1, DN_K_HEADS, DN_K_DIM)
+        v = mixed[:, 2 * DN_K_HEADS * DN_K_DIM:].reshape(1, DN_V_HEADS, DN_V_DIM)
+        q = q.repeat_interleave(DN_V_HEADS // DN_K_HEADS, dim=1)  # [1,H,Kd]
+        k = k.repeat_interleave(DN_V_HEADS // DN_K_HEADS, dim=1)
+
+        a_out = self._lin(f"l{i}_dn_a", x_2d).float()        # [1, H]
+        b_out = self._lin(f"l{i}_dn_b", x_2d)                # [1, H]
+        beta = b_out.sigmoid().float()                       # [1, H]
+        g = -A_log.float().exp() * F.softplus(a_out + dt_bias.float())  # [1, H]
+
+        # Head-major, single real token at chunk position 0; pad rest with zeros.
+        q_hm = q.new_zeros(H, C, DN_K_DIM, dtype=torch.float32)
+        k_hm = q.new_zeros(H, C, DN_K_DIM, dtype=torch.float32)
+        v_hm = q.new_zeros(H, C, DN_V_DIM, dtype=torch.float32)
+        q_hm[:, 0, :] = q[0].float(); k_hm[:, 0, :] = k[0].float(); v_hm[:, 0, :] = v[0].float()
+        g_hm = q.new_zeros(H, C, dtype=torch.float32); g_hm[:, 0] = g[0]
+        beta_hm = q.new_zeros(H, C, dtype=torch.float32); beta_hm[:, 0] = beta[0]
+        q_hm = q_hm.reshape(H * C, DN_K_DIM).contiguous()
+        k_hm = k_hm.reshape(H * C, DN_K_DIM).contiguous()
+        v_hm = v_hm.reshape(H * C, DN_V_DIM).contiguous()
+        g_hm = g_hm.reshape(H * C, 1).contiguous()
+        beta_hm = beta_hm.reshape(H * C, 1).contiguous()
+
+        state_in = dn_states[di, 0].float()                  # [H*Kd, Vd]
+        out_hm, new_state = torch.ops.deltanet.chunked_prefill(
+            state_in, q_hm, k_hm, v_hm, g_hm, beta_hm,
+            self.chunk_m_incl, self.chunk_m_strict, self.chunk_eye,
+        )
+        dn_states[di, 0] = new_state.reshape(DN_V_HEADS * DN_K_DIM, DN_V_DIM).to(dn_states.dtype)
+        attn_out = out_hm.reshape(H, C, DN_V_DIM)[:, 0, :]    # [H, Vd] (row 0 = real token)
+
+        z = self._lin(f"l{i}_dn_z", x_2d).reshape(1, DN_V_HEADS, DN_V_DIM)
+        gated = rms_norm_gated(attn_out.unsqueeze(0).to(x_2d.dtype), z, norm_w)  # [1,H,Vd]
+        out = self._lin(f"l{i}_dn_out", gated.reshape(1, DN_VALUE_DIM).to(torch.bfloat16))
+        out = functional_all_reduce(out, "sum", self.tp_group)
+        return out.unsqueeze(1)  # [1, 1, 5120]
+
     def _deltanet_layer(
         self, i: int, x: torch.Tensor,
         dn_states: torch.Tensor, cv_states: torch.Tensor
@@ -874,6 +976,11 @@ class StaticDecodeModule(nn.Module):
         norm_w = getattr(self, f"l{i}_dn_norm")
 
         x_2d = x.squeeze(1).to(torch.bfloat16)  # [B, 5120] bf16
+
+        # trn1 coherence path: route B=1 decode DeltaNet through the validated
+        # chunked_prefill NKI kernel (deltanet_full is wrong at TP=8/H=6).
+        if USE_DECODE_VIA_CHUNKED and B == 1 and not self.fp8_weights:
+            return self._deltanet_decode_chunked(i, x_2d, dn_states, cv_states)
 
         conv_weight_2d = conv_w.squeeze(1).float()           # [2560, 4]
         if conv_b is not None:
@@ -1323,7 +1430,7 @@ def main():
                         dtype=dtype, device=device)
 
     # 6. Compile
-    if not args.skip_compile:
+    if not args.skip_compile and not USE_DECODE_SEGMENTED:
         if rank == 0:
             print(f"  Compiling with backend='{_COMPILE_BACKEND}', fullgraph=True...")
         t0 = time.time()

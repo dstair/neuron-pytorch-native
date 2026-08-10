@@ -79,16 +79,38 @@ All are **default-off**; the baseline path is byte-identical without them.
 | `NORMFUSE=1` | NKI RMSNorm |
 | `LEANKV=1`, `NOREDUCE=1`, `DNF32STATE=1` | Reference levers, ruled out (kept for A/B) |
 | `KERNEL_TRN1=1` | Native trn1 (NeuronCore-v2) portability gate — see below |
+| `PREFILL_SEGMENTED=1` | trn1 coherence: run prefill as per-layer sub-graphs (the monolithic prefill NEFF miscompiles at TP=8) — see below |
+| `DECODE_SEGMENTED=1` | trn1 coherence: run the decode step as per-layer sub-graphs (the monolithic decode NEFF also miscompiles at TP=8); forward runs eager (not `torch.compile`d) |
+| `DECODE_VIA_CHUNKED=1` | trn1 coherence: route B=1 decode DeltaNet through the validated chunked-prefill kernel (the `deltanet_full` decode kernel is wrong at TP=8) |
 
 ### Native trn1 execution (`KERNEL_TRN1`)
 
 The model is a Trainium2 (NeuronCore-v3) program by design, but it **also compiles
 and runs natively on Trainium1 (`trn1.32xlarge`, NeuronCore-v2)** for customers where
-trn1 is the more widely available part. This runs the **full 64-layer dense model,
-real weights, compiled (non-lazy) decode at TP=8**: **37.0 tok/s (B=1), 27.0 ms
-steady-state TPOT** (`--target trn1 --optlevel 1`, `KERNEL_TRN1=1`, vocab-sharded).
-The chunked-DeltaNet prefill (`CHUNKEDPREFILL=1`) also compiles and executes
-(cold compile+exec ~11 s for S=64).
+trn1 is the more widely available part, running the **full 64-layer dense model with
+real weights at TP=8** (`--target trn1 --optlevel 1`, `KERNEL_TRN1=1`, vocab-sharded).
+
+**Coherent generation on trn1** requires three additional gates —
+`PREFILL_SEGMENTED=1 DECODE_SEGMENTED=1 DECODE_VIA_CHUNKED=1`. Without them the model
+compiles and emits tokens but the output is incoherent: at TP=8 the *monolithic*
+prefill **and** single-token decode graphs miscompile (a compiler defect, independent
+of the kernels), and the `deltanet_full` B=1 decode kernel is separately wrong at the
+per-core head count. The three gates (a) run prefill and (b) run decode as per-layer
+sub-graphs (`xm.mark_step` between layers; `forward` runs eager, not `torch.compile`d),
+and (c) route the decode DeltaNet recurrence through the validated chunked-prefill NKI
+kernel. With all three on, the model generates coherent text — e.g. the prompt
+"…the very first President of the United States … was a man named George" continues
+" Washington. The study of history is also important because it helps us to understand
+the …", token-identical to the CPU/HF reference. The forward *math* and TP-8 sharding
+are correct without these gates (verified layer-by-layer against HuggingFace on CPU);
+the gates only work around the compiler/kernel defects.
+
+> **Performance caveat.** Segmenting decode into per-layer sub-graphs trades the
+> single-NEFF decode latency for correctness — the throughput numbers in the tables
+> below are the Trainium2 single-NEFF path and do **not** describe this segmented trn1
+> path. Getting the monolithic trn1 decode NEFF to compile correctly (and/or fixing
+> `deltanet_full` at the per-core head count) is the open optimization; correctness
+> came first.
 
 > **trn1 uses TP=8, not TP=4.** A trn1 NeuronLink collective is valid only over
 > {1, 4, 8, 16} Neuron *devices*, and each trn1 device has 2 cores — so valid TP
@@ -148,12 +170,16 @@ implementation of the same model on the torch-xla stack, for comparison.
 | Decode, NxDI (single-stream, published) | XLA | 1 | 54.2 | 18.5 |
 | Decode, NxDI offline `llm.generate` | XLA | 8 | 361 | 22.2 |
 | Decode, NxDI offline `llm.generate` | XLA | 16 | 525 | 30.5 |
-| Decode-only, `static_decode.py` **on trn1** † | PyTorch Native | 1 | 27.0 | **37.0** |
+| Decode-only, single-NEFF `static_decode.py` **on trn1** † | PyTorch Native | 1 | 27.0 | 37.0 |
 
 † trn1 row is `trn1.32xlarge`, **TP=8**, `--target trn1 --optlevel 1`, `KERNEL_TRN1=1`,
 PJRT/2.9 — NOT the trn2/TP=4/LNC=2 config of the other rows (see *Native trn1
-execution*). It is a portability + real-throughput result on the more widely available
-part, not a strict head-to-head with the trn2 rows.
+execution*). **This is the single-NEFF compiled-decode structural TPOT, measured before
+the TP=8 coherence bugs were found — the emitted tokens on this path are not coherent
+(the monolithic decode NEFF miscompiles at TP=8).** Coherent trn1 generation uses the
+segmented path (`DECODE_SEGMENTED=1 DECODE_VIA_CHUNKED=1`, per-layer sub-graphs), whose
+throughput is lower and not yet optimized; treat 37.0 as a structural upper bound for a
+future correctly-compiled single-NEFF trn1 decode, not a shipped coherent number.
 
 - BS=1 synced steady-state TPOT is **35.9 ms**; the realistic host-synchronized
   greedy loop (a `.item()` D2H per token) is ~43.6 ms.
