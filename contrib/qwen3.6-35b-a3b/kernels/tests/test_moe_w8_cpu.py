@@ -285,7 +285,18 @@ def test_row_fp8_requantization_uses_one_scale_per_output():
     torch.testing.assert_close(reconstructed, source, rtol=0.04, atol=0.01)
 
 
-def _write_official_expert_checkpoint(tmp_path):
+def _write_official_expert_checkpoint(
+    tmp_path, *, num_experts=2, hidden=256, intermediate=128, seed=None
+):
+    """Write a synthetic official-FP8 expert checkpoint.
+
+    Defaults reproduce the original tiny deterministic fixture (E=2, H=256,
+    I=128, constant 0x78-pattern bytes) so existing callers are unchanged. Pass
+    ``seed`` to fill each projection with realistic per-128x128-block E4M3FN
+    bytes (via ``_random_official_block_fp8``) for quality testing at larger,
+    production-shaped dims. Official orientation: gate/up ``[I, H]`` (out=I),
+    down ``[H, I]`` (out=H).
+    """
     prefix = "model.language_model."
     tensors = [
         (
@@ -302,37 +313,52 @@ def _write_official_expert_checkpoint(tmp_path):
         ),
     ]
     expected = {}
-    for expert in range(2):
+    for expert in range(num_experts):
         ep = prefix + f"layers.0.mlp.experts.{expert}."
         for projection_index, projection in enumerate(
             ("gate_proj", "up_proj", "down_proj")
         ):
-            shape = (256, 128) if projection == "down_proj" else (128, 256)
-            scale_shape = (2, 1) if projection == "down_proj" else (1, 2)
-            # 0x78 is finite E4M3FN 256 but unsafe to bitcast as legacy E4M3.
-            raw = torch.empty(shape, dtype=torch.uint8)
-            scales = torch.empty(scale_shape, dtype=torch.bfloat16)
-            for row_block in range(scale_shape[0]):
-                for col_block in range(scale_shape[1]):
-                    raw[
-                        row_block * 128 : (row_block + 1) * 128,
-                        col_block * 128 : (col_block + 1) * 128,
-                    ] = 0x78 - expert - projection_index - row_block - col_block
-                    scales[row_block, col_block] = (
-                        0.01
-                        + expert * 0.01
-                        + projection_index * 0.002
-                        + row_block * 0.003
-                        + col_block * 0.004
-                    )
+            shape = (
+                (hidden, intermediate)
+                if projection == "down_proj"
+                else (intermediate, hidden)
+            )
+            row_blocks, col_blocks = shape[0] // 128, shape[1] // 128
+            if seed is None:
+                # 0x78 is finite E4M3FN 256 but unsafe to bitcast as legacy E4M3.
+                raw = torch.empty(shape, dtype=torch.uint8)
+                scales = torch.empty(
+                    (row_blocks, col_blocks), dtype=torch.bfloat16
+                )
+                for row_block in range(row_blocks):
+                    for col_block in range(col_blocks):
+                        raw[
+                            row_block * 128 : (row_block + 1) * 128,
+                            col_block * 128 : (col_block + 1) * 128,
+                        ] = 0x78 - expert - projection_index - row_block - col_block
+                        scales[row_block, col_block] = (
+                            0.01
+                            + expert * 0.01
+                            + projection_index * 0.002
+                            + row_block * 0.003
+                            + col_block * 0.004
+                        )
+            else:
+                # Realistic random per-block E4M3FN weights for quality gates.
+                raw, scales = _random_official_block_fp8(
+                    shape[0],
+                    shape[1],
+                    gain=0.02,
+                    seed=seed + expert * 3 + projection_index,
+                )
             tensors.append(
-                (ep + projection + ".weight", "F8_E4M3", raw.shape, bytes(raw.flatten()))
+                (ep + projection + ".weight", "F8_E4M3", tuple(shape), bytes(raw.flatten()))
             )
             tensors.append(
                 (
                     ep + projection + ".weight_scale_inv",
                     "BF16",
-                    scales.shape,
+                    (row_blocks, col_blocks),
                     _bf16_bytes(scales),
                 )
             )
@@ -610,6 +636,99 @@ def test_official_reader_builds_output_block_coalesced_layout(tmp_path):
             dim=0,
         )
         assert cosine >= 0.9995
+
+
+def test_block_ob_coalesced_cte_sized_quality(tmp_path):
+    """`block_ob_coalesced` at production CTE expert dims (H=2048, I=512).
+
+    Step 1 of the FP8 prefill plan: confirm the load-time weight-quality gate
+    (cosine >= 0.9995) holds at the real tile-shaped dims, that the packed scale
+    tables have the ``[E,128,*]`` shapes the FP8 CTE kernel will index, and that
+    the fused-MoE output stays within tolerance vs the official-FP8 reference
+    (i.e. the extra coarsening from one-scale-per-output-block is safe). E is
+    small on purpose — the shape-critical dims for tiling are H/I, not E — so the
+    CPU requant loop stays fast.
+    """
+    E, H, I = 8, 2048, 512
+    expected = _write_official_expert_checkpoint(
+        tmp_path, num_experts=E, hidden=H, intermediate=I, seed=7
+    )
+    reader = OfficialFP8ExpertReader(tmp_path)
+    try:
+        converted, stats = reader.load_layer(
+            0, 0, E, "fp8", fp8_impl="block_ob_coalesced"
+        )
+    finally:
+        reader.close()
+
+    # (1) Load-time weight-quality gate — same bar as the decode FP8 path.
+    assert stats.cosine >= 0.9995, stats.cosine
+    assert stats.normalized_rmse <= 0.035, stats.normalized_rmse
+
+    # (2) Weight + scale-table shapes the FP8 CTE kernel will tile over.
+    hidden_blocks, inter_blocks = H // 128, I // 128  # 16, 4
+    assert converted["w8_gate_up"].shape == (E, H, 2, I)
+    assert converted["w8_down"].shape == (E, I, H)
+    assert converted["w8_gate_up_scale"].shape == (
+        E,
+        128,
+        2 * hidden_blocks * inter_blocks,
+    )  # (8, 128, 128)
+    assert converted["w8_down_scale"].shape == (
+        E,
+        128,
+        inter_blocks * hidden_blocks,
+    )  # (8, 128, 64)
+    validate_legacy_e4m3_bytes(converted["w8_gate_up"])
+    validate_legacy_e4m3_bytes(converted["w8_down"])
+
+    # Reduction-B1 invariant at CTE dims: scale is constant along the input-block
+    # axis (this is what lets the kernel post-scale once after PSUM accumulation).
+    gate_up_grid, down_grid = unpack_coalesced_block_scales(
+        converted["w8_gate_up_scale"],
+        converted["w8_down_scale"],
+        hidden_size=H,
+        intermediate_size=I,
+    )
+    assert torch.equal(
+        gate_up_grid, gate_up_grid[:, :, :1, :].expand_as(gate_up_grid)
+    )
+    assert torch.equal(down_grid, down_grid[:, :1, :].expand_as(down_grid))
+
+    # (3) End-to-end fused MoE: block_ob_coalesced vs the official-FP8 reference
+    # (pre-coarsening). Same FP32 activation for both, so this isolates the
+    # weight-quantization coarsening. Dense over all E experts, affinity-weighted.
+    T = 64
+    gen = torch.Generator().manual_seed(11)
+    hidden = torch.randn(T, H, generator=gen, dtype=torch.float32) * 0.5
+    affinities = torch.rand(T, E, generator=gen, dtype=torch.float32)
+
+    got = fused_moe_block_coalesced_cpu(
+        hidden,
+        converted["w8_gate_up"],
+        converted["w8_down"],
+        converted["w8_gate_up_scale"],
+        converted["w8_down_scale"],
+        affinities,
+    )
+    ref = torch.zeros(T, H, dtype=torch.float32)
+    for e in range(E):
+        gate = expected[e, "gate_proj"].float()  # [I, H]
+        up = expected[e, "up_proj"].float()  # [I, H]
+        down = expected[e, "down_proj"].float()  # [H, I]
+        act = F.silu(F.linear(hidden, gate)) * F.linear(hidden, up)  # [T, I]
+        ref += F.linear(act, down) * affinities[:, e : e + 1]  # [T, H]
+
+    cos = F.cosine_similarity(
+        got.flatten().double(), ref.flatten().double(), dim=0
+    )
+    # Secondary (not the Step-1 gate): the weight-level cosine >= 0.9995 above is
+    # the criterion. This end-to-end fused check just confirms the pipeline
+    # composes at CTE dims. ~0.999 on SYNTHETIC random weights (gain 0.02) is
+    # expected — block_ob shares one absmax scale across the full 2048-col input
+    # row, so uniform-variance random data loses slightly more than the real
+    # checkpoint (validated at 0.9996; shipped bit-identical in the decode path).
+    assert cos >= 0.998, cos
 
 
 def test_retain_official_fp8_is_exact_and_validates_scales():
