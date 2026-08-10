@@ -1,14 +1,17 @@
 # Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32)
 
 Reproduces the fastest validated **prefill** configuration. The current best is
-**≈4,002 aggregate prompt tok/s** at **TP=8/LNC=1** on the **beta-4 container** with
-the **correct in-place rope-KV write** (one cache buffer per GQA layer) — see §3c
-and §4. That is **+9.8%** over the beta-4 compiler-only baseline (≈3,645) and
-**+15.8%** over the pre-beta-4 TP=8/LNC=1 packed-C32 number (≈3,457, itself +24.5%
-over TP=4/LNC=2). All use the identical packed-C32 DeltaNet kernel; LNC=1 gives
-twice the tensor engines and additionally requires both replicated `[V, H]` vocab
-tensors to be **load-time vocab-sharded** to fit the ~12 GB/rank budget, plus the
-~30-line `moe_cte` LNC=1 patch (§3c).
+**≈4,096 aggregate prompt tok/s** at **TP=8/LNC=1** on the **beta-5 container**
+(`concourse-release-0461d3b@sha256:94413ce1ffea…`, built 2026-08-05) with the
+**correct in-place rope-KV write** (one cache buffer per GQA layer) — see §3c and §4.
+That is **+2.4%** over the beta-4 headline (4,002.1), which was itself +9.8% over the
+beta-4 compiler-only baseline (≈3,645) and +15.8% over the pre-beta-4 TP=8/LNC=1
+number (≈3,457, itself +24.5% over TP=4/LNC=2). beta-5 is a clean compiler-only win:
+identical source, **bit-identical fingerprint**, reproduced across two runs (4,097.9
+and 4,095.2, within 0.07%). All use the identical packed-C32 DeltaNet kernel; LNC=1
+gives twice the tensor engines and additionally requires both replicated `[V, H]`
+vocab tensors to be **load-time vocab-sharded** to fit the ~12 GB/rank budget, plus
+the ~30-line `moe_cte` LNC=1 patch (§3c).
 
 The TP=4/LNC=2 configuration (§3a) is **≈2,792 aggregate prompt tok/s** (BS=2,
 N=20000 tokens, query bucket 1024, DeltaNet **stable C32** block-diagonal inverse
@@ -128,7 +131,7 @@ nohup bash -c 'deploy/compile_prefill_trn2.sh \
 ```
 Re-runs are cache-hot from the matching `--cache-dir` (skip §2/compile).
 
-### 3c. Fastest — TP=8/LNC=1 (≈4,002 tok/s on beta-4; ≈3,457 pre-beta-4)
+### 3c. Fastest — TP=8/LNC=1 (≈4,096 tok/s on beta-5; 4,002 on beta-4; 3,457 pre-beta-4)
 
 Same packed-C32 kernel, but at TP=8/LNC=1 (8 logical cores → twice the tensor
 engines). Two extra requirements:
@@ -200,6 +203,18 @@ tok/s** at an unchanged **8.95 GB/core**, `kv_k` **100% non-zero** in *every* gr
 (`per_group_nz = 10,485,760 × 10`), and this recipe's reference fingerprint reproduced
 **exactly**. The real lever is therefore *larger* than the defective build's +6.7%
 suggested — skipping the cache re-export is worth +9.8% on its own.
+
+**beta-5 container: 4,097.9 tok/s (+2.4%) — current best, 2026-08-10.** The same source
+(`.clone()` per GQA layer) on the beta-5 DLC (`sha256:94413ce1ffea…`, 2026-08-05, 6 days
+newer than beta-4) measured **9,761.1 ms / 4,097.9 aggregate prompt tok/s**, reproduced
+at **9,767.5 ms / 4,095.2** (within 0.07%), at an unchanged 8.95 GB/core, `kv_k`
+104,857,597/104,857,600, and this recipe's reference fingerprint reproduced **exactly**
+both times — a clean compiler-only win, no numerical change.
+> **Heads-up on the exit code.** On beta-5 the prefill process aborts on *teardown* with
+> glibc `corrupted size vs. prev_size` (SIGABRT → `DOCKER_EXIT=1`) **after** both the
+> warmup and TIMED lines + fingerprints have printed. Both runs did this; the decode path
+> did not. Read the `PREFILL TIMED` line for the result — do not treat the non-zero exit
+> code as a failed measurement.
 >
 > Use `.clone()`, not `.contiguous()`: a dim-0 slice of a contiguous tensor is already
 > contiguous, so `[gi].contiguous()` hands back ten views of one storage. That variant
@@ -261,6 +276,7 @@ batch ÷ prefill wall-time). References for the two configs:
 
 | Config | Wall time | Aggregate prompt tok/s |
 |---|---:|---:|
+| **Packed C32 ×4, TP=8/LNC=1, per-GQA-layer rope-KV, beta-5 container** (reproduced 9.768 s / 4,095.2) | **9.761 s** | **4,097.9** |
 | **Packed C32 ×4, TP=8/LNC=1, in-place rope-KV write (per-GQA-layer buffers), beta-4** | **9.995 s** | **4,002.1** |
 | Packed C32 ×4, TP=8/LNC=1, cache returned as graph output, beta-4 | 10.974 s | 3,645.0 |
 | **Packed C32 ×4, TP=8/LNC=1** (§3c, vocab-sharded head+embed, pg256; pre-hoisted-transpose) | **11.572 s** | **3,456.8** |

@@ -37,14 +37,18 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 
 | Phase | Best | Config | Recipe |
 |---|---|---|---|
-| **Prefill** | **3,456.8 agg prompt tok/s** | same packed **C32 n=4** path at **TP=8/LNC=1**, both vocab tensors load-time sharded (`PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1`), `--scratchpad-page-size-mb 256`, BS=2, N=20,000, bucket 1024, O1 (**+23.8%** over the TP=4/LNC=2 best below; measured before the hoisted-transpose finish, so not yet re-baselined with it) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
+| **Prefill** | **4,097.9 agg prompt tok/s** | packed **C32 n=4** at **TP=8/LNC=1**, correct per-GQA-layer in-place rope-KV write, both vocab tensors load-time sharded (`PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1`), `--scratchpad-page-size-mb 256`, BS=2, N=20,000, bucket 1024, O1, **beta-5 container** (reproduced 4,095.2, within 0.07%; **+2.4%** over beta-4's 4,002.1; bit-identical fingerprint) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
 | Prefill (TP=4/LNC=2) | 2,791.7 agg prompt tok/s | stable **C32 + 4-stream block-diagonal pack, SBUF-resident, hoisted-transpose finish** (`DN_PACK_C32=1 DN_PACK_N=4`), BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+22.6% over unpacked C32 @ 2,276.9; +33.6% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
-| **Decode** | **442.1 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv, TP=8/LNC=1, O2 (bit-identical output) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
+| **Decode** | **681.3 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv + per-layer DeltaNet state (`DN_PERLAYER_STATE=1`), TP=8/LNC=1, O1, **beta-5 container**, seq=256 (**+7.8%** over beta-4's 632.0; **582.3 tok/s** at seq=1024; bit-identical `0cc59fb25112`) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
 
-Other reference points: the prior FP8 `block_pow2_coalesced` decode **343.6 tok/s
-@ BS=128** (B1 is +28.7% over it, same `0cc59fb25112` gen hash); latency-optimal
-decode **48.9 tok/s @ BS=1** (true-sparse MoE + `MOE_DECODE_TP`); BF16 full-graph
-decode **320.6 tok/s @ BS=32**.
+Container lineage: the current numbers are on the **beta-5** DLC
+(`concourse-release-0461d3b@sha256:94413ce1ffea…`, built 2026-08-05). Both paths are
+clean compiler-only wins over beta-4, bit-identical in numerics. Other reference points:
+beta-4 headlines were **4,002.1** prefill / **632.0** decode; the pre-beta-4 TP=8/LNC=1
+prefill was **3,456.8**; the prior FP8 `block_pow2_coalesced` decode **343.6 tok/s @
+BS=128** (B1 is +28.7% over it, same `0cc59fb25112` gen hash); latency-optimal decode
+**48.9 tok/s @ BS=1** (true-sparse MoE + `MOE_DECODE_TP`); BF16 full-graph decode
+**320.6 tok/s @ BS=32**.
 
 Full methodology, ablations, per-optimization progression, HBM/DMA attribution,
 and the NxDI (XLA) reference comparison are in **[BENCHMARK.md](BENCHMARK.md)**.
@@ -64,6 +68,7 @@ unless noted; combine per the recipes.
 | `DN_NKI=1` | DeltaNet NKI kernel — **required past ~20 layers** (pure-torch recurrence trips a compiler tiling assertion) |
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode (batches over heads) |
 | `DN_DIRECT_STATE_OUT=1` | Full-graph decode: write BF16 DeltaNet/conv state directly to disjoint output buffers (skips whole-state clone + FP32→BF16 copy) |
+| `DN_PERLAYER_STATE=1` | Full-graph decode: one distinct DeltaNet recurrent-state buffer per layer (mutated once, `torch.stack` at return) instead of scattering ~30 writebacks into a shared base — removes the write-after-write serialization. **+96% decode** at O1, bit-identical; requires `DN_DIRECT_STATE_OUT=1` |
 | `DN_TILED_CONV=1` | Tiled conv-state layout + coalesced `mixed_qkv` DMA (decode) — ~+15–19% at BS=32/128, bit-identical |
 | `DN_CHUNK_NKI=1` | Chunked DeltaNet **prefill** NKI kernel (stable long-context) |
 | `CHUNK_SIZE=16\|32` | DeltaNet prefill chunk size (default 16). `32` = the faster stable-C32 path (pair with `DN_STABLE_C32=0`) |
@@ -98,7 +103,7 @@ unless noted; combine per the recipes.
 | `MOE_NKILIB=1` | nkilib fused MoE path (BF16) |
 | `MOE_FP8=1` | Older per-row FP8 grouped-matvec MoE path |
 | `MOE_FUSED_W8=fp8\|int8` | High-batch full-graph decode: fused all-expert path using the official block-scaled FP8 (or symmetric INT8) experts |
-| `MOE_FUSED_W8_FP8_IMPL=` | FP8 variant for `MOE_FUSED_W8`: `row` / `dual` / `block_pow2` / `block_pow2_coalesced` / **`block_ob_coalesced`** (Reduction B1: coarse per-128-output-block scale + PSUM-accumulate — the fastest decode kernel, 442.1 tok/s, bit-identical output) |
+| `MOE_FUSED_W8_FP8_IMPL=` | FP8 variant for `MOE_FUSED_W8`: `row` / `dual` / `block_pow2` / `block_pow2_coalesced` / **`block_ob_coalesced`** (Reduction B1: coarse per-128-output-block scale + PSUM-accumulate — the fastest decode MoE kernel; 681.3 tok/s at BS=128 with `DN_PERLAYER_STATE` on beta-5, bit-identical output) |
 | `MOE_FUSED_W8_FP8_LAYER_START`, `_LAYER_LIMIT` | Restrict FP8 experts to a layer range (defaults 0 / 40) — for A/B and layer-limited runs |
 | `MOE_W8_TENSOR_SCALE=1` | Experiment (**negative**, default off): dequant to BF16 with per-block scale + PSUM-accumulate; removes Vector scale-adds but is slower |
 | `MOE_W8_RESIDUAL_FP32=1` | Keep the routed accumulation residual in FP32 |

@@ -21,9 +21,13 @@ prefill runs at **TP=8/LNC=1** once both replicated `[V, H]` vocab tensors are
 load-time sharded to fit the ~12 GB/rank budget (3,456.8 tok/s, +24.5%; see the
 prefill throughput table and the TP=8/LNC=1 resolution below). On the **beta-4
 container** that became **3,645.0 tok/s** (+5.4% over 3,456.8, same source, same page
-size 256 — a clean compiler-only win, verified numerically bit-identical). The current
-best is **4,002.1 tok/s** (+9.8% over 3,645.0), from the in-place rope-KV write now
-that it is **correct**: one cache buffer per GQA layer.
+size 256 — a clean compiler-only win, verified numerically bit-identical). On beta-4 the
+in-place rope-KV write, now **correct** (one cache buffer per GQA layer), reached
+**4,002.1 tok/s** (+9.8% over 3,645.0). The current best is **4,097.9 tok/s** on the
+**beta-5 container** (`sha256:94413ce1ffea…`, 2026-08-05; +2.4% over 4,002.1, identical
+source, bit-identical fingerprint, reproduced at 4,095.2) — another clean compiler-only
+win. Decode's current best is **681.3 tok/s** at BS=128 (beta-5, O1, `DN_PERLAYER_STATE`;
++7.8% over beta-4's 632.0; 582.3 tok/s at seq=1024); see the beta-5 section below.
 
 The previously headlined **3,889.4 tok/s** is **withdrawn** — that build of the
 in-place rope-KV rewrite **dropped ~60% of its KV-cache writes**, so part of its gain
@@ -682,6 +686,7 @@ historical results in this section must not be attributed to it.
 
 | Test | Framework | Config | Latency | Prompt tok/s |
 |---|---|---|---|---|
+| **beta-5 container, per-GQA-layer rope-KV, same source (compiler-only win, bit-identical, reproduced 9.768 s / 4,095.2)** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256, splits=4 | **9.761 s** | **4,097.9 aggregate** |
 | **beta-4 + in-place rope-KV write, one buffer per GQA layer (CORRECT: cache 100% populated)** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256, splits=4 | **9.995 s** | **4,002.1 aggregate** |
 | **beta-4 container, unchanged source (compiler-only win, numerics bit-identical)** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256 | **10.974 s** | **3,645.0 aggregate** |
 | ~~beta-4 + in-place rope-KV write~~ — **INVALID**, drops ~60% of KV writes | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256 | ~~10.284 s~~ | ~~3,889.4 aggregate~~ |
@@ -1392,6 +1397,45 @@ change with identical arithmetic, which is why bit-identical is the expected and
 observed result. Per the discipline established above, greedy `gen hash` is treated as
 a floor, not proof; the occupancy gates plus the pure-ownership nature of the refactor
 are what carry the equivalence claim. KV occupancy was `[384]×10`.
+
+### beta-5 container (2026-08-10): both paths faster, numerics bit-identical
+
+The **beta-5** DLC (`concourse-release-0461d3b@sha256:94413ce1ffea…`, built
+2026-08-05T10:02Z — **6 days newer** than beta-4 `sha256:ad7f7bbcd468…`) was pulled
+onto the native trn2.3xlarge and both published configs re-run against it with the
+**same source** (per-GQA-layer rope-KV for prefill; O1 + `DN_PERLAYER_STATE=1` for
+decode). Both are clean compiler-only wins with no numerical change. `ecr:DescribeImages`
+is denied to the host instance role, so `:latest` was confirmed newer via
+`docker inspect … .Created`; the pull deduped almost entirely against beta-4's layers.
+
+| Path | beta-4 | **beta-5** | Δ | correctness |
+|---|---:|---:|---:|---|
+| Prefill TP=8/LNC=1 pg256, 40L BS=2 N=20000 | 4,002.1 tok/s (9994.6 ms) | **4,097.9 tok/s** (9761.1 ms) | **+2.4%** | fingerprint `sum=-3.17835375e+05 norm=1.20818213e+03 top5=[517,607,261,294,15089]` **exact**, warm≡timed, `kv_k` 104857597/104857600 |
+| Decode BS=128 O1 `DN_PERLAYER_STATE=1`, seq=256 | 632.0 tok/s (202.54 ms) | **681.3 tok/s** (187.87 ms/tok) | **+7.8%** | gen hash `0cc59fb25112` row0/row127 (== beta-4 2-token ref), `DOCKER_EXIT=0` |
+| Decode BS=128, seq=1024 (generated 1024 tokens) | — | **582.3 tok/s** (219.83 ms/tok) | — | `DOCKER_EXIT=0`; module 8.10 GB/core |
+
+**Prefill reproduced** across two runs (4,097.9 / 4,095.2, within 0.07%), fingerprint
+bit-identical both times.
+
+**Two caveats.**
+1. **Prefill aborts on teardown** with glibc `corrupted size vs. prev_size` → SIGABRT on
+   one rank (`DOCKER_EXIT=1`) **after** both warmup and timed results + fingerprints have
+   printed. Reproduced on both prefill runs; decode never crashed (`DOCKER_EXIT=0`). The
+   measurement is valid — the abort is a beta-5 shutdown/heap issue, not a benchmark
+   failure. Read the `PREFILL TIMED` line, not the exit code.
+2. **Decode compiled fast** on beta-5: "first decode step (incl compile): 65–86 s" vs
+   beta-4's O1 24m21s, with the NEFF cache still not persisting (`ccache` stayed empty —
+   see the cache-transplant notes). A large apparent compiler speedup, but observed only
+   as a side effect of these two runs (with an unexplained ~10-min gap before the BENCH
+   print) — not yet measured in isolation, so treat it as an observation, not a claim.
+
+**seq-length cost.** Going seq=256 → 1024 costs −14.5% throughput / +17% TPOT because GQA
+reads the full `max_seq_len` KV cache each decode step, so per-step cost scales with
+`max_seq_len` (not with tokens generated so far); the module also grows 7.09 → 8.10
+GB/core. The seq=1024 run generated 1024 tokens; over that many greedy steps the row0 and
+row127 gen hashes diverge (`6c3b3a1909bd` / `554aa924beb3`), which is expected for long
+from-zeros greedy decode (per-row FP differences in the fp8/batched GEMMs compound into
+different argmax picks) and not a regression — the seq=256/2-token rows stay identical.
 
 ## Reference
 
