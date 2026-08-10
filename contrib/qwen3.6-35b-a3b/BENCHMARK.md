@@ -481,6 +481,7 @@ tok/s.
 | `GQATAIL=1` | Fused GQA attention-tail kernel |
 | `DNBATCHED_V2=1` | DMA-coalesced batched DeltaNet decode |
 | `DN_DIRECT_STATE_OUT=1` | Full-graph decode: write BF16 DeltaNet/conv state directly to disjoint output buffers |
+| `DN_PERLAYER_STATE=1` | Full-graph decode: one distinct DeltaNet state buffer per layer (kills the shared-base writeback WAW serialization) — **+96% decode**, bit-identical; requires `DN_DIRECT_STATE_OUT=1` |
 | `GQA_STATEFUL_KV=1` | Full-graph decode: keep BF16 K/V caches as aliased module state and append only the current rows |
 | `MOE_CTE=1` | Long-token nkilib context-encoding MoE kernel for prefill |
 | `GQA_CTE_PREFILL=1` | Prefix-aware nkilib CTE attention; requires `GQA_DYNAMIC_ROPE_KV=1` |
@@ -1350,6 +1351,47 @@ a lucky one. Note what this does *not* do: it does not make sharing one base acr
 mutations safe. The probes' shared-base arms now all land (0/10 → 10/10 on the decode
 one), so those files no longer discriminate, and the occupancy gate is the only remaining
 check. The per-layer buffers stay.
+
+#### Gated 2026-08-06: per-layer DeltaNet state buffers (`DN_PERLAYER_STATE=1`) — +96% decode, and it beats the published O2
+
+The GQA per-layer-buffer fix above (one distinct buffer per mutation) was applied to
+the **DeltaNet recurrent-state writeback** as well, behind `DN_PERLAYER_STATE=1`
+(requires `DN_DIRECT_STATE_OUT=1`). The old path wrote every DeltaNet layer's new state
+into one shared `[NUM_DELTANET, B, …]` base tensor via a self-copy at
+`static_decode_35b.py:~1855`; with ~30 DeltaNet layers in one full-graph decode step
+that is ~30 write-after-write dependencies serialized through a single buffer. The fix
+gives each layer its own `torch.empty_like` buffer (held in a Python list, mutated
+once, `torch.stack`ed at return) — the `layer_index=0, num_groups=1` analogue of the
+GQA fix, but here the payoff is **throughput** (the WAW chain is gone), not correctness.
+
+40 layers, BS=128, seq=256, `--optlevel 1`, beta-4, `GQA_STATEFUL_KV=1
+DECODE_FULLGRAPH=1 DN_DIRECT_STATE_OUT=1`, TP=8/LNC=1, FP8 `block_ob_coalesced` MoE +
+tiled DeltaNet conv — the same flag set as the O1 baseline, only `DN_PERLAYER_STATE`
+added:
+
+| | TPOT | tok/s | gen hash (row0 / row127) |
+|---|---:|---:|---|
+| baseline (shared-base state) | 397.45 ms | 322.1 | `7f4b446344cf` |
+| **+ `DN_PERLAYER_STATE=1`** | **202.54 ms** | **632.0** | `7f4b446344cf` |
+
+**+96.3%** throughput at O1, reproduced across two independent runs (a separate
+2-token bench measured 202.11 ms / 633.3 tok/s). This does not merely recover the
+O1→O2 penalty — at O1 it is **+43% over the published O2 decode headline (442.1
+tok/s)**, so shipping beta-4 at O1 + `DN_PERLAYER_STATE` publishes a decode
+*improvement*, not the −26.7% O1 regression. The trn1 O2 cross-compile (below) becomes
+optional upside — O2 stacked on this lever could go higher — rather than the critical
+path to a non-regressing decode headline.
+
+**Numerics.** The 8-token A/B (7 recurrent-state feedbacks — a stronger gate than the
+2–3 token skip-prefill runs that the aliasing sections above showed are insensitive)
+was **bit-identical**, `gen hash 7f4b446344cf` on rows 0 and 127 for both arms. The
+DeltaNet-state occupancy gate (`DN_OCCUPANCY_CHECK=1`, asserts each per-layer state has
+≥1 non-zero row) passed on **both** arms, so — unlike the GQA cache — the shared-base
+DeltaNet writeback was *not* dropping writes; this is a pure ownership/serialization
+change with identical arithmetic, which is why bit-identical is the expected and
+observed result. Per the discipline established above, greedy `gen hash` is treated as
+a floor, not proof; the occupancy gates plus the pure-ownership nature of the refactor
+are what carry the equivalence claim. KV occupancy was `[384]×10`.
 
 ## Reference
 

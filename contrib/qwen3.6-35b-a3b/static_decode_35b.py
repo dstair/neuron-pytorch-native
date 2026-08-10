@@ -57,6 +57,22 @@ if USE_DN_DIRECT_STATE_OUT and not USE_DN_NKI:
     raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DN_NKI=1")
 if USE_DN_DIRECT_STATE_OUT and os.environ.get("DNBATCHED_V2", "0") != "1":
     raise RuntimeError("DN_DIRECT_STATE_OUT=1 requires DNBATCHED_V2=1")
+# Per-layer DeltaNet recurrent-state buffers (decode). The default direct-state
+# path keeps dn_states_out/cv_states_out as ONE [NUM_DN,B,...] base tensor and
+# writes dn_states_out[di]=... per layer. Those 30 slice-scatters into the shared
+# base serialize (WAW on the same buffer) AND each is a redundant self-copy of the
+# aliased kernel output — profiled as the top decode cost (static_decode:1855:
+# 75ms semaphore + 19ms COPY + 15ms DMA across the DeltaNet layers). With this
+# flag the accumulators become Python lists of distinct per-layer tensors: each is
+# mutated exactly once (write lands via the op's aliased return — see
+# [[neuron-inplace-mutation-loses-writes]]), the writeback is a list rebind (no
+# scatter, no WAW), and one torch.stack at the return boundary preserves the
+# external [NUM_DN,B,...] tensor interface. Mirrors the GQA per-layer-buffer fix.
+# Requires the single-graph fullgraph path (the list is built and consumed inside
+# one trace, like the outs=[]/torch.stack pattern in the pure-torch DN layer).
+USE_DN_PERLAYER_STATE = os.environ.get("DN_PERLAYER_STATE", "0") == "1"
+if USE_DN_PERLAYER_STATE and not USE_DN_DIRECT_STATE_OUT:
+    raise RuntimeError("DN_PERLAYER_STATE=1 requires DN_DIRECT_STATE_OUT=1")
 # Tiled conv-state layout for the DeltaNet decode kernel (matches DN_TILED_CONV in
 # deltanet_full_batched_v2_35b.py): conv_states stored tile-partition-major
 # [NUM_DN,B,PMAX,NT,3] so the kernel's sliding-window I/O coalesces to ~3 DMAs.
@@ -604,6 +620,41 @@ def _assert_kv_occupancy(kv, what, min_rows=1):
             f"the defect that produced finite, plausible, token-identical output "
             f"in 2026-08; do not trust logits or `gen hash` to catch it. Check "
             f"that each GQA layer owns a distinct cache tensor."
+        )
+    return rows
+
+
+def _assert_dn_occupancy(dn_states, what, min_rows=1):
+    """Postcondition: every per-DeltaNet-layer recurrent state must be non-zero.
+
+    The DeltaNet-state analogue of `_assert_kv_occupancy`, and the direct gate on
+    the DN_PERLAYER_STATE refactor: replacing the shared-base writeback with a list
+    of distinct per-layer buffers (each mutated once) is exactly the shape of change
+    that silently drops middle-layer writes if the aliasing is wrong — finite,
+    plausible, token-identical, invisible to `gen hash`. The recurrent state starts
+    at zeros and every layer updates it each decode step, so a zero layer-slice after
+    decode means that layer's writeback was lost. `dn_states` is the stacked
+    [NUM_DELTANET, B, ...] tensor (or a list of per-layer tensors). Set
+    `DN_OCCUPANCY_CHECK=0` to bypass (diagnostics only).
+    """
+    if os.environ.get("DN_OCCUPANCY_CHECK", "1") != "1":
+        return
+    if isinstance(dn_states, (list, tuple)):
+        parts = list(dn_states)
+    else:
+        parts = [dn_states[i] for i in range(dn_states.shape[0])]
+    rows = [
+        int((t.reshape(-1, t.shape[-1]) != 0).any(dim=-1).sum()) for t in parts
+    ]
+    empty = [i for i, n in enumerate(rows) if n < min_rows]
+    if empty:
+        raise RuntimeError(
+            f"{what}: DeltaNet layers {empty} of {len(parts)} hold fewer than "
+            f"{min_rows} non-zero rows (per_layer_nonzero_rows={rows}). Recurrent "
+            f"state writebacks were DROPPED for those layers — they carried zeros "
+            f"forward. This is the per-layer-buffer aliasing hazard; do not trust "
+            f"logits or `gen hash` to catch it. Check that each DeltaNet layer owns "
+            f"a distinct state buffer mutated exactly once."
         )
     return rows
 
@@ -1414,7 +1465,18 @@ class StaticDecode35B(nn.Module):
         hidden = self._embed_tokens(input_id).unsqueeze(1)   # [B,1,H]
         if USE_MOE_W8_RESIDUAL_FP32:
             hidden = hidden.float()
-        if USE_DN_DIRECT_STATE_OUT:
+        if USE_DN_DIRECT_STATE_OUT and USE_DN_PERLAYER_STATE:
+            # Distinct per-layer output buffers: each mutated exactly once, so the
+            # write lands and the 30 writebacks don't serialize on a shared base.
+            dn_states = [
+                torch.empty_like(deltanet_states[di])
+                for di in range(D.NUM_DELTANET)
+            ]
+            cv_states = [
+                torch.empty_like(conv_states[di])
+                for di in range(D.NUM_DELTANET)
+            ]
+        elif USE_DN_DIRECT_STATE_OUT:
             dn_states = torch.empty_like(deltanet_states)
             cv_states = torch.empty_like(conv_states)
         else:
@@ -1450,6 +1512,12 @@ class StaticDecode35B(nn.Module):
         hidden = rms_norm(hidden, self.final_norm)
         if USE_MOE_W8_RESIDUAL_FP32:
             hidden = hidden.to(torch.bfloat16)
+        if USE_DN_DIRECT_STATE_OUT and USE_DN_PERLAYER_STATE:
+            # Re-materialize the [NUM_DN,B,...] tensor interface once (reads the
+            # per-layer aliased outputs; disjoint writes into a fresh tensor, so
+            # the compiler pipelines them instead of serializing 30 scatters).
+            dn_states = torch.stack(dn_states, 0)
+            cv_states = torch.stack(cv_states, 0)
         return hidden, dn_states, cv_states, kv_k, kv_v
 
     # ── Decode forward (B tokens in, B logits out) ──
@@ -1852,18 +1920,36 @@ class StaticDecode35B(nn.Module):
                 # Keep the custom op's mutated outputs in explicit graph
                 # dataflow. Relying only on alias mutation of these parent
                 # slices can leave middle-layer state outputs unwritten.
-                dn_states_out[di] = new_state.reshape(
-                    B, VH * KD, VD
-                ).to(dn_states_out.dtype)
-                if USE_DN_TILED_CONV:
-                    _nt = qkv_dim // _DN_TILED_PMAX
-                    cv_states_out[di] = new_cs.reshape(
-                        B, _DN_TILED_PMAX, _nt, D.DN_CONV_KERNEL - 1
-                    ).to(cv_states_out.dtype)
+                if USE_DN_PERLAYER_STATE:
+                    # Distinct per-layer buffer, mutated exactly once: rebind the
+                    # list slot to the aliased kernel output. new_state/new_cs
+                    # alias state_out/conv_out (bf16), so reshape is a view and
+                    # the rebind is free — no scatter into a shared base, no
+                    # self-copy. This is the source line that dominated the
+                    # decode profile (static_decode:1855).
+                    dn_states_out[di] = new_state.reshape(B, VH * KD, VD)
+                    if USE_DN_TILED_CONV:
+                        _nt = qkv_dim // _DN_TILED_PMAX
+                        cv_states_out[di] = new_cs.reshape(
+                            B, _DN_TILED_PMAX, _nt, D.DN_CONV_KERNEL - 1
+                        )
+                    else:
+                        cv_states_out[di] = new_cs.reshape(
+                            B, qkv_dim, D.DN_CONV_KERNEL - 1
+                        )
                 else:
-                    cv_states_out[di] = new_cs.reshape(
-                        B, qkv_dim, D.DN_CONV_KERNEL - 1
-                    ).to(cv_states_out.dtype)
+                    dn_states_out[di] = new_state.reshape(
+                        B, VH * KD, VD
+                    ).to(dn_states_out.dtype)
+                    if USE_DN_TILED_CONV:
+                        _nt = qkv_dim // _DN_TILED_PMAX
+                        cv_states_out[di] = new_cs.reshape(
+                            B, _DN_TILED_PMAX, _nt, D.DN_CONV_KERNEL - 1
+                        ).to(cv_states_out.dtype)
+                    else:
+                        cv_states_out[di] = new_cs.reshape(
+                            B, qkv_dim, D.DN_CONV_KERNEL - 1
+                        ).to(cv_states_out.dtype)
             else:
                 new_state, new_cs, attn_flat = torch.ops.deltanet35b.full_batched(
                     state_in, qkv_in, conv_in, conv_w2, cb,
@@ -3245,15 +3331,42 @@ def main():
         if rank == 0:
             print(f"  prefilled {len(pid)} prompt tokens; first gen id={int(nid0)}")
     else:
-        next_id = torch.full((B,), 100, dtype=torch.long, device=device)
-        position = torch.tensor(0, dtype=torch.long, device=device)
+        # These two seed tensors are created in EAGER mode (outside the compiled
+        # decode graph), so on Neuron each is dispatched as its own tiny standalone
+        # NEFF and executed immediately. On the trn1 cross-compile host
+        # (CROSS_TARGET_COMPILE_ONLY=1) that eager NEFF is the wrong physical target
+        # and fails at execution (aten::full -> NRT status 1004), whose async error
+        # SIGSEGVs the rank before the decode fullgraph is ever traced -- the
+        # 2026-08-05 cross-compile crash. A segfault cannot be caught by the escape
+        # below, so build the seeds on CPU there and DMA-copy to device: no compute
+        # NEFF runs pre-fullgraph. The device tensor handed to the compiled step is
+        # bit-identical either way (constant fill, no math), so the traced graph --
+        # and thus its NEFF cache key -- is unchanged and the trn2 bench cache-hits.
+        if os.environ.get("CROSS_TARGET_COMPILE_ONLY", "0") == "1":
+            next_id = torch.full((B,), 100, dtype=torch.long).to(device)
+            position = torch.tensor(0, dtype=torch.long).to(device)
+        else:
+            next_id = torch.full((B,), 100, dtype=torch.long, device=device)
+            position = torch.tensor(0, dtype=torch.long, device=device)
         gen.append(next_id)
 
     # DN_TILED_CONV: convert conv_states to tile-partition-major ONCE before any
     # decode step (from-zeros bench or post-prefill). Decode then reads/writes it
     # tiled; generated tokens are identical to the channel-major layout.
     if USE_DN_TILED_CONV:
-        conv_states = _conv_cm_to_tiled(conv_states)
+        # The tiled reshape/permute/contiguous is an eager device COMPUTE kernel.
+        # On the trn1 cross-compile host (CROSS_TARGET_COMPILE_ONLY=1) any eager
+        # device kernel loads the wrong-physical-target NEFF and DMA-aborts (30 s
+        # exec timeout -> NRT_EXEC_HW_ERR_DMA_ABORT) before the decode fullgraph is
+        # ever traced -- the 2026-08-05 cross-compile failure. Route this one-time
+        # setup conversion through CPU there so no compute NEFF runs pre-fullgraph.
+        # The device tensor handed to the compiled step is bit-identical either way
+        # (pure layout, no math), so the traced graph -- and thus its NEFF cache
+        # key -- is unchanged and the trn2 bench still cache-hits.
+        if os.environ.get("CROSS_TARGET_COMPILE_ONLY", "0") == "1":
+            conv_states = _conv_cm_to_tiled(conv_states.cpu()).to(device)
+        else:
+            conv_states = _conv_cm_to_tiled(conv_states)
 
     # ── PROFILE_STEPS: minimal isolated decode trace for neuron-explorer ──
     # When set, run 3 warmup + PROFILE_STEPS constant-(token,pos) decode steps
@@ -3284,11 +3397,79 @@ def main():
             dist.destroy_process_group()
         return
 
+    # Cross-target compile-only escape. On the trn1 cross-compile host the trn2
+    # NEFF compiles and persists to NEURON_COMPILE_CACHE_URL, then cannot run on
+    # the trn1 cores: the fullgraph typically fails to LOAD with "Invalid NEFF"
+    # (wrong physical target), but a NEFF that does load DMA-aborts at EXECUTION
+    # (30 s exec timeout -> NRT_EXEC_HW_ERR_DMA_ABORT, status 1203). Either way the
+    # persistent cache write already finalized at compile time, before load/exec,
+    # so catch the whole family, write a rank marker, wait for the other ranks,
+    # and exit clean -- mirroring test_decode_fullgraph_device.py:692-709. Without
+    # this the process hangs and is SIGTERM'd before the cache write completes, so
+    # only tiny kernel NEFFs survive (the full decode graph is lost). This is what
+    # lets static_decode's LITERAL --bench graph be cross-compiled on trn1 and
+    # cache-hit on trn2. Gated on CROSS_TARGET_COMPILE_ONLY, so it is a strict
+    # no-op on the native trn2 run (where any such error IS a real failure).
+    cross_target_compile = os.environ.get("CROSS_TARGET_COMPILE_ONLY", "0") == "1"
+    marker_dir = os.environ.get(
+        "CROSS_TARGET_MARKER_DIR", "/tmp/cross-target-compile")
+    marker_timeout = int(
+        os.environ.get("CROSS_TARGET_MARKER_TIMEOUT_SECONDS", "7200"))
+    # Execution-side signatures of "compiled fine, cannot run on this physical
+    # target". NOT compile errors (those raise before any NEFF exists and must
+    # surface). Kept execution-specific on purpose.
+    cross_target_exec_signatures = (
+        "Invalid NEFF", "DMA_ABORT", "unrecoverable error",
+        "execution timeout", "NRT_EXEC", "NRT EXECUTION FAILED",
+        "NRT status: 1203", "NRT status: 1004", "NRT Execution error",
+    )
+    # Stagger the per-rank walrus_driver compiles into waves of
+    # CROSS_TARGET_COMPILE_CONCURRENCY ranks. The tiled O2 decode graph needs
+    # ~58 GB/rank in walrus; all 8 co-resident peaked at ~493 GB and wedged the
+    # 512 GB trn1 (2026-08-05 OOM, SSM ConnectionLost). Collectives compile INTO
+    # each rank's NEFF and only need peer ranks at EXECUTE time, so per-rank
+    # walrus is independent and safe to serialize: a rank blocks until every
+    # earlier-wave rank has written its done-marker before triggering its own
+    # compile. Mirrors test_decode_fullgraph_device.py:646-664. concurrency ==
+    # world_size (the default) preserves the old all-at-once behavior.
+    cross_target_concurrency = int(os.environ.get(
+        "CROSS_TARGET_COMPILE_CONCURRENCY", str(world_size)))
+    if not 1 <= cross_target_concurrency <= world_size:
+        raise ValueError(
+            "CROSS_TARGET_COMPILE_CONCURRENCY must be in "
+            f"[1, {world_size}], got {cross_target_concurrency}")
+    if cross_target_compile and cross_target_concurrency < world_size:
+        os.makedirs(marker_dir, exist_ok=True)
+        wave_start = (rank // cross_target_concurrency) * cross_target_concurrency
+        wave_deadline = time.time() + marker_timeout
+        while len(os.listdir(marker_dir)) < wave_start:
+            if time.time() >= wave_deadline:
+                raise TimeoutError(
+                    f"rank {rank} timed out waiting for cross-target compile "
+                    f"wave {wave_start // cross_target_concurrency}")
+            time.sleep(1)
+
     with torch.no_grad():
         t0 = time.time()
         for step in range(args.num_tokens):
-            logits, next_id, dn_states, conv_states, kv_k, kv_v = run_decode(
-                next_id, position, dn_states, conv_states, kv_k, kv_v)
+            try:
+                logits, next_id, dn_states, conv_states, kv_k, kv_v = run_decode(
+                    next_id, position, dn_states, conv_states, kv_k, kv_v)
+            except RuntimeError as exc:
+                if not (cross_target_compile and any(
+                        sig in str(exc) for sig in cross_target_exec_signatures)):
+                    raise
+                os.makedirs(marker_dir, exist_ok=True)
+                open(os.path.join(marker_dir, f"rank{rank}.done"), "w").close()
+                deadline = time.time() + marker_timeout
+                while len(os.listdir(marker_dir)) < world_size:
+                    if time.time() >= deadline:
+                        raise TimeoutError(
+                            "timed out waiting for rank compile markers after "
+                            f"{marker_timeout}s")
+                    time.sleep(1)
+                print(f"rank={rank} compiled; skipped incompatible target load")
+                return
             gen.append(next_id)
             position = position + one
             if step == 0 and rank == 0:
@@ -3322,6 +3503,12 @@ def main():
     if USE_GQA_STATEFUL_KV and gen:
         _assert_kv_occupancy(mod.decode_kv_bufs("k"), f"DECODE kv_k rank={rank}")
         _assert_kv_occupancy(mod.decode_kv_bufs("v"), f"DECODE kv_v rank={rank}")
+
+    # DeltaNet recurrent-state occupancy: the gate on the DN_PERLAYER_STATE refactor.
+    # `dn_states`/`conv_states` are the last states threaded out of the decode loop.
+    if USE_DN_DIRECT_STATE_OUT and gen:
+        _assert_dn_occupancy(dn_states, f"DECODE dn_states rank={rank}")
+        _assert_dn_occupancy(conv_states, f"DECODE conv_states rank={rank}")
 
     if rank == 0:
         ids = [int(g[0].item()) for g in gen]
