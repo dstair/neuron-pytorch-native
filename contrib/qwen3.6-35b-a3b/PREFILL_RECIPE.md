@@ -1,13 +1,14 @@
 # Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32)
 
 Reproduces the fastest validated **prefill** configuration. The current best is
-**≈3,457 aggregate prompt tok/s** at **TP=8/LNC=1** (§3c) — **+23.8%** over the
-TP=4/LNC=2 configuration. Both use the identical packed-C32 DeltaNet kernel; LNC=1
-just gives twice the tensor engines. LNC=1 additionally requires both replicated
-`[V, H]` vocab tensors to be **load-time vocab-sharded** to fit the ~12 GB/rank
-budget, and the ~30-line `moe_cte` LNC=1 patch (§3c). The LNC=1 number was measured
-before the hoisted packed transposes landed, so it has not yet been re-baselined
-with them.
+**≈4,002 aggregate prompt tok/s** at **TP=8/LNC=1** on the **beta-4 container** with
+the **correct in-place rope-KV write** (one cache buffer per GQA layer) — see §3c
+and §4. That is **+9.8%** over the beta-4 compiler-only baseline (≈3,645) and
+**+15.8%** over the pre-beta-4 TP=8/LNC=1 packed-C32 number (≈3,457, itself +24.5%
+over TP=4/LNC=2). All use the identical packed-C32 DeltaNet kernel; LNC=1 gives
+twice the tensor engines and additionally requires both replicated `[V, H]` vocab
+tensors to be **load-time vocab-sharded** to fit the ~12 GB/rank budget, plus the
+~30-line `moe_cte` LNC=1 patch (§3c).
 
 The TP=4/LNC=2 configuration (§3a) is **≈2,792 aggregate prompt tok/s** (BS=2,
 N=20000 tokens, query bucket 1024, DeltaNet **stable C32** block-diagonal inverse
@@ -127,7 +128,7 @@ nohup bash -c 'deploy/compile_prefill_trn2.sh \
 ```
 Re-runs are cache-hot from the matching `--cache-dir` (skip §2/compile).
 
-### 3c. Fastest — TP=8/LNC=1 (≈3,457 tok/s, +24.5%)
+### 3c. Fastest — TP=8/LNC=1 (≈4,002 tok/s on beta-4; ≈3,457 pre-beta-4)
 
 Same packed-C32 kernel, but at TP=8/LNC=1 (8 logical cores → twice the tensor
 engines). Two extra requirements:
