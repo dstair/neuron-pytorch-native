@@ -34,6 +34,7 @@ run yet. Items to confirm on the first trn2 compile (Step 5 of the plan):
 """
 
 import nki
+import nki.isa as nisa
 import nki.language as nl
 
 from nkilib.core.moe.moe_cte.bwmm_shard_on_I import (
@@ -131,6 +132,33 @@ def nki_moe_cte_fp8_routed_35b(
         scatter_barrier=assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS,
     )
 
+    # (B) Clamp the padding-block expert sentinel (== num_local_experts) to a valid
+    # expert id. The baseline processes ALL blocks and gathers weights/scales/affinity
+    # by block_to_expert, so the sentinel indexes past the E-expert tensors (runtime
+    # scatter/gather OOB). Padded blocks' tokens are the padding token (id=T) whose
+    # affinity is 0, so a clamped padded block contributes 0 and writes only the dummy
+    # output row -- the real rows are untouched. Unit-test-scoped: the padding-safe
+    # production path is the hybrid entry with is_block_quant=True (skips padded blocks
+    # via `conditions`).
+    block_to_expert_clamped = nl.ndarray(
+        (max_blocks, 1),
+        dtype=nl.int32,
+        buffer=nl.shared_hbm,
+        name="fp8_block_to_expert_clamped",
+    )
+    _CLAMP_TILE = 128
+    for _t in range(0, max_blocks, _CLAMP_TILE):
+        _n = min(_CLAMP_TILE, max_blocks - _t)
+        _sb = nl.ndarray((_CLAMP_TILE, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=_sb[0:_n], src=block_to_expert[_t:_t + _n])
+        nisa.tensor_scalar(
+            dst=_sb[0:_n],
+            data=_sb[0:_n],
+            op0=nl.minimum,
+            operand0=num_local_experts - 1,
+        )
+        nisa.dma_copy(dst=block_to_expert_clamped[_t:_t + _n], src=_sb[0:_n])
+
     # Weights arrive as nl.int8 holding legacy-E4M3 bytes and are reinterpreted to
     # nki's legacy float8_e4m3 here. torch has no legacy-e4m3 dtype and neuronx-cc
     # rejects F8E4M3FN operands on TRN2 (NCC_EVRF051), so the HLO custom-call operand
@@ -151,7 +179,7 @@ def nki_moe_cte_fp8_routed_35b(
         down_proj_weight=down_proj_weight_fp8,
         block_size=block_size,
         token_position_to_id=token_position_to_id,
-        block_to_expert=block_to_expert,
+        block_to_expert=block_to_expert_clamped,
         gate_up_proj_scale=gate_up_proj_scale,
         down_proj_scale=down_proj_scale,
         is_block_quant=True,
