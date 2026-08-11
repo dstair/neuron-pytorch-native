@@ -438,6 +438,46 @@ def requantize_official_fp8_output_block(
     return result, result_scales, stats
 
 
+def quantize_gate_up_256block(gate_up_bf16, block=256):
+    """Quantize gate/up experts [E,H,2,I] to 256x256-block legacy-E4M3 (FP8 CTE).
+
+    Returns (int8 [E,H,2,I], scale [E,H//256,2,I//256,128]). One absmax scale per
+    (H-256-block, gate/up, I-256-block); dequant is decode_legacy_e4m3(int8) * scale.
+    The scale is broadcast over the 128 partition rows the kernel loads; the layout
+    matches nkilib's block-quant double_row path (moe_cte_torch_ref, is_block_quant).
+    Vectorized (no per-block Python loop) for load-time use across all 40 layers.
+    """
+    E, H, two_dim, I = gate_up_bf16.shape
+    if two_dim != 2 or H % block or I % block:
+        raise ValueError(f"gate_up must be [E,H,2,I] with H,I divisible by {block}")
+    HB, IB = H // block, I // block
+    w = gate_up_bf16.float().reshape(E, HB, block, 2, IB, block)
+    scale = w.abs().amax(dim=(2, 5)).clamp_min(1e-12) / LEGACY_E4M3_MAX  # [E,HB,2,IB]
+    i8 = encode_legacy_e4m3(w / scale[:, :, None, :, :, None]).reshape(E, H, 2, I)
+    scale_tab = (
+        scale.to(torch.float32)[..., None].expand(E, HB, 2, IB, 128).contiguous()
+    )
+    return i8, scale_tab
+
+
+def quantize_down_256block(down_bf16, block=256):
+    """Quantize down experts [E,I,H] to 256x256-block legacy-E4M3 (FP8 CTE).
+
+    Returns (int8 [E,I,H], scale [E,I//256,H//256,128]). See quantize_gate_up_256block.
+    """
+    E, I, H = down_bf16.shape
+    if I % block or H % block:
+        raise ValueError(f"down must be [E,I,H] with I,H divisible by {block}")
+    IB, HB = I // block, H // block
+    w = down_bf16.float().reshape(E, IB, block, HB, block)
+    scale = w.abs().amax(dim=(2, 4)).clamp_min(1e-12) / LEGACY_E4M3_MAX  # [E,IB,HB]
+    i8 = encode_legacy_e4m3(w / scale[:, :, None, :, None]).reshape(E, I, H)
+    scale_tab = (
+        scale.to(torch.float32)[..., None].expand(E, IB, HB, 128).contiguous()
+    )
+    return i8, scale_tab
+
+
 def requantize_official_fp8_row(
     raw,
     source_scales,

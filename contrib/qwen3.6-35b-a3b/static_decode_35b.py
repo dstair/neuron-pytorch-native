@@ -40,6 +40,8 @@ from moe_w8 import (
     build_local_affinities,
     OfficialFP8ExpertReader,
     QuantizationStats,
+    quantize_down_256block,
+    quantize_gate_up_256block,
     ROW_FP8_PROJECTION_CHOICES,
 )
 from topology_35b import LNC_DEGREE
@@ -193,9 +195,17 @@ USE_MOE_NKILIB = os.environ.get("MOE_NKILIB", "0") == "1"
 # metadata is built at runtime with fixed tensor shapes by moe_cte_adapter.py.
 USE_MOE_CTE = os.environ.get("MOE_CTE", "0") == "1"
 USE_MOE_CTE_NKI_PACK = os.environ.get("MOE_CTE_NKI_PACK", "0") == "1"
+# FP8xFP8 prefill CTE: experts resident as 256x256-block legacy-E4M3 (int8), run as
+# double_row FP8 matmuls (Trainium2 2x). Prefill-only; decode uses MOE_FUSED_W8.
+USE_MOE_CTE_FP8 = os.environ.get("MOE_CTE_FP8", "0") == "1"
 if USE_MOE_CTE:
     if USE_MOE_NKILIB:
         raise RuntimeError("MOE_CTE and MOE_NKILIB are mutually exclusive")
+if USE_MOE_CTE_FP8:
+    if not USE_MOE_CTE:
+        raise RuntimeError("MOE_CTE_FP8=1 requires MOE_CTE=1")
+    if not USE_MOE_CTE_NKI_PACK:
+        raise RuntimeError("MOE_CTE_FP8=1 requires MOE_CTE_NKI_PACK=1 (routed path)")
 
 # High-batch decode-only fused W8 experts. FP8 defaults to row-scaled legacy
 # E4M3 in nkilib's all-expert scheduler. Block power-of-two conversion preserves
@@ -369,6 +379,9 @@ if USE_MOE_NKILIB or USE_MOE_CTE:
     from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
 if USE_MOE_CTE:
     from torch_neuronx import wrap_nki
+    if USE_MOE_CTE_FP8:
+        from moe_cte_fp8_35b import nki_moe_cte_fp8_routed_35b
+        _nkilib_moe_cte_fp8_hop = wrap_nki(nki_moe_cte_fp8_routed_35b)[LNC_DEGREE]
     if USE_MOE_CTE_NKI_PACK:
         from moe_cte_35b import nki_moe_cte_routed_35b
         _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_routed_35b)[LNC_DEGREE]
@@ -1011,6 +1024,20 @@ class StaticDecode35B(nn.Module):
                     self.register_buffer(f"l{i}_k_down", down_k)
                     self.register_buffer(f"l{i}_k_gu_s", gs.squeeze(-1).reshape(Ec, 2, II).contiguous())  # [E,2,I]
                     self.register_buffer(f"l{i}_k_dn_s", ds.squeeze(-1).contiguous())                     # [E,H]
+                elif USE_MOE_CTE_FP8:
+                    # FP8xFP8 prefill: build the BF16 nkilib layout, then 256x256-block
+                    # quantize to int8 (legacy-E4M3) + scale tables for the double_row
+                    # path. Only the FP8 experts stay resident (the memory win); decode
+                    # is a separate run that uses MOE_FUSED_W8, not these buffers, so
+                    # reusing the l{i}_k_* names as int8 here is safe for prefill.
+                    gate_up_k = gu.reshape(Ec, 2, II, HH).permute(0, 3, 1, 2).contiguous()  # [E,H,2,I]
+                    down_k = dn.permute(0, 2, 1).contiguous()                              # [E,I,H]
+                    gu_i8, gu_scale = quantize_gate_up_256block(gate_up_k)
+                    dn_i8, dn_scale = quantize_down_256block(down_k)
+                    self.register_buffer(f"l{i}_k_gate_up", gu_i8)
+                    self.register_buffer(f"l{i}_k_gate_up_scale", gu_scale)
+                    self.register_buffer(f"l{i}_k_down", dn_i8)
+                    self.register_buffer(f"l{i}_k_down_scale", dn_scale)
                 else:
                     gate_up_k = gu.reshape(Ec, 2, II, HH).permute(0, 3, 1, 2).contiguous()  # [E,H,2,I]
                     down_k = dn.permute(0, 2, 1).contiguous()                              # [E,I,H]
@@ -1368,7 +1395,19 @@ class StaticDecode35B(nn.Module):
         hidden = torch.cat(
             [x2d.to(torch.bfloat16), torch.zeros(1, D.HIDDEN, dtype=torch.bfloat16, device=x2d.device)]
         )
-        if USE_MOE_CTE_NKI_PACK:
+        if USE_MOE_CTE_FP8:
+            routed = _nkilib_moe_cte_fp8_hop(
+                hidden,
+                affinities.reshape(-1, 1),
+                getattr(self, f"l{i}_k_gate_up"),        # int8 legacy-E4M3
+                getattr(self, f"l{i}_k_down"),           # int8 legacy-E4M3
+                getattr(self, f"l{i}_k_gate_up_scale"),  # [E,H//256,2,I//256,128]
+                getattr(self, f"l{i}_k_down_scale"),     # [E,I//256,H//256,128]
+                sel.to(torch.int32),
+                self.e_lo,
+                block_size,
+            )
+        elif USE_MOE_CTE_NKI_PACK:
             routed = _nkilib_moe_cte_hop(
                 hidden,
                 affinities.reshape(-1, 1),
