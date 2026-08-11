@@ -69,21 +69,28 @@ def _init_route_metadata(
     num_blocks = block_to_expert.shape[0]
     block_lo = writer_id * num_blocks // num_writers
     block_hi = (writer_id + 1) * num_blocks // num_writers
+    # block_to_expert is [num_blocks, 1] (partition-major over blocks), so its init
+    # must be tiled to <=128 partitions: at high batch num_blocks exceeds the SBUF
+    # 128-partition limit (e.g. BS=16 -> 288 blocks) and a single [num_blocks,1] memset
+    # trips "memset dst partition dimension exceeds maximum 128". Compile-time loop;
+    # one iteration at low batch (BS=2 -> 64 blocks), so BF16 behavior is unchanged.
     block_init = sbm.alloc_stack(
-        (block_hi - block_lo, 1),
+        (128, 1),
         dtype=nl.int32,
         name="route_pack_block_init",
     )
-    nisa.memset(
-        dst=block_init,
-        value=num_local_experts,
-        name="route_pack_init_block_experts",
-    )
-    nisa.dma_copy(
-        dst=block_to_expert[block_lo:block_hi, :],
-        src=block_init,
-        name="route_pack_store_block_experts_init",
-    )
+    for _ci, _blk_lo in enumerate(range(block_lo, block_hi, 128)):
+        _blk_n = min(128, block_hi - _blk_lo)
+        nisa.memset(
+            dst=block_init[0:_blk_n],
+            value=num_local_experts,
+            name=f"route_pack_init_block_experts_{_ci}",
+        )
+        nisa.dma_copy(
+            dst=block_to_expert[_blk_lo:_blk_lo + _blk_n, :],
+            src=block_init[0:_blk_n],
+            name=f"route_pack_store_block_experts_init_{_ci}",
+        )
 
     num_conditions = num_blocks + 1
     condition_lo = writer_id * num_conditions // num_writers
