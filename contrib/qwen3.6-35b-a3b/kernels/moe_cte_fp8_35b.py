@@ -26,6 +26,7 @@ gate_up [E,H//256,2,I//256,128], down [E,I//256,H//256,128].
 """
 
 import nki
+import nki.isa as nisa
 import nki.language as nl
 
 from nkilib.core.moe.moe_cte.bwmm_shard_on_I import (
@@ -119,6 +120,27 @@ def nki_moe_cte_fp8_routed_35b(
         scatter_barrier=assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS,
     )
 
+    # Clamp the padding-block expert sentinel (== num_local_experts) to E-1 before the
+    # kernel. Even the hybrid gathers weights/scales by block_to_expert for every block
+    # it visits (the `conditions` skip guards compute, not the pre-gather index), so the
+    # sentinel drives a scatter/gather DGE out-of-bound read on the [E,...] scale tables.
+    # Padded blocks carry the padding token (affinity 0) so a clamped block contributes
+    # 0; only the dummy output row is touched. Tiled to <=128 partitions like the packer.
+    block_to_expert_clamped = nl.ndarray(
+        (max_blocks, 1), dtype=nl.int32, buffer=nl.shared_hbm,
+        name="fp8_block_to_expert_clamped",
+    )
+    for _cl_lo in range(0, max_blocks, 128):
+        _cl_hi = min(_cl_lo + 128, max_blocks)
+        _cl_n = _cl_hi - _cl_lo
+        _cl_sb = nl.ndarray((128, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=_cl_sb[0:_cl_n], src=block_to_expert[_cl_lo:_cl_hi])
+        nisa.tensor_scalar(
+            dst=_cl_sb[0:_cl_n], data=_cl_sb[0:_cl_n],
+            op0=nl.minimum, operand0=num_local_experts - 1,
+        )
+        nisa.dma_copy(dst=block_to_expert_clamped[_cl_lo:_cl_hi], src=_cl_sb[0:_cl_n])
+
     # int8 (legacy-E4M3) -> nki float8_e4m3 view; HLO operand stays int8 (legal on TRN2).
     gate_up_proj_weight_fp8 = gate_up_proj_weight.view(nl.float8_e4m3)
     down_proj_weight_fp8 = down_proj_weight.view(nl.float8_e4m3)
@@ -134,7 +156,7 @@ def nki_moe_cte_fp8_routed_35b(
         down_proj_weight=down_proj_weight_fp8,
         block_size=block_size,
         token_position_to_id=token_position_to_id,
-        block_to_expert=block_to_expert,
+        block_to_expert=block_to_expert_clamped,
         num_static_block=0,
         gate_up_proj_scale=gate_up_proj_scale,
         down_proj_scale=down_proj_scale,

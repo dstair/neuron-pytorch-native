@@ -79,17 +79,23 @@ def _init_route_metadata(
         dtype=nl.int32,
         name="route_pack_block_init",
     )
-    for _ci, _blk_lo in enumerate(range(block_lo, block_hi, 128)):
-        _blk_n = min(128, block_hi - _blk_lo)
+    # Plain `for x in range(...)` with a SIMPLE loop variable: NKI's loop frontend
+    # rejects a tuple loop var (e.g. `for i, x in enumerate(...)`) with "expecting
+    # simple variable". Slice bounds are precomputed simple variables for the same
+    # reason (an arithmetic expression as a bound is also rejected). Unique op names
+    # are derived from the (compile-time-constant) loop offset.
+    for _blk_lo in range(block_lo, block_hi, 128):
+        _blk_hi = min(_blk_lo + 128, block_hi)
+        _blk_n = _blk_hi - _blk_lo
         nisa.memset(
             dst=block_init[0:_blk_n],
             value=num_local_experts,
-            name=f"route_pack_init_block_experts_{_ci}",
+            name=f"route_pack_init_block_experts_{_blk_lo}",
         )
         nisa.dma_copy(
-            dst=block_to_expert[_blk_lo:_blk_lo + _blk_n, :],
+            dst=block_to_expert[_blk_lo:_blk_hi, :],
             src=block_init[0:_blk_n],
-            name=f"route_pack_store_block_experts_init_{_ci}",
+            name=f"route_pack_store_block_experts_init_{_blk_lo}",
         )
 
     num_conditions = num_blocks + 1
