@@ -44,7 +44,8 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 
 # Reuse the validated route-packing preamble and constants from the BF16 wrapper so
 # the FP8 path packs routes identically (only the matmul dtype/scale path differs).
-from kernels.moe_cte_35b import (
+# Sibling import (kernels/ is on sys.path), matching static_decode_35b.py's convention.
+from moe_cte_35b import (
     _DIRECT_ROUTE_MAX_ASSIGNMENTS,
     _max_packed_blocks,
     _pack_local_routes_impl,
@@ -58,8 +59,8 @@ _moe_cte_baseline_impl = blockwise_mm_baseline_shard_intermediate.func
 def nki_moe_cte_fp8_routed_35b(
     hidden_states,
     expert_affinities_masked,
-    gate_up_proj_weight,   # [E, H, 2, I_TP], int8-stored legacy-E4M3 (FP8)
-    down_proj_weight,      # [E, I_TP, H],    int8-stored legacy-E4M3 (FP8)
+    gate_up_proj_weight,   # [E, H, 2, I_TP], nl.int8 holding legacy-E4M3 bytes
+    down_proj_weight,      # [E, I_TP, H],    nl.int8 holding legacy-E4M3 bytes
     gate_up_proj_scale,    # 256x256-block scale table (gate/up), see module docstring
     down_proj_scale,       # 256x256-block scale table (down)
     expert_indices,
@@ -130,6 +131,15 @@ def nki_moe_cte_fp8_routed_35b(
         scatter_barrier=assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS,
     )
 
+    # Weights arrive as nl.int8 holding legacy-E4M3 bytes and are reinterpreted to
+    # nki's legacy float8_e4m3 here. torch has no legacy-e4m3 dtype and neuronx-cc
+    # rejects F8E4M3FN operands on TRN2 (NCC_EVRF051), so the HLO custom-call operand
+    # must be int8 (legal); the .view is an in-kernel reinterpret that makes the
+    # baseline's DMA + double_row matmul treat them as FP8. Mirrors the int8-store +
+    # .view(nl.float8_e4m3) pattern in moe_fused_w8_35b.py:_load_native_fp8_tile.
+    gate_up_proj_weight_fp8 = gate_up_proj_weight.view(nl.float8_e4m3)
+    down_proj_weight_fp8 = down_proj_weight.view(nl.float8_e4m3)
+
     # --- FP8xFP8 block-quant double_row MoE (baseline entry; padded blocks included) ---
     # The baseline processes all N blocks; padded tokens map to id=T (dummy row), so the
     # result is correct. is_block_quant=True selects the double_row 2x path in the shared
@@ -137,8 +147,8 @@ def nki_moe_cte_fp8_routed_35b(
     return _moe_cte_baseline_impl(
         hidden_states=hidden_states,
         expert_affinities_masked=expert_affinities_masked,
-        gate_up_proj_weight=gate_up_proj_weight,
-        down_proj_weight=down_proj_weight,
+        gate_up_proj_weight=gate_up_proj_weight_fp8,
+        down_proj_weight=down_proj_weight_fp8,
         block_size=block_size,
         token_position_to_id=token_position_to_id,
         block_to_expert=block_to_expert,
