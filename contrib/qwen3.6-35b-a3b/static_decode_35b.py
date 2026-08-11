@@ -1034,10 +1034,24 @@ class StaticDecode35B(nn.Module):
                     down_k = dn.permute(0, 2, 1).contiguous()                              # [E,I,H]
                     gu_i8, gu_scale = quantize_gate_up_256block(gate_up_k)
                     dn_i8, dn_scale = quantize_down_256block(down_k)
-                    self.register_buffer(f"l{i}_k_gate_up", gu_i8)
-                    self.register_buffer(f"l{i}_k_gate_up_scale", gu_scale)
-                    self.register_buffer(f"l{i}_k_down", dn_i8)
-                    self.register_buffer(f"l{i}_k_down_scale", dn_scale)
+
+                    # Pad experts to E+1 with an all-zero dummy expert (index E). The route
+                    # packer marks padding blocks with the sentinel expert id == E; the CTE
+                    # kernel gathers weights/scales/affinity by that id BEFORE the padding
+                    # skip, so without the pad it reads index E out of an E-expert table
+                    # (scatter/gather DGE OOB). With the dummy row the gather is in-bounds
+                    # and padding blocks contribute 0 (zero weights/scale + zero affinity).
+                    # The affinity is padded to E+1 in _moe_cte. ~1/E extra expert HBM.
+                    def _pad_expert_dim(t):
+                        pad = torch.zeros(
+                            (1, *t.shape[1:]), dtype=t.dtype, device=t.device
+                        )
+                        return torch.cat([t, pad], dim=0).contiguous()
+
+                    self.register_buffer(f"l{i}_k_gate_up", _pad_expert_dim(gu_i8))
+                    self.register_buffer(f"l{i}_k_gate_up_scale", _pad_expert_dim(gu_scale))
+                    self.register_buffer(f"l{i}_k_down", _pad_expert_dim(dn_i8))
+                    self.register_buffer(f"l{i}_k_down_scale", _pad_expert_dim(dn_scale))
                 else:
                     gate_up_k = gu.reshape(Ec, 2, II, HH).permute(0, 3, 1, 2).contiguous()  # [E,H,2,I]
                     down_k = dn.permute(0, 2, 1).contiguous()                              # [E,I,H]
@@ -1392,6 +1406,15 @@ class StaticDecode35B(nn.Module):
         affinities = torch.cat(
             [affinities, torch.zeros(1, E, dtype=affinities.dtype, device=x2d.device)]
         ).to(torch.bfloat16)
+        if USE_MOE_CTE_FP8:
+            # FP8 experts/scales are padded to E+1 (dummy expert E). The kernel gathers
+            # affinity by the block's expert id too, so pad the expert axis with a zero
+            # dummy column: padding blocks (sentinel id == E) read affinity 0 in-bounds.
+            affinities = torch.cat(
+                [affinities,
+                 torch.zeros(affinities.shape[0], 1, dtype=affinities.dtype, device=x2d.device)],
+                dim=1,
+            )
         hidden = torch.cat(
             [x2d.to(torch.bfloat16), torch.zeros(1, D.HIDDEN, dtype=torch.bfloat16, device=x2d.device)]
         )
