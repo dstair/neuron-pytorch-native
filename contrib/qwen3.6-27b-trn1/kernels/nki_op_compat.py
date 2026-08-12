@@ -18,8 +18,10 @@ Why this can't be a verbatim copy of 2.11's ``nki_op``:
 
 All 27B op outputs are expressible from their inputs (``empty_like`` of an input
 tensor, or a ``[V_HEADS, V_DIM]`` combination), so the fakes below are exact.
-The eager / lazy-XLA path never consults these fakes (proven: eager add1 was
-bit-exact with ``fn``-as-fake), but keeping them correct makes both paths work.
+The op itself must be registered specifically for XLA. A default composite
+implementation is decomposed by AOT functionalization; substituting the fake
+there records empty placeholders instead of the NKI call and silently corrupts
+compiled execution. The eager / lazy-XLA path never consults these fakes.
 
 Install is a no-op on 2.11 (``torch_neuronx.nki_op`` already present); callers
 should guard with ``if not hasattr(torch_neuronx, "nki_op"): import nki_op_compat``.
@@ -64,10 +66,9 @@ _FAKES = {
 def nki_op(name, fn=None, mutates_args={}):
     """2.9 drop-in for torch-neuronx 2.11's ``torch_neuronx.nki_op``.
 
-    Registers ``fn`` as a torch custom op (so torch.compile/openxla sees an
-    opaque leaf that lowers to the NKI kernel at runtime), with a correct Fake
-    kernel from ``_FAKES`` and a FunctionalTensorMode decomposition so the eager
-    functionalization path can still trace into ``fn``.
+    Registers ``fn`` as an XLA-specific torch custom op (so
+    torch.compile/openxla preserves an opaque NKI call), with a correct
+    Fake/Meta kernel from ``_FAKES`` for shape propagation.
     """
     def dec(fn):
         def backend_fn(*args, **kwargs):
@@ -75,41 +76,11 @@ def nki_op(name, fn=None, mutates_args={}):
 
         result = custom_op(
             name, backend_fn, mutates_args=mutates_args,
+            device_types="xla",
             schema=infer_schema(fn, mutates_args=mutates_args),
         )
         fake = _FAKES.get(name, fn)  # fall back to fn (2.11 behavior; lazy-only)
         result.register_fake(fake)
-
-        from torch._subclasses.functional_tensor import FunctionalTensorMode
-
-        def functional_decomp(mode, op, types, args, kwargs):
-            import torch._subclasses
-            from torch.utils._pytree import tree_flatten
-            unrecognized = [
-                t for t in types
-                if not issubclass(t, torch._subclasses.FakeTensor)
-                and t not in (torch.Tensor,
-                              torch._subclasses.functional_tensor.FunctionalTensor)
-            ]
-            if unrecognized:
-                return NotImplemented
-            # Under torch.compile(backend="openxla"), AOTAutograd collects
-            # metadata with an active FakeTensorMode; the op's args arrive as
-            # FunctionalTensors whose inner isn't a plain FakeTensor, so a
-            # type-based check misses it. detect_fake_mode inspects the dispatch
-            # mode stack (and args), firing during compile tracing and staying
-            # None on the genuine lazy-XLA path. Running the real NKI kernel on
-            # fakes calls _xla_user_computation on non-XLA tensors -> crash;
-            # route those to the registered fake instead.
-            from torch._guards import detect_fake_mode
-            flat, _ = tree_flatten((args, kwargs))
-            has_fake = detect_fake_mode(flat) is not None
-            with mode:
-                if has_fake:
-                    return fake(*args, **kwargs)
-                return fn(*args, **kwargs)
-
-        result.register_torch_dispatch(FunctionalTensorMode, functional_decomp)
         return result
 
     return dec if fn is None else dec(fn)

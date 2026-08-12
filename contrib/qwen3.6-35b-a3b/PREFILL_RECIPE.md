@@ -32,7 +32,8 @@ path**. All configs use identical shapes, topology, and the fused NKI route pack
 All host/path values live in `.env` — copy `.env.example` to `.env` and fill in.
 This recipe references: `QWEN35_NATIVE_IMAGE`, `QWEN35_MODEL_DIR` (BF16 — prefill
 is BF16, no FP8 experts needed), `QWEN35_NKILIB_DIR`, `QWEN35_COMPILER_CACHE_DIR`,
-`QWEN35_RUN_HOST`/`QWEN35_RUN_REGION` (Trn2). Nothing is hard-coded here.
+`QWEN35_LOG_DIR`, and `QWEN35_RUN_HOST`/`QWEN35_RUN_REGION` (Trn2). Nothing is
+hard-coded here.
 
 ---
 
@@ -126,8 +127,9 @@ and the script's metadata guard refuses to mix them.
 nohup bash -c 'deploy/compile_prefill_trn2.sh \
   --tp 4 --lnc 2 --layers 40 --splits 4 --bucket 1024 --optlevel 1 \
   --cache-dir "$QWEN35_COMPILER_CACHE_DIR/c32pack4"' \
-  > /mnt/nvme/runlog/prefill_bench.log 2>&1 &
-# poll: grep -E 'tok/s|prompt|throughput|compiled|Error' /mnt/nvme/runlog/prefill_bench.log
+  > "$QWEN35_LOG_DIR/prefill_bench.log" 2>&1 &
+# poll:
+grep -E 'tok/s|prompt|throughput|compiled|Error' "$QWEN35_LOG_DIR/prefill_bench.log"
 ```
 Re-runs are cache-hot from the matching `--cache-dir` (skip §2/compile).
 

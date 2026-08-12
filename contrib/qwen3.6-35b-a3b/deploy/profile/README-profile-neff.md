@@ -9,7 +9,7 @@ The 40-layer TP=8 graph is too large for direct on-device profiling
 overflows). The working method is: **cross-compile a debug NEFF on trn1, then
 collective-replay-capture it on trn2.**
 
-## 1. Cross-compile the debug NEFF (trn1.32xlarge, us-east-2)
+## 1. Cross-compile the debug NEFF (trn1.32xlarge)
 
 Use `deploy/compile_decode_fp8_trn2.sh`. It ALREADY uses the correct harness
 (`test_decode_fullgraph_device.py`) — do **not** switch it to `static_decode_35b.py`:
@@ -21,16 +21,14 @@ NEFF survives.
 
 ```bash
 cd <repo>/contrib/qwen3.6-35b-a3b
-export QWEN35_NATIVE_IMAGE=<concourse DLC image>
-export QWEN35_MODEL_DIR=/mnt/nvme/models/Qwen3.5-35B-A3B
-export QWEN35_FP8_MODEL_DIR=/mnt/nvme/models/Qwen3.5-35B-A3B-FP8   # FP8 mode REQUIRES this
-export QWEN35_NKILIB_DIR=/mnt/nvme/nki-library
+source ../../.env
 export QWEN35_XC_NEURON_CC_FLAGS="--target trn2 --lnc 1"          # O2 (match shipped); do NOT add --optlevel 1
 export XLA_IR_DEBUG=1 XLA_HLO_DEBUG=1 NEURON_FRAMEWORK_DEBUG=1     # source attribution
 DN_TILED_CONV=1 deploy/compile_decode_fp8_trn2.sh \
   --mode fp8 --fp8-impl block_pow2_coalesced \
   --layers 40 --batch-size 128 --direct-state-output on \
-  --compile-concurrency 8 --cache-dir /mnt/nvme/xc-cache/tiled-prof-dbg
+  --compile-concurrency 8 \
+  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/tiled-prof-dbg"
 ```
 
 Success = eight ~66 MB `*.neff` under `<cache-dir>/neff_cache/` (one per rank) +
@@ -38,7 +36,7 @@ Success = eight ~66 MB `*.neff` under `<cache-dir>/neff_cache/` (one per rank) +
 to static_decode. Transfer the largest NEFF to trn2 (S3; from the dev box use
 `aws s3api put-object`, not `aws s3 cp`).
 
-## 2. Capture-replay on trn2 (trn2.3xlarge, ap-southeast-4)
+## 2. Capture-replay on trn2 (trn2.3xlarge)
 
 Runs in the DLC. Needs the host neuron lib mount (driver mismatch) AND
 `NEURON_LOGICAL_NC_CONFIG=1` (8-core LNC=1; without it `nrt_init` fails — the

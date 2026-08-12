@@ -19,42 +19,43 @@ V_DIM = 128
 V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))
 
 
-def run(C=16, S=64, seed=0, realistic_gates=True):
+def run(C=16, S=64, seed=0, realistic_gates=True, batch_size=1):
     torch.manual_seed(seed)
     H = V_HEADS
-    # head-major rows: row h*S + t
-    q = torch.randn(H * S, K_DIM)
-    k = torch.randn(H * S, K_DIM)
-    v = torch.randn(H * S, V_DIM)
+    streams = batch_size * H
+    # Batch/head stream-major rows: row stream*S + t.
+    q = torch.randn(streams * S, K_DIM)
+    k = torch.randn(streams * S, K_DIM)
+    v = torch.randn(streams * S, V_DIM)
     if realistic_gates:
         # Real DeltaNet gates: g = -exp(A_log)*softplus(a+dt) is strongly
         # NEGATIVE (g_cum reaches ~-200 over 64 tokens). This exercises the
         # decay-mask exp-before-mask NaN path that g*0.1 never triggers.
-        A_log = torch.randn(H, 1)
-        dt = torch.randn(H, 1) * 0.1
-        a = torch.randn(H * S, 1)
+        A_log = torch.randn(streams, 1)
+        dt = torch.randn(streams, 1) * 0.1
+        a = torch.randn(streams * S, 1)
         g = ((-torch.exp(A_log)).repeat_interleave(S, dim=0)
              * torch.nn.functional.softplus(a + dt.repeat_interleave(S, dim=0)))
     else:
-        g = torch.randn(H * S, 1) * 0.1
-    beta = torch.sigmoid(torch.randn(H * S, 1))
-    state = torch.randn(H * K_DIM, V_DIM) * 0.01
+        g = torch.randn(streams * S, 1) * 0.1
+    beta = torch.sigmoid(torch.randn(streams * S, 1))
+    state = torch.randn(streams * K_DIM, V_DIM) * 0.01
 
     m_incl, m_strict, eye = build_constants(C)
 
     # ---- oracle (per head), kernel L2-normalizes internally so pass raw q,k ----
-    ref_out = torch.zeros(H * S, V_DIM)
-    ref_state = torch.zeros(H * K_DIM, V_DIM)
-    for h in range(H):
-        qh = F.normalize(q[h * S:(h + 1) * S], p=2, dim=-1)
-        kh = F.normalize(k[h * S:(h + 1) * S], p=2, dim=-1)
-        vh = v[h * S:(h + 1) * S]
-        gh = g[h * S:(h + 1) * S]
-        bh = beta[h * S:(h + 1) * S]
-        sh = state[h * K_DIM:(h + 1) * K_DIM]
+    ref_out = torch.zeros(streams * S, V_DIM)
+    ref_state = torch.zeros(streams * K_DIM, V_DIM)
+    for stream in range(streams):
+        qh = F.normalize(q[stream * S:(stream + 1) * S], p=2, dim=-1)
+        kh = F.normalize(k[stream * S:(stream + 1) * S], p=2, dim=-1)
+        vh = v[stream * S:(stream + 1) * S]
+        gh = g[stream * S:(stream + 1) * S]
+        bh = beta[stream * S:(stream + 1) * S]
+        sh = state[stream * K_DIM:(stream + 1) * K_DIM]
         oh, nsh = ref_chunk_single_head(sh, qh, kh, vh, gh, bh, C, m_incl, m_strict, eye)
-        ref_out[h * S:(h + 1) * S] = oh
-        ref_state[h * K_DIM:(h + 1) * K_DIM] = nsh
+        ref_out[stream * S:(stream + 1) * S] = oh
+        ref_state[stream * K_DIM:(stream + 1) * K_DIM] = nsh
 
     # ---- Run the NKI kernel. Default: nki.simulate (CPU, numpy — exercises the
     # exact kernel logic without XLA device lowering, ideal for numerical
@@ -71,7 +72,10 @@ def run(C=16, S=64, seed=0, realistic_gates=True):
     od = (out - ref_out).abs().max().item()
     sd = (ns - ref_state).abs().max().item()
     ocos = F.cosine_similarity(out.reshape(-1), ref_out.reshape(-1), dim=0).item()
-    print(f"C={C} S={S} H={H}: out_max_diff={od:.3e} state_max_diff={sd:.3e} out_cos={ocos:.6f}")
+    print(
+        f"B={batch_size} C={C} S={S} H={H}: out_max_diff={od:.3e} "
+        f"state_max_diff={sd:.3e} out_cos={ocos:.6f}"
+    )
     ok = od < 1e-2 and sd < 1e-2
     print("PASS" if ok else "FAIL")
     return ok
@@ -82,5 +86,6 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--C", type=int, default=16)
     p.add_argument("--S", type=int, default=64)
+    p.add_argument("--batch-size", type=int, default=1)
     a = p.parse_args()
-    run(C=a.C, S=a.S)
+    run(C=a.C, S=a.S, batch_size=a.batch_size)

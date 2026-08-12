@@ -3,7 +3,7 @@
 A PyTorch-Native inference implementation of the sparse-MoE **Qwen3.6-35B-A3B**
 model (~3B active parameters of 35B) on a single Trainium2 device
 (`trn2.3xlarge`, TP=4, LNC=2). It shares the DeltaNet + GQA backbone structure of
-the [dense 27B](../qwen3.6-27b) but replaces the dense MLP with a 256-expert
+the [dense 27B Trn2 implementation](../qwen3.6-27b-trn2) but replaces the dense MLP with a 256-expert
 top-8 mixture of experts, and targets a fixed long-context (20,000-token) regime.
 
 > **Naming.** The model is published as
@@ -347,11 +347,12 @@ host directory mounted as `/tmp` in the container. That directory contains
 `hlo_cache`, `neff_cache`, and NKI compiler subtrees. Do not archive or restore
 only a `.neff` file, and do not point the runtime at an arbitrary one.
 
-Set these ignored `.env` values on the compile and reuse hosts:
+Set these values in the ignored `.env` on the compile and reuse hosts:
 
 ```bash
-export QWEN35_COMPILER_CACHE_DIR=/mnt/nvme/qwen35-prefill-cache
-export QWEN35_COMPILER_CACHE_S3_URI=s3://YOUR-BUCKET/neuron-compile-cache/qwen35
+source ../../.env
+: "${QWEN35_COMPILER_CACHE_DIR:?set in .env}"
+: "${QWEN35_COMPILER_CACHE_S3_URI:?set in .env}"
 ```
 
 After a successful cold compile, stage an immutable cache key:
@@ -393,13 +394,13 @@ the ignored `.env`, then use a separate cache root for each graph shape:
 deploy/compile_prefill_trn2.sh \
   --layers 40 --splits 1 --tp 8 --lnc 1 \
   --cache-platform-target trn2 --scratchpad-page-size-mb 64 \
-  --cache-dir /mnt/nvme/qwen35-prefill-tp8-lnc1-s1
+  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/prefill-tp8-lnc1-s1"
 
 # Four compiled regions containing 10 layers each.
 deploy/compile_prefill_trn2.sh \
   --layers 40 --splits 4 --tp 8 --lnc 1 \
   --cache-platform-target trn2 --scratchpad-page-size-mb 64 \
-  --cache-dir /mnt/nvme/qwen35-prefill-tp8-lnc1-s4
+  --cache-dir "$QWEN35_COMPILER_CACHE_DIR/prefill-tp8-lnc1-s4"
 ```
 
 A Trn2 NEFF cannot execute on the Trn1 compile host, so the driver can exit
@@ -408,7 +409,7 @@ Use the per-rank logs, `neff_cache`, and `qwen35_compile_metadata.env` to
 distinguish that expected load failure from a compiler failure. Restore the
 complete cache root on Trn2 and use the same scratchpad page size at runtime.
 
-The full-depth experiment used a `trn1.32xlarge` in `us-east-2`, compiler
+The full-depth experiment used a `trn1.32xlarge`, compiler
 2.25.1280.0, and the DLC recorded in the cache metadata. Both the one-region
 and four-region graphs compiled successfully. The one-region compile peaked at
 216 GiB host RAM; four-region variants peaked at 205-206 GiB. The four-region
@@ -1449,7 +1450,7 @@ its own MoE kernels and CPU oracle.
 ### vLLM-Neuron port (different regime — not a ranking)
 
 A separate vLLM-Neuron port of this model exists and was validated by its authors
-(`/home/dstair/dev/vllm-neuron`, `origin/add-qwen36-moe` @ `65ef8b7`). Its measured
+(`origin/add-qwen36-moe` @ `65ef8b7`). Its measured
 numbers, for reference:
 
 | Metric | vLLM-Neuron port | Config |

@@ -721,6 +721,6 @@ output, not as an architecture to copy.
 
 | Piece | Source |
 |---|---|
-| DeltaNet / GQA / RoPE / RMSNorm / TP / compile harness | the sibling `qwen3.6-27b` (dense) — retune head counts |
+| DeltaNet / GQA / RoPE / RMSNorm / TP / compile harness | the sibling `qwen3.6-27b-trn2` (dense) — retune head counts |
 | MoE (masked-dense grouped-bmm, expert-parallel) | `kernels/` here + `test_moe_oracle_cpu.py` |
 | Correctness oracle | this package's CPU oracle + NxDI PR #60 token match |

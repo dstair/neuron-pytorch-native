@@ -16,19 +16,19 @@ keep it self-contained and match the reference exactly, it L2-normalizes q,k and
 applies the 1/sqrt(K) q-scale internally. Gates g (log-decay) and beta are passed
 precomputed per (token, head) — same as the decode kernel computes them.
 
-Layout (per TP core; flattened head-major like deltanet_full / deltanet_chunked):
-  state:   [V_HEADS*K_DIM, V_DIM]            f32   in
-  q,k:     [V_HEADS*S, K_DIM]                f32   (head-major: rows h*S+t)
-  v:       [V_HEADS*S, V_DIM]                f32
-  g:       [V_HEADS*S, 1]                    f32   log-decay per (h,t)
-  beta:    [V_HEADS*S, 1]                    f32
+Layout (per TP core; each batch/head pair is an independent stream):
+  state:   [STREAMS*K_DIM, V_DIM]             f32   in
+  q,k:     [STREAMS*S, K_DIM]                 f32   (rows stream*S+t)
+  v:       [STREAMS*S, V_DIM]                 f32
+  g:       [STREAMS*S, 1]                     f32   log-decay per stream/token
+  beta:    [STREAMS*S, 1]                     f32
   m_incl:  [C, C]  f32  (i>=j) — also the cumsum operator
   m_strict:[C, C]  f32  (i> j)
   eye:     [C, C]  f32
 
 Returns:
-  output:    [V_HEADS*S, V_DIM]  f32   (ungated raw delta-rule output)
-  new_state: [V_HEADS*K_DIM, V_DIM] f32
+  output:    [STREAMS*S, V_DIM]  f32   (ungated raw delta-rule output)
+  new_state: [STREAMS*K_DIM, V_DIM] f32
 
 NOTE: this returns the RAW attention output (pre RMSNormGated / pre out_proj), so
 it can be validated directly against ref_chunk_single_head. Gating + out_proj are
@@ -54,27 +54,46 @@ V_HEADS = int(_os.environ.get("DN_V_HEADS", "12"))  # 12@TP4, 6@TP8
 RMS_EPS = 1e-6
 
 
+def kernel_assert(condition, error_text):
+    """Raise an NKI-formatted validation error for a static shape contract."""
+    assert condition, (
+        f"[INTERNAL_ERROR] [NCC_INKI016] Kernel validation exception: {error_text}"
+    )
+
+
 @nki.jit
 def nki_deltanet_chunked_prefill_v2(
-    state,      # [V_HEADS*K_DIM, V_DIM] f32
-    query,      # [V_HEADS*S, K_DIM] f32
-    key,        # [V_HEADS*S, K_DIM] f32
-    value,      # [V_HEADS*S, V_DIM] f32
-    g,          # [V_HEADS*S, 1] f32
-    beta,       # [V_HEADS*S, 1] f32
+    state,      # [STREAMS*K_DIM, V_DIM] f32
+    query,      # [STREAMS*S, K_DIM] f32
+    key,        # [STREAMS*S, K_DIM] f32
+    value,      # [STREAMS*S, V_DIM] f32
+    g,          # [STREAMS*S, 1] f32
+    beta,       # [STREAMS*S, 1] f32
     m_incl,     # [C, C] f32
     m_strict,   # [C, C] f32
     eye,        # [C, C] f32
 ):
-    num_heads = V_HEADS
+    kernel_assert(len(state.shape) == 2, "state must be rank 2")
+    kernel_assert(state.shape[0] % K_DIM == 0, "state rows must divide into K_DIM")
+    kernel_assert(state.shape[1] == V_DIM, "state free dimension must equal V_DIM")
+    kernel_assert(query.shape[1] == K_DIM, "query free dimension must equal K_DIM")
+    kernel_assert(key.shape == query.shape, "key shape must match query")
+    kernel_assert(value.shape[1] == V_DIM, "value free dimension must equal V_DIM")
+
+    num_streams = state.shape[0] // K_DIM
     total_rows = query.shape[0]
-    S = total_rows // num_heads
+    kernel_assert(
+        total_rows % num_streams == 0,
+        "query rows must divide evenly across state streams",
+    )
+    S = total_rows // num_streams
     C = m_incl.shape[0]
+    kernel_assert(S % C == 0, "sequence length must be a multiple of chunk size")
     num_chunks = S // C
     Q_SCALE = 1.0 / math.sqrt(K_DIM)
 
     out = nl.ndarray((total_rows, V_DIM), dtype=nl.float32, buffer=nl.shared_hbm)
-    new_state = nl.ndarray((num_heads * K_DIM, V_DIM), dtype=nl.float32, buffer=nl.shared_hbm)
+    new_state = nl.ndarray(state.shape, dtype=nl.float32, buffer=nl.shared_hbm)
 
     # ---- constants resident in SBUF (reused across all heads/chunks) ----
     m_incl_s = nl.ndarray((C, C), dtype=nl.float32, buffer=nl.sbuf)
@@ -92,11 +111,14 @@ def nki_deltanet_chunked_prefill_v2(
     onesC = nl.ndarray((1, C), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=onesC, value=1.0)
 
-    for h in nl.sequential_range(num_heads):
-        # state for this head: [K_DIM, V_DIM]
+    for stream in nl.sequential_range(num_streams):
+        # State for one independent (batch, head) stream: [K_DIM, V_DIM].
         s = nl.ndarray((K_DIM, V_DIM), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=s, src=state[h * K_DIM:(h + 1) * K_DIM, 0:V_DIM])
-        row0 = h * S
+        nisa.dma_copy(
+            dst=s,
+            src=state[stream * K_DIM:(stream + 1) * K_DIM, 0:V_DIM],
+        )
+        row0 = stream * S
         for c in nl.sequential_range(num_chunks):
             base = row0 + c * C
             _chunk(
@@ -105,7 +127,10 @@ def nki_deltanet_chunked_prefill_v2(
                 m_incl_s, m_strict_s, eye_s,
                 eps1, zC1, zCC, onesC, C, Q_SCALE,
             )
-        nisa.dma_copy(dst=new_state[h * K_DIM:(h + 1) * K_DIM, 0:V_DIM], src=s)
+        nisa.dma_copy(
+            dst=new_state[stream * K_DIM:(stream + 1) * K_DIM, 0:V_DIM],
+            src=s,
+        )
 
     return out, new_state
 

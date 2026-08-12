@@ -13,13 +13,14 @@ kernels, and benchmarking harnesses.
 ## What's here
 
 Everything lives under [`contrib/`](contrib/). Each subdirectory is a
-self-contained reference implementation of a model on PyTorch Native — the model
-code, any custom NKI kernels and correctness tests it needs, and the scripts used
-to compile, run, and benchmark it on Trainium2.
+self-contained reference implementation for a specific model and accelerator
+generation: model code, custom NKI kernels, correctness tests, and the scripts
+used to compile, run, and benchmark it.
 
 | Directory | Model | Highlights |
 |---|---|---|
-| [`contrib/qwen3.6-27b`](contrib/qwen3.6-27b) | Qwen3.6-27B (dense hybrid) | DeltaNet + GQA backbone, fused DeltaNet NKI kernels, chunked prefill, GQA-tail mega-kernel, FP8 W8A16, EAGLE3 speculative decode |
+| [`contrib/qwen3.6-27b-trn1`](contrib/qwen3.6-27b-trn1) | Qwen3.6-27B on Trainium1 | TP8 PJRT/XLA execution, segmented prefill, compiled decode, prepacked bf16 weights, batched DeltaNet recurrence |
+| [`contrib/qwen3.6-27b-trn2`](contrib/qwen3.6-27b-trn2) | Qwen3.6-27B on Trainium2 | PyTorch Native, fused DeltaNet NKI kernels, chunked prefill, GQA-tail mega-kernel, FP8 W8A16, EAGLE3 speculative decode |
 | [`contrib/qwen3.6-35b-a3b`](contrib/qwen3.6-35b-a3b) | Qwen3.6-35B-A3B (sparse MoE) | 256-expert top-8 MoE (masked-dense + true-sparse dispatch), DeltaNet + GQA backbone, MoE FP8, 20k-context config sweep |
 | [`contrib/deepseek-v4-flash`](contrib/deepseek-v4-flash) | DeepSeek V4 Flash (284B/13B MoE) | MLA attention + Hyper-Connections, 256-expert MoE, TP=64 expert+tensor parallel, Neuron-native MoE gate, `torch.compile` HC fusion |
 | [`contrib/esm2`](contrib/esm2) | ESM-2 (protein LM, 8M–15B) | HuggingFace ESM-2 inference + MLM fine-tuning via `torch.compile`, tensor parallelism for the large sizes |

@@ -36,7 +36,8 @@ checkpoint — just the env below); it needs the same official FP8 checkpoint.
 All host/path values live in `.env` — copy `.env.example` to `.env` and fill in.
 This recipe references: `QWEN35_NATIVE_IMAGE`, `QWEN35_MODEL_DIR` (BF16),
 `QWEN35_FP8_MODEL_DIR` (FP8 experts), `QWEN35_COMPILER_CACHE_DIR`,
-`QWEN35_RUN_HOST`/`QWEN35_RUN_REGION` (Trn2). No values are hard-coded here.
+`QWEN35_LOG_DIR`, and `QWEN35_RUN_HOST`/`QWEN35_RUN_REGION` (Trn2). No values
+are hard-coded here.
 
 ---
 
@@ -129,8 +130,9 @@ re-runs are cache-hot (seconds, no recompile).
 **Kicking it off headless** (compile is long; don't hold an interactive
 session): wrap the above in a script, `nohup` it, and write to a log:
 ```bash
-nohup bash run_decode_bench.sh > /mnt/nvme/runlog/decode_bench.log 2>&1 &
-# then poll: grep -E 'loaded|first decode|TPOT|tok/s|gen hash' /mnt/nvme/runlog/decode_bench.log
+nohup bash run_decode_bench.sh > "$QWEN35_LOG_DIR/decode_bench.log" 2>&1 &
+# then poll:
+grep -E 'loaded|first decode|TPOT|tok/s|gen hash' "$QWEN35_LOG_DIR/decode_bench.log"
 ```
 
 ---
