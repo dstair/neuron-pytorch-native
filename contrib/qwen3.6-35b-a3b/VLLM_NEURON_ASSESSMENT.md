@@ -199,18 +199,18 @@ these versions.
 
 ### 4c. Disk
 
-`/mnt/nvme` is at **3.2 GB free of 430 GB**. Top consumers: `tmp` 166 G,
-`prefill-work` 67 G, a checkpoint 67 G, `prefill.swap` 49 G, an FP8 checkpoint
-35 G, `lnc1-work` 21 G, `docker` 13 G. Roughly **40 GB** would need reclaiming for
-a NEFF/NKI compile cache (`VLLM_CACHE_ROOT`).
+The instance-store volume was nearly full during the assessment. Roughly
+**40 GB** would need reclaiming for a NEFF/NKI compile cache
+(`VLLM_CACHE_ROOT`).
 
 **One thing that is *not* a blocker:** the checkpoint. Our existing
-`/mnt/nvme/Qwen3.5-35B-A3B` BF16 checkpoint serves their port unchanged — same
+`QWEN35_MODEL_DIR` BF16 checkpoint serves their port unchanged — same
 architecture (`qwen3_5_moe`), and their own README lists Qwen3.5-35B-A3B as
 "BF16 (same arch)". No 70 GB re-download.
 
 **What would unblock it:** a `trn2.48xlarge`; a Neuron 2.31 / vLLM 0.21
-environment; ~40 GB of `/mnt/nvme` reclaimed. With those three, §10 runs as-is.
+environment; and ~40 GB reclaimed on the instance-store volume. With those
+three, §10 runs as-is.
 
 ---
 
@@ -726,7 +726,7 @@ hf download Qwen/Qwen3.6-35B-A3B --local-dir /path/to/Qwen3.6-35B-A3B
 ```
 
 > **Local adaptation:** not needed here — our existing
-> `/mnt/nvme/Qwen3.5-35B-A3B` BF16 checkpoint serves this port unchanged (same
+> `QWEN35_MODEL_DIR` BF16 checkpoint serves this port unchanged (same
 > `qwen3_5_moe` architecture; their README lists Qwen3.5-35B-A3B as "BF16 (same
 > arch)"). Point `vllm serve` at it directly. Note `huggingface-cli` is removed on
 > the pinned `huggingface_hub` 1.x — use `hf download`; set
@@ -828,4 +828,3 @@ few-shot prompt + generation inside the 1,024-token window or requests are
 rejected for exceeding `max_model_len`.
 
 **Do not** gate on `run_logit_validation_offline.py`'s stock thresholds — see §3.
-

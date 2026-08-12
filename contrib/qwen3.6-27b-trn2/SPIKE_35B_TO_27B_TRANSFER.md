@@ -1,7 +1,7 @@
 # Research spike: which 35B-A3B improvements transfer to the 27B
 
 **Question.** Since the initial commit, ~64 commits of optimization work landed on
-`qwen3.6-35b-a3b` and *none* on `qwen3.6-27b`. Which of those wins are portable to
+`qwen3.6-35b-a3b` and *none* on `qwen3.6-27b-trn2`. Which of those wins are portable to
 the 27B, how much work is each, and what is the expected payoff?
 
 **Method.** Static reading only (Trn2 was in use). Compared the two trees
@@ -29,7 +29,7 @@ gated GQA tail with partial RoPE (dim 64, θ=1e7, head_dim 256), and (1+w) RMSNo
 | TP / topo | 4 / LNC=2 | 4 (also 8/LNC=1) |
 
 The 35B `README` even names the 27B as the *source* of the shared backbone
-("DeltaNet / GQA / RoPE / RMSNorm / TP / compile harness — the sibling qwen3.6-27b;
+("DeltaNet / GQA / RoPE / RMSNorm / TP / compile harness — the sibling qwen3.6-27b-trn2;
 retune head counts"). So the flow direction has now reversed: the 35B carries the
 matured versions of kernels the 27B seeded.
 
