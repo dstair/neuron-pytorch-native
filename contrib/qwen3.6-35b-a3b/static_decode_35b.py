@@ -1165,6 +1165,33 @@ class StaticDecode35B(nn.Module):
             return self._moe_fused_w8(i, x2d, lead).to(x.dtype)
         if USE_MOE_CTE:
             if prefill:
+                # The CTE MoE deadlocks (NRT status 5, "hang on instructions
+                # BETWEEN collective operations") once ONE call processes more
+                # than ~2048 tokens. Measured 2026-08-20 at 4L/seq1024, TP=8:
+                # 2048 tokens completes at block_size 512 (64 blocks) AND at 256
+                # (96 blocks, bit-identical); 3072 hangs at BOTH 512 (80 blocks)
+                # and 256 (128 blocks). Block count overlaps across the working
+                # and hanging sets (80-96) and packed_len 32768 appears on both
+                # sides, so the wall is tokens per call — not block count, not
+                # the packed buffer length, and not the loop expression
+                # (dynamic_range / static unroll / fori_loop all hang alike).
+                # MoE is per-token independent, so cap the tokens per CTE call
+                # instead of shrinking --bucket-chunk. That keeps the bucket
+                # large, so GQA/DeltaNet setup and the per-chunk collectives
+                # still amortize over few chunks: capping the bucket instead
+                # (BS=16/chunk128, 79 chunks vs 20) lost 14.7% at 40L/seq10k.
+                cap = int(os.environ.get("MOE_CTE_MAX_TOKENS", "0"))
+                T = x2d.shape[0]
+                if cap > 0 and T > cap:
+                    parts = []
+                    for cs in range(0, T, cap):
+                        ce = min(cs + cap, T)
+                        parts.append(self._moe_cte(i, x2d[cs:ce], (ce - cs,)))
+                    return (
+                        torch.cat(parts, dim=0)
+                        .reshape(*lead, D.HIDDEN)
+                        .to(x.dtype)
+                    )
                 return self._moe_cte(i, x2d, lead).to(x.dtype)
             # Decode: the context-encoding kernel can't meta-specialize T=1, and the
             # sparse/reference tail below needs the plain per-expert weights that the
