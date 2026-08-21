@@ -1,0 +1,144 @@
+--- a/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py
++++ b/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py
+@@ -407,6 +407,7 @@
+     gate_up_activations_T=None,
+     down_activations=None,
+     is_block_quant: bool = False,
++    is_output_block_quant: bool = False,
+     # meta parameters
+     activation_function: ActFnType = ActFnType.SiLU,
+     skip_dma: SkipMode = SkipMode(),
+@@ -603,6 +604,7 @@
+         quant_activation_mode=ActivationQuantMode.NONE,
+         quant_is_per_tensor=False,
+         is_block_quant=is_block_quant,
++        is_output_block_quant=is_output_block_quant,
+     )
+ 
+     check_blockwise_mm_shard_I_kernel_compatibility(dims, configs)
+@@ -1339,7 +1341,14 @@
+                         h_block = h_lin // i_tiles_per_block
+                         i_block = i_tile_idx // i_tiles_per_block
+                         for b_psum_idx in range(N_PSUM_TILE):
+-                            tmp_psum = nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum)
++                            if cfg.is_output_block_quant:
++                                # One scale serves the whole H contraction, so every
++                                # 256-H chunk can auto-accumulate into the persistent
++                                # PSUM tile and be scaled ONCE after the h loops --
++                                # exactly what the non-block-quant branch below does.
++                                tmp_psum = gate_or_up_psum_lst[b_psum_idx][i_tile_idx]
++                            else:
++                                tmp_psum = nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum)
+                             # Double-row FP8 matmul — .ap() on contiguous weight and hidden_T buffers
+                             N_WEIGHTS = gup_weights[h_outer_idx].shape[2]
+                             I_TP_per_shard = gup_weights[h_outer_idx].shape[3]
+@@ -1371,7 +1380,11 @@
+                             i_block = i_tile_idx // (BLOCK_QUANT_SIZE // TILE_SIZE)
+                             I_blocks_sharded = dims.I_TP_sharded // BLOCK_QUANT_SIZE
+                             flat_scale_idx = (h_block * 2 + gate_or_up) * I_blocks_sharded + i_block
+-                            if h_outer_idx == 0 and h_inner_idx == 0:
++                            if cfg.is_output_block_quant:
++                                # Scale applied once after the h loops, at the
++                                # PSUM -> SBUF convergence point below.
++                                pass
++                            elif h_outer_idx == 0 and h_inner_idx == 0:
+                                 nisa.tensor_scalar(
+                                     data=tmp_psum[0:TILE_SIZE, 0:free_size],
+                                     op0=nl.multiply,
+@@ -1468,7 +1481,22 @@
+             for i_tile_idx in range(GUP_N_TILES):
+                 # Step 1: Apply weight scale (move from psum to sbuf)
+                 # For block quant, result is already scaled and in sbuf — skip
+-                if gup_block_scale != None:
++                if gup_block_scale != None and cfg.is_output_block_quant:
++                    # Output-block grid: the H contraction accumulated in one PSUM
++                    # tile, so apply the (h-independent) scale exactly once here.
++                    # h_block = 0 because the scale table is constant along H.
++                    I_blocks_sharded = dims.I_TP_sharded // BLOCK_QUANT_SIZE
++                    i_block = i_tile_idx // (BLOCK_QUANT_SIZE // TILE_SIZE)
++                    flat_scale_idx = gate_or_up * I_blocks_sharded + i_block
++                    nisa.tensor_scalar(
++                        data=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
++                        op0=nl.multiply,
++                        operand0=gup_block_scale[0:TILE_SIZE, flat_scale_idx : flat_scale_idx + 1],
++                        dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
++                            0:TILE_SIZE, 0:free_size
++                        ],
++                    )
++                elif gup_block_scale != None:
+                     pass  # already in sbuf with block scale applied
+                 elif gup_scale != None:
+                     nisa.tensor_scalar(
+@@ -2107,9 +2135,17 @@
+                     # Block quant 256x256: accumulate 2 i_tiles per block in psum, scale, sbuf accumulate
+                     i_tiles_per_block = BLOCK_QUANT_SIZE // TILE_SIZE  # 2
+                     num_h_256 = div_ceil(num_h_elems, BLOCK_QUANT_SIZE)
++                    if cfg.is_output_block_quant:
++                        # One scale per output (H-256) block, independent of the I
++                        # contraction block -> accumulate ALL i_blocks in one PSUM
++                        # tile and scale once, instead of once per i_block.
++                        ob_dp_psum = nl.ndarray((TILE_SIZE, PSUM_SIZE), dtype=nl.float32, buffer=nl.psum)
+                     for i_block in range(GUP_N_TILES // i_tiles_per_block):
+                         # Accumulate 2 i_tiles into psum
+-                        tmp_dp_psum = nl.ndarray((TILE_SIZE, PSUM_SIZE), dtype=nl.float32, buffer=nl.psum)
++                        if cfg.is_output_block_quant:
++                            tmp_dp_psum = ob_dp_psum
++                        else:
++                            tmp_dp_psum = nl.ndarray((TILE_SIZE, PSUM_SIZE), dtype=nl.float32, buffer=nl.psum)
+                         for i_sub in range(i_tiles_per_block):
+                             i_i = i_block * i_tiles_per_block + i_sub
+                             num_i_elems = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_i)
+@@ -2122,8 +2158,12 @@
+                                     pattern=[[H_tile_size, num_i_elems], [1, num_h_elems]], offset=PSUM_SIZE * h_j
+                                 ),
+                             )
+-                        # Scale each 256-wide H chunk and accumulate into sbuf
+-                        for h_256_idx in range(num_h_256):
++                        # Scale each 256-wide H chunk and accumulate into sbuf.
++                        # With an output-block grid the scale does not depend on the
++                        # I contraction block, so it is deferred to a single pass
++                        # after the i_block loop (see below) and skipped here.
++                        scale_per_i_block = not cfg.is_output_block_quant
++                        for h_256_idx in range(num_h_256 if scale_per_i_block else 0):
+                             h_256_local = h_256_idx * BLOCK_QUANT_SIZE
+                             h_256_count = min(BLOCK_QUANT_SIZE, num_h_elems - h_256_local)
+                             h_256_within_H1024 = h_j * (PSUM_SIZE // BLOCK_QUANT_SIZE) + h_256_idx
+@@ -2147,6 +2187,22 @@
+                                     ],
+                                     dst=block_new_lst[B_tile_idx][0:TILE_SIZE, dst_h_start : dst_h_start + h_256_count],
+                                 )
++                    if cfg.is_output_block_quant:
++                        # Whole I contraction is in ob_dp_psum: one scale-and-store
++                        # per 256-wide H output block, no cross-i_block accumulate.
++                        for h_256_idx in range(num_h_256):
++                            h_256_local = h_256_idx * BLOCK_QUANT_SIZE
++                            h_256_count = min(BLOCK_QUANT_SIZE, num_h_elems - h_256_local)
++                            h_256_within_H1024 = h_j * (PSUM_SIZE // BLOCK_QUANT_SIZE) + h_256_idx
++                            # i_block = 0: the scale table is constant along I.
++                            flat_dp_idx = h_256_within_H1024
++                            dst_h_start = H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j + h_256_local
++                            nisa.tensor_scalar(
++                                data=ob_dp_psum[0:TILE_SIZE, h_256_local : h_256_local + h_256_count],
++                                op0=nl.multiply,
++                                operand0=dp_block_scale[0:TILE_SIZE, flat_dp_idx : flat_dp_idx + 1],
++                                dst=block_new_lst[B_tile_idx][0:TILE_SIZE, dst_h_start : dst_h_start + h_256_count],
++                            )
+                     # Apply hidden scale if present (on partition dim, broadcast across H)
+                     if down_hidden_scale != None:
+                         dst_h_start_full = H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j
+--- a/src/nkilib_src/nkilib/core/moe/moe_cte/moe_cte_utils.py
++++ b/src/nkilib_src/nkilib/core/moe/moe_cte/moe_cte_utils.py
+@@ -276,6 +276,13 @@
+     quant_activation_mode: ActivationQuantMode = ActivationQuantMode.NONE
+     quant_is_per_tensor: bool = False
+     is_block_quant: bool = False
++    # Block-quant scale grid reduced over the CONTRACTION-block axis, so one
++    # scale serves a whole output block. Lets the 256-wide contraction chunks
++    # auto-accumulate in a single PSUM tile and be scaled ONCE on the way to
++    # SBUF, instead of one Vector scale-add per chunk. Requires the scale table
++    # to be constant along the contraction axis (see the host-side
++    # quantize_*_256block(output_block=True)).
++    is_output_block_quant: bool = False
+ 
+ 
+ def div_ceil(n, d):

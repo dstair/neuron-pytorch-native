@@ -198,6 +198,39 @@ USE_MOE_CTE_NKI_PACK = os.environ.get("MOE_CTE_NKI_PACK", "0") == "1"
 # FP8xFP8 prefill CTE: experts resident as 256x256-block legacy-E4M3 (int8), run as
 # double_row FP8 matmuls (Trainium2 2x). Prefill-only; decode uses MOE_FUSED_W8.
 USE_MOE_CTE_FP8 = os.environ.get("MOE_CTE_FP8", "0") == "1"
+# Reduce the 256-block scale grid over the CONTRACTION-block axis so one scale
+# serves a whole output block. With the tensor shape kept, this makes the
+# existing kernel produce output-block numerics at the old op count -- the
+# numerics gate for hoisting the per-256-chunk Vector scale-add out of the H
+# loop (bwmm_shard_on_I.py:1364-1390 / :2133-2140, 26% of prefill Vector time).
+MOE_CTE_FP8_OUTPUT_BLOCK = os.environ.get("MOE_CTE_FP8_OUTPUT_BLOCK", "0") == "1"
+# Pre-registered gate for the reduced grid (the full grid scores ~0.9996).
+MOE_CTE_FP8_MIN_COSINE = float(os.environ.get("MOE_CTE_FP8_MIN_COSINE", "0.999"))
+
+
+def _gate_fp8_cte_quant(layer_idx, which, stats):
+    """Print and gate the 256-block dequant quality for the FP8 CTE experts."""
+    grid = "output_block" if MOE_CTE_FP8_OUTPUT_BLOCK else "full"
+    line = (
+        f"[fp8-cte-quant] l{layer_idx} {which} grid={grid} "
+        f"cosine={stats.cosine:.7f} nrmse={stats.normalized_rmse:.5f} "
+        f"clipped={stats.clipped_count} scales={stats.block_count}"
+    )
+    if layer_idx == 0 or stats.cosine < MOE_CTE_FP8_MIN_COSINE:
+        print(line, flush=True)
+    if stats.cosine < MOE_CTE_FP8_MIN_COSINE:
+        raise ValueError(
+            f"l{layer_idx} {which} failed the FP8 CTE {grid}-grid quality gate: "
+            f"cosine={stats.cosine:.7f} < {MOE_CTE_FP8_MIN_COSINE}"
+        )
+    if stats.clipped_count:
+        raise ValueError(
+            f"l{layer_idx} {which} {grid} grid saturated E4M3 on "
+            f"{stats.clipped_count} values; the reduced scale must only lose "
+            "resolution, never range"
+        )
+
+
 if USE_MOE_CTE:
     if USE_MOE_NKILIB:
         raise RuntimeError("MOE_CTE and MOE_NKILIB are mutually exclusive")
@@ -1032,8 +1065,14 @@ class StaticDecode35B(nn.Module):
                     # reusing the l{i}_k_* names as int8 here is safe for prefill.
                     gate_up_k = gu.reshape(Ec, 2, II, HH).permute(0, 3, 1, 2).contiguous()  # [E,H,2,I]
                     down_k = dn.permute(0, 2, 1).contiguous()                              # [E,I,H]
-                    gu_i8, gu_scale = quantize_gate_up_256block(gate_up_k)
-                    dn_i8, dn_scale = quantize_down_256block(down_k)
+                    gu_i8, gu_scale, gu_st = quantize_gate_up_256block(
+                        gate_up_k, output_block=MOE_CTE_FP8_OUTPUT_BLOCK
+                    )
+                    dn_i8, dn_scale, dn_st = quantize_down_256block(
+                        down_k, output_block=MOE_CTE_FP8_OUTPUT_BLOCK
+                    )
+                    _gate_fp8_cte_quant(i, "gate_up", gu_st)
+                    _gate_fp8_cte_quant(i, "down", dn_st)
 
                     # Pad experts to E+1 with an all-zero dummy expert (index E). The route
                     # packer marks padding blocks with the sentinel expert id == E; the CTE

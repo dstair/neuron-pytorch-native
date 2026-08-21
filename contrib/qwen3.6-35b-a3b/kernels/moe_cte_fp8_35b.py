@@ -38,6 +38,7 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 # FP8 path packs routes identically (only the matmul dtype/scale path differs). Sibling
 # import (kernels/ is on sys.path), matching static_decode_35b.py's convention.
 from moe_cte_35b import (
+    _FP8_OUTPUT_BLOCK_HOIST,
     _max_packed_blocks,
     _pack_local_routes_impl,
     _scatter_barrier_default,
@@ -146,6 +147,7 @@ def nki_moe_cte_fp8_routed_35b(
         gate_up_proj_scale=gate_up_proj_scale,
         down_proj_scale=down_proj_scale,
         is_block_quant=True,
+        is_output_block_quant=_FP8_OUTPUT_BLOCK_HOIST,
         activation_function=ActFnType.SiLU,
         skip_dma=SkipMode(False, False),
         compute_dtype=nl.bfloat16,

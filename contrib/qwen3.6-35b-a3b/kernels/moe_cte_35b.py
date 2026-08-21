@@ -47,6 +47,23 @@ _FORCE_TILED_ROUTE = _os.environ.get("MOE_CTE_FORCE_TILED", "") == "1"
 # deadlocks the fused TP=8 graph. Output is deliberately WRONG under any
 # ablation -- the only question asked is "does it still hang".
 _ABLATE = _os.environ.get("MOE_CTE_ABLATE", "")
+# MOE_CTE_FP8_OUTPUT_BLOCK (read in static_decode_35b.py) reduces the HOST scale
+# grid over the contraction axis. MOE_CTE_FP8_OB_HOIST then lets the KERNEL hoist
+# the scale out of the contraction loop and PSUM-accumulate. Keeping them separate
+# enables the numerics-first staging step: grid on + hoist OFF produces the new
+# numerics at the OLD op count, so accuracy is gated before any kernel risk.
+# Default: the hoist follows the grid.
+_FP8_OUTPUT_BLOCK_QUANT = _os.environ.get("MOE_CTE_FP8_OUTPUT_BLOCK", "0") == "1"
+_FP8_OUTPUT_BLOCK_HOIST = (
+    _os.environ.get("MOE_CTE_FP8_OB_HOIST", "1" if _FP8_OUTPUT_BLOCK_QUANT else "0")
+    == "1"
+)
+if _FP8_OUTPUT_BLOCK_HOIST and not _FP8_OUTPUT_BLOCK_QUANT:
+    raise RuntimeError(
+        "MOE_CTE_FP8_OB_HOIST requires MOE_CTE_FP8_OUTPUT_BLOCK=1: the kernel "
+        "hoist is only correct when the host scale grid is constant along the "
+        "contraction axis"
+    )
 if _SCATTER_BARRIER_OVERRIDE != "" or _FORCE_TILED_ROUTE:
     # Positive evidence in the log: a hang under an override must not be
     # confused with an override that never reached the container.
