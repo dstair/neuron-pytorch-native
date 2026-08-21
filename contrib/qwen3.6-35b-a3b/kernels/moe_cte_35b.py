@@ -19,6 +19,56 @@ _ROUTE_TILE = 2048
 _ASSIGNMENT_SLICE = 128
 _DIRECT_ROUTE_MAX_ASSIGNMENTS = 16384
 
+# Lanes per `nonzero_with_count` call in the direct route packer, and the partition
+# stride between them. 4 lanes at a 32-partition stride looks like it wastes half the
+# GpSimd hardware -- the ISA has 8 cores at a 16-partition stride (partitions
+# 0,16,...,112; nkilib core/subkernels/find_nonzero_indices.py: _NUM_GPSIMD_CORES = 8,
+# _PARTITIONS_PER_GPSIMD = 16) -- but 8 lanes at stride 16 is NOT expressible:
+#   MEASURED 2026-08-21: (8, 16) fails BIR verification with
+#   "Invalid access of 1 partitions starting at partition 16"
+#   on the per-lane route_pack_direct_match tensor_scalar.
+# A single-partition SBUF access must begin on a 32-partition QUADRANT boundary
+# (_QUADRANT_SIZE = 32), so the odd cores at 16/48/80/112 are unreachable directly --
+# which is exactly why find_nonzero_indices carries a quad_mask stream shuffle for
+# them. Using all 8 cores therefore costs extra shuffles on both the input and the
+# result, against a ~2.1%-of-region ceiling. Not worth it; keep (4, 32).
+_ROUTE_LANES = 4
+_ROUTE_LANE_STRIDE = 32
+
+# Route-packer overrides, read once at import. This module is NKI-traced, so the
+# `os` module must NOT stay in its namespace -- the specializer walks module
+# globals and rejects it ("NKI classes must inherit from either Enum or
+# NKIObject"). Keep only plain str/bool constants.
+import os as _os  # noqa: E402
+
+_SCATTER_BARRIER_OVERRIDE = _os.environ.get("MOE_CTE_SCATTER_BARRIER", "")
+_FORCE_TILED_ROUTE = _os.environ.get("MOE_CTE_FORCE_TILED", "") == "1"
+# Diagnostic ONLY: neutralize one tiled-exclusive construct to find which one
+# deadlocks the fused TP=8 graph. Output is deliberately WRONG under any
+# ablation -- the only question asked is "does it still hang".
+_ABLATE = _os.environ.get("MOE_CTE_ABLATE", "")
+if _SCATTER_BARRIER_OVERRIDE != "" or _FORCE_TILED_ROUTE:
+    # Positive evidence in the log: a hang under an override must not be
+    # confused with an override that never reached the container.
+    print(
+        f"[moe-cte-route] scatter_barrier_override="
+        f"{_SCATTER_BARRIER_OVERRIDE or 'none'} force_tiled={_FORCE_TILED_ROUTE}",
+        flush=True,
+    )
+del _os
+
+
+def _scatter_barrier_default(num_assignments: int) -> bool:
+    """Per-slice scatter barriers: on for the direct packer, off for the tiled scan.
+
+    ``MOE_CTE_SCATTER_BARRIER`` (1/0) overrides the size-derived choice, which
+    is what separates "the barrier deadlocks" from "the token count deadlocks"
+    at a fixed call size.
+    """
+    if _SCATTER_BARRIER_OVERRIDE != "":
+        return _SCATTER_BARRIER_OVERRIDE == "1"
+    return num_assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS
+
 
 def _max_packed_blocks(
     num_assignments: int, num_local_experts: int, block_size: int
@@ -458,10 +508,19 @@ def _pack_local_routes_impl(
     # in SBUF. It is the fastest route packer through BS=2 (16,384
     # assignments), but cannot fit at BS=4. Larger calls use the tiled stable
     # scan below, which keeps route working sets bounded by _ROUTE_TILE.
-    if scatter_barrier and assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS:
+    if (
+        scatter_barrier
+        and assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS
+        and not _FORCE_TILED_ROUTE
+    ):
         kernel_assert(
             num_writers == 1,
             "direct route packing requires one writer per metadata tensor",
+        )
+        kernel_assert(
+            num_local_experts % _ROUTE_LANES == 0,
+            f"direct route packing needs num_local_experts divisible by "
+            f"{_ROUTE_LANES} lanes, found {num_local_experts}",
         )
         sbm.open_scope(name="route_pack_direct_store")
         nonzero_input = sbm.alloc_stack(
@@ -504,10 +563,10 @@ def _pack_local_routes_impl(
             name="route_pack_zero_direct_write_offset",
         )
 
-        for expert_batch in nl.sequential_range(num_local_experts // 4):
-            for expert_lane in range(4):
-                expert_idx = expert_batch * 4 + expert_lane
-                gpsimd_partition = expert_lane * 32
+        for expert_batch in nl.sequential_range(num_local_experts // _ROUTE_LANES):
+            for expert_lane in range(_ROUTE_LANES):
+                expert_idx = expert_batch * _ROUTE_LANES + expert_lane
+                gpsimd_partition = expert_lane * _ROUTE_LANE_STRIDE
                 nisa.dma_copy(
                     dst=nonzero_input[
                         gpsimd_partition : gpsimd_partition + 1, :
@@ -533,20 +592,24 @@ def _pack_local_routes_impl(
                 padding_val=assignments,
                 name=f"route_pack_direct_nonzero_b{expert_batch}",
             )
-            for expert_lane in range(4):
-                expert_idx = expert_batch * 4 + expert_lane
-                gpsimd_partition = expert_lane * 32
-                nisa.tensor_scalar(
-                    dst=routed_indices[
-                        gpsimd_partition : gpsimd_partition + 1, 0:assignments
-                    ],
-                    data=routed_indices[
-                        gpsimd_partition : gpsimd_partition + 1, 0:assignments
-                    ],
-                    op0=nl.right_shift,
-                    operand0=3,
-                    name=f"route_pack_direct_assignment_to_token_e{expert_idx}",
-                )
+            # Lever 4a: assignment index -> token id is the SAME constant shift for
+            # every lane, and a 1-partition tensor_scalar over a [1, assignments]
+            # row uses 1 of 128 Vector partitions (8.68 us to move 16,384 int32).
+            # One op over the full partition dim costs about the same as one lane
+            # and replaces all of them. Partitions outside the lane stride hold
+            # nonzero_with_count padding that nothing reads (the only consumer is
+            # the per-lane `route_pack_direct_select_block_e*` gather below, at
+            # offset gpsimd_partition * (assignments + 1)), so shifting them is inert.
+            nisa.tensor_scalar(
+                dst=routed_indices[0 : nl.tile_size.pmax, 0:assignments],
+                data=routed_indices[0 : nl.tile_size.pmax, 0:assignments],
+                op0=nl.right_shift,
+                operand0=3,
+                name=f"route_pack_direct_assignment_to_token_b{expert_batch}",
+            )
+            for expert_lane in range(_ROUTE_LANES):
+                expert_idx = expert_batch * _ROUTE_LANES + expert_lane
+                gpsimd_partition = expert_lane * _ROUTE_LANE_STRIDE
                 nisa.tensor_copy(
                     dst=expert_block_count,
                     src=blocks_per_expert[0:1, expert_idx : expert_idx + 1],
@@ -655,75 +718,24 @@ def _pack_local_routes_impl(
     nisa.memset(dst=ordinal_ones, value=1, name="route_pack_init_ordinal_scan")
     packed_2d = token_position_to_id.reshape((max_blocks * block_size, 1))
 
-    # local_gather returns every core's 16 indices to all 16 connected
-    # partitions. Select the diagonal to recover one value per assignment.
-    gather_partition_lanes = sbm.alloc_stack(
-        (_ASSIGNMENT_SLICE, 16),
-        dtype=nl.int32,
-        name="route_pack_gather_partition_lanes",
-    )
-    nisa.iota(
-        dst=gather_partition_lanes,
-        pattern=[[0, 16]],
-        offset=0,
-        channel_multiplier=1,
-        name="route_pack_gather_partition_iota",
-    )
-    nisa.tensor_scalar(
-        dst=gather_partition_lanes,
-        data=gather_partition_lanes,
-        op0=nl.bitwise_and,
-        operand0=15,
-        name="route_pack_gather_partition_mod",
-    )
-    gather_free_lanes = sbm.alloc_stack(
-        (_ASSIGNMENT_SLICE, 16),
-        dtype=nl.int32,
-        name="route_pack_gather_free_lanes",
-    )
-    nisa.iota(
-        dst=gather_free_lanes,
-        pattern=[[1, 16]],
-        offset=0,
-        channel_multiplier=0,
-        name="route_pack_gather_free_iota",
-    )
-    gather_diagonal = sbm.alloc_stack(
-        (_ASSIGNMENT_SLICE, 16),
-        dtype=nl.float32,
-        name="route_pack_gather_diagonal",
-    )
-    nisa.tensor_tensor(
-        dst=gather_diagonal,
-        data1=gather_partition_lanes,
-        data2=gather_free_lanes,
-        op=nl.equal,
-        name="route_pack_gather_diagonal_compare",
-    )
-    assignment_lanes = sbm.alloc_stack(
-        (_ASSIGNMENT_SLICE, 1),
-        dtype=nl.int32,
-        name="route_pack_assignment_lanes",
-    )
-    nisa.iota(
-        dst=assignment_lanes,
-        pattern=[[0, 1]],
-        offset=0,
-        channel_multiplier=1,
-        name="route_pack_assignment_lane_iota",
-    )
-    first_assignment_lane = sbm.alloc_stack(
-        (_ASSIGNMENT_SLICE, 1),
-        dtype=nl.int32,
-        name="route_pack_first_assignment_lane",
-    )
-    nisa.tensor_scalar(
-        dst=first_assignment_lane,
-        data=assignment_lanes,
-        op0=nl.equal,
-        operand0=0,
-        name="route_pack_first_assignment_compare",
-    )
+    # Per-assignment "pick my expert's destination out of this row" used to be a
+    # nisa.local_gather. That is a GpSimd op whose result is broadcast to all 16
+    # connected partitions of a core, which is why a diagonal mask used to live
+    # here to undo the broadcast.
+    #
+    # MEASURED 2026-08-21: that local_gather is what DEADLOCKED the fused TP=8
+    # graph. Ablation ladder at 4L with the tiled path forced, everything else
+    # identical: nothing ablated -> hang; the indirect scatter ablated -> hang;
+    # the whole slice body ablated -> completes; local_gather alone ablated ->
+    # COMPLETES. It is the only tiled-exclusive GpSimd op (the direct packer uses
+    # nonzero_with_count), and it hangs at ANY size -- it reproduces with a single
+    # 2,048-assignment tile, so this was never about token count or volume.
+    #
+    # Replacement needs no gather at all: `matches` is ALREADY the one-hot we were
+    # reconstructing (matches[e, a] == 1 iff assignment a routes to local expert e,
+    # all-zero when it routes off-rank). Transposing it alongside `destinations`
+    # turns the select into a masked row reduce -- one nc_transpose, one multiply
+    # and one reduce, all on engines the working direct path already exercises.
 
     for tile_idx in nl.sequential_range(assignments // _ROUTE_TILE):
         sbm.open_scope(name=f"route_pack_scan_tile_{tile_idx}")
@@ -790,7 +802,22 @@ def _pack_local_routes_impl(
             name=f"route_pack_add_block_offsets_t{tile_idx}",
         )
 
-        for slice_idx in nl.affine_range(_ROUTE_TILE // _ASSIGNMENT_SLICE):
+        # SEQUENTIAL, not affine: the slices are NOT independent. Every slice's
+        # lane 0 can be forced to the shared padding slot
+        # (max_blocks * block_size - 1) and every non-store is aimed one past the
+        # end, so declaring independence hands the compiler a false licence to
+        # overlap 16 slices' worth of indirect (DGE) scatters into the same
+        # shared_hbm buffer. The per-slice `core_barrier` below was the intended
+        # serialization, and it is illegal at LNC=1 (`core_barrier() requires LNC
+        # degree >= 2`), so at NUM_SHARDS==1 nothing ordered them at all -- which
+        # is why this path deadlocked at ANY token count while the direct packer
+        # (a few contiguous scalar_offset block copies) was always fine.
+        # Diagnostic "slices": skip the entire per-slice body. Pass 1 still writes
+        # block_to_expert and conditions, so the MoE's block-loop trip count is
+        # unchanged and only the token IDs are wrong -- a fair test of whether the
+        # deadlock lives in the slice body or in the per-tile code above it.
+        slice_tripcount = 0 if _ABLATE == "slices" else _ROUTE_TILE // _ASSIGNMENT_SLICE
+        for slice_idx in nl.sequential_range(slice_tripcount):
             sbm.open_scope(name=f"route_pack_slice_{tile_idx}_{slice_idx}")
             slice_lo = slice_idx * _ASSIGNMENT_SLICE
             slice_hi = slice_lo + _ASSIGNMENT_SLICE
@@ -816,6 +843,27 @@ def _pack_local_routes_impl(
                 name=f"route_pack_destination_copy_t{tile_idx}_s{slice_idx}",
             )
 
+            match_psum = nl.ndarray(
+                (_ASSIGNMENT_SLICE, num_local_experts),
+                dtype=nl.float32,
+                buffer=nl.psum,
+            )
+            nisa.nc_transpose(
+                dst=match_psum,
+                data=matches[:, slice_lo:slice_hi],
+                name=f"route_pack_match_transpose_t{tile_idx}_s{slice_idx}",
+            )
+            match_rows = sbm.alloc_stack(
+                (_ASSIGNMENT_SLICE, num_local_experts),
+                dtype=nl.float32,
+                name=f"route_pack_match_rows_t{tile_idx}_s{slice_idx}",
+            )
+            nisa.tensor_copy(
+                dst=match_rows,
+                src=match_psum,
+                name=f"route_pack_match_copy_t{tile_idx}_s{slice_idx}",
+            )
+
             route_psum = nl.ndarray(
                 (_ASSIGNMENT_SLICE, 1),
                 dtype=nl.float32,
@@ -836,61 +884,17 @@ def _pack_local_routes_impl(
                 src=route_psum,
                 name=f"route_pack_route_cast_t{tile_idx}_s{slice_idx}",
             )
-            local_index = sbm.alloc_stack(
-                (_ASSIGNMENT_SLICE, 1),
-                dtype=nl.int32,
-                name=f"route_pack_local_index_t{tile_idx}_s{slice_idx}",
-            )
-            nisa.tensor_scalar(
-                dst=local_index,
-                data=route_column,
-                op0=nl.subtract,
-                operand0=expert_lo,
-                op1=nl.maximum,
-                operand1=0,
-                name=f"route_pack_local_index_lower_t{tile_idx}_s{slice_idx}",
-            )
-            nisa.tensor_scalar(
-                dst=local_index,
-                data=local_index,
-                op0=nl.minimum,
-                operand0=num_local_experts - 1,
-                name=f"route_pack_local_index_upper_t{tile_idx}_s{slice_idx}",
-            )
-            local_index_u16 = sbm.alloc_stack(
-                (_ASSIGNMENT_SLICE, 1),
-                dtype=nl.uint16,
-                name=f"route_pack_local_index_u16_t{tile_idx}_s{slice_idx}",
-            )
-            nisa.tensor_copy(
-                dst=local_index_u16,
-                src=local_index,
-                name=f"route_pack_local_index_cast_t{tile_idx}_s{slice_idx}",
-            )
-            gathered_destinations = sbm.alloc_stack(
-                (_ASSIGNMENT_SLICE, 16),
+            masked_destinations = sbm.alloc_stack(
+                (_ASSIGNMENT_SLICE, num_local_experts),
                 dtype=nl.float32,
-                name=f"route_pack_gathered_destinations_t{tile_idx}_s{slice_idx}",
-            )
-            nisa.local_gather(
-                dst=gathered_destinations,
-                src_buffer=destination_rows,
-                index=local_index_u16,
-                num_elem_per_idx=1,
-                num_valid_indices=_ASSIGNMENT_SLICE // 8,
-                name=f"route_pack_select_ordinal_t{tile_idx}_s{slice_idx}",
-            )
-            diagonal_destinations = sbm.alloc_stack(
-                (_ASSIGNMENT_SLICE, 16),
-                dtype=nl.float32,
-                name=f"route_pack_diagonal_destinations_t{tile_idx}_s{slice_idx}",
+                name=f"route_pack_masked_destinations_t{tile_idx}_s{slice_idx}",
             )
             nisa.tensor_tensor(
-                dst=diagonal_destinations,
-                data1=gathered_destinations,
-                data2=gather_diagonal,
+                dst=masked_destinations,
+                data1=destination_rows,
+                data2=match_rows,
                 op=nl.multiply,
-                name=f"route_pack_mask_gather_diagonal_t{tile_idx}_s{slice_idx}",
+                name=f"route_pack_mask_destination_row_t{tile_idx}_s{slice_idx}",
             )
             selected_destination = sbm.alloc_stack(
                 (_ASSIGNMENT_SLICE, 1),
@@ -899,10 +903,10 @@ def _pack_local_routes_impl(
             )
             nisa.tensor_reduce(
                 dst=selected_destination,
-                data=diagonal_destinations,
+                data=masked_destinations,
                 op=nl.add,
                 axis=1,
-                name=f"route_pack_reduce_gather_diagonal_t{tile_idx}_s{slice_idx}",
+                name=f"route_pack_select_ordinal_t{tile_idx}_s{slice_idx}",
             )
 
             in_local_range = sbm.alloc_stack(
@@ -992,44 +996,26 @@ def _pack_local_routes_impl(
                 reverse0=True,
                 name=f"route_pack_non_store_mask_t{tile_idx}_s{slice_idx}",
             )
-            force_padding = sbm.alloc_stack(
+            # Every non-owned assignment is redirected to the VALID padding slot
+            # carrying the padding token, so the scatter never emits an
+            # out-of-range descriptor.
+            #
+            # The original aimed non-owned lanes one element PAST the buffer and
+            # relied on oob_mode.skip to drop them, keeping a single in-range
+            # descriptor alive per slice (lane 0 forced to the padding slot).
+            # That makes almost every descriptor of almost every slice an OOB
+            # event -- the 1,667 vector-DGE OOBs seen on this path -- and each
+            # indirect-DMA event costs a notification. The direct packer emits
+            # none, which is why only this path deadlocked, structurally, at any
+            # token count (it reproduces at 1 tile / 256 tokens).
+            #
+            # Writing the padding token to the padding slot is idempotent:
+            # _init_route_metadata already seeds the buffer with it, so the
+            # many-writers-one-address WAW is benign.
+            pad_term = sbm.alloc_stack(
                 (_ASSIGNMENT_SLICE, 1),
                 dtype=nl.int32,
-                name=f"route_pack_force_padding_t{tile_idx}_s{slice_idx}",
-            )
-            nisa.tensor_tensor(
-                dst=force_padding,
-                data1=non_store,
-                data2=first_assignment_lane,
-                op=nl.multiply,
-                name=f"route_pack_force_padding_lane_t{tile_idx}_s{slice_idx}",
-            )
-            store_mask = sbm.alloc_stack(
-                (_ASSIGNMENT_SLICE, 1),
-                dtype=nl.int32,
-                name=f"route_pack_store_mask_t{tile_idx}_s{slice_idx}",
-            )
-            nisa.tensor_tensor(
-                dst=store_mask,
-                data1=in_local_range,
-                data2=force_padding,
-                op=nl.add,
-                name=f"route_pack_store_or_padding_t{tile_idx}_s{slice_idx}",
-            )
-            invalid_offset = sbm.alloc_stack(
-                (_ASSIGNMENT_SLICE, 1),
-                dtype=nl.int32,
-                name=f"route_pack_invalid_offset_t{tile_idx}_s{slice_idx}",
-            )
-            nisa.tensor_scalar(
-                dst=invalid_offset,
-                data=store_mask,
-                op0=nl.subtract,
-                operand0=1,
-                reverse0=True,
-                op1=nl.multiply,
-                operand1=max_blocks * block_size,
-                name=f"route_pack_invalid_destination_t{tile_idx}_s{slice_idx}",
+                name=f"route_pack_pad_term_t{tile_idx}_s{slice_idx}",
             )
             destination_index = sbm.alloc_stack(
                 (_ASSIGNMENT_SLICE, 1),
@@ -1041,24 +1027,16 @@ def _pack_local_routes_impl(
                 src=selected_destination,
                 name=f"route_pack_destination_cast_t{tile_idx}_s{slice_idx}",
             )
-            nisa.tensor_scalar(
-                dst=store_mask,
-                data=force_padding,
-                op0=nl.subtract,
-                operand0=1,
-                reverse0=True,
-                name=f"route_pack_not_forced_padding_t{tile_idx}_s{slice_idx}",
-            )
             nisa.tensor_tensor(
                 dst=destination_index,
                 data1=destination_index,
-                data2=store_mask,
+                data2=in_local_range,
                 op=nl.multiply,
                 name=f"route_pack_keep_route_destination_t{tile_idx}_s{slice_idx}",
             )
             nisa.tensor_scalar(
-                dst=non_store,
-                data=force_padding,
+                dst=pad_term,
+                data=non_store,
                 op0=nl.multiply,
                 operand0=max_blocks * block_size - 1,
                 name=f"route_pack_padding_destination_t{tile_idx}_s{slice_idx}",
@@ -1066,16 +1044,9 @@ def _pack_local_routes_impl(
             nisa.tensor_tensor(
                 dst=destination_index,
                 data1=destination_index,
-                data2=non_store,
+                data2=pad_term,
                 op=nl.add,
                 name=f"route_pack_select_padding_destination_t{tile_idx}_s{slice_idx}",
-            )
-            nisa.tensor_tensor(
-                dst=destination_index,
-                data1=destination_index,
-                data2=invalid_offset,
-                op=nl.add,
-                name=f"route_pack_mask_destination_t{tile_idx}_s{slice_idx}",
             )
 
             token_ids = sbm.alloc_stack(
@@ -1100,13 +1071,13 @@ def _pack_local_routes_impl(
             nisa.tensor_tensor(
                 dst=token_ids,
                 data1=token_ids,
-                data2=store_mask,
+                data2=in_local_range,
                 op=nl.multiply,
                 name=f"route_pack_keep_assignment_token_t{tile_idx}_s{slice_idx}",
             )
             nisa.tensor_scalar(
-                dst=non_store,
-                data=force_padding,
+                dst=pad_term,
+                data=non_store,
                 op0=nl.multiply,
                 operand0=T,
                 name=f"route_pack_padding_token_t{tile_idx}_s{slice_idx}",
@@ -1114,19 +1085,29 @@ def _pack_local_routes_impl(
             nisa.tensor_tensor(
                 dst=token_ids,
                 data1=token_ids,
-                data2=non_store,
+                data2=pad_term,
                 op=nl.add,
                 name=f"route_pack_select_padding_token_t{tile_idx}_s{slice_idx}",
             )
-            nisa.dma_copy(
-                dst=packed_2d.ap(
+            # Diagnostic: "scatter" keeps all the compute but writes contiguously,
+            # dropping the only tiled-exclusive DMA (a vector_offset indirect
+            # scatter; the direct packer uses contiguous scalar_offset copies).
+            if _ABLATE == "scatter":
+                scatter_dst = packed_2d[0:_ASSIGNMENT_SLICE, 0:1]
+            else:
+                scatter_dst = packed_2d.ap(
                     pattern=[[1, _ASSIGNMENT_SLICE], [1, 1]],
                     offset=0,
                     vector_offset=destination_index,
                     indirect_dim=0,
-                ),
+                )
+            nisa.dma_copy(
+                dst=scatter_dst,
                 src=token_ids,
-                oob_mode=nisa.oob_mode.skip,
+                # error, not skip: with non-owned lanes redirected to the padding
+                # slot there is no longer any legitimate out-of-range descriptor,
+                # so a fault here is a real bug rather than routine traffic.
+                oob_mode=nisa.oob_mode.error,
                 name=f"route_pack_scatter_token_ids_t{tile_idx}_s{slice_idx}",
             )
             if scatter_barrier:
@@ -1291,7 +1272,9 @@ def nki_moe_cte_routed_35b(
         # At BS=4 the bounded tiled scan owns every non-padding destination
         # uniquely; keeping its per-slice core barriers can cross-synchronize
         # with a different TP rank's adjacent custom call.
-        scatter_barrier=assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS,
+        # MOE_CTE_SCATTER_BARRIER overrides the size-derived choice so the
+        # barrier can be isolated from the packer path at a fixed token count.
+        scatter_barrier=_scatter_barrier_default(assignments),
     )
     return _moe_cte_hybrid_impl(
         conditions=conditions,

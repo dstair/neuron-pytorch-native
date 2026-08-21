@@ -38,9 +38,9 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 # FP8 path packs routes identically (only the matmul dtype/scale path differs). Sibling
 # import (kernels/ is on sys.path), matching static_decode_35b.py's convention.
 from moe_cte_35b import (
-    _DIRECT_ROUTE_MAX_ASSIGNMENTS,
     _max_packed_blocks,
     _pack_local_routes_impl,
+    _scatter_barrier_default,
     SkipMode,
 )
 
@@ -121,7 +121,9 @@ def nki_moe_cte_fp8_routed_35b(
         block_size,
         nl.shared_hbm,
         metadata_tensors=metadata_tensors,
-        scatter_barrier=assignments <= _DIRECT_ROUTE_MAX_ASSIGNMENTS,
+        # Same size-derived default as the BF16 wrapper, but routed through the
+        # shared helper so MOE_CTE_SCATTER_BARRIER reaches the FP8 path too.
+        scatter_barrier=_scatter_barrier_default(assignments),
     )
 
     # int8 (legacy-E4M3) -> nki float8_e4m3 view; HLO operand stays int8 (legal on TRN2).
