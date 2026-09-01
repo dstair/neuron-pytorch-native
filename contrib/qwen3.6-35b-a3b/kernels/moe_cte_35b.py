@@ -402,115 +402,137 @@ def _pack_local_routes_impl(
     )
 
     # Materialize block expert IDs and the dynamic active-block conditions.
-    block_ids = sbm.alloc_stack(
-        (max_blocks, num_local_experts),
-        dtype=nl.int32,
-        name="route_pack_block_ids",
-    )
-    nisa.iota(
-        dst=block_ids,
-        pattern=[[0, num_local_experts]],
-        offset=0,
-        channel_multiplier=1,
-        name="route_pack_block_iota",
-    )
-    ends_broadcast = sbm.alloc_stack(
-        (max_blocks, num_local_experts),
-        dtype=nl.int32,
-        name="route_pack_ends_broadcast",
-    )
-    stream_shuffle_broadcast(block_ends, ends_broadcast)
-    ended_experts = sbm.alloc_stack(
-        (max_blocks, num_local_experts),
-        dtype=nl.int32,
-        name="route_pack_ended_experts",
-    )
-    nisa.tensor_tensor(
-        dst=ended_experts,
-        data1=block_ids,
-        data2=ends_broadcast,
-        op=nl.greater_equal,
-        name="route_pack_block_expert_compare",
-    )
-    block_experts = sbm.alloc_stack(
-        (max_blocks, 1),
-        dtype=nl.int32,
-        name="route_pack_block_experts",
-    )
-    nisa.tensor_reduce(
-        dst=block_experts,
-        data=ended_experts,
-        op=nl.add,
-        axis=1,
-        name="route_pack_block_expert_reduce",
-    )
-    block_write_lo = writer_id * max_blocks // num_writers
-    block_write_hi = (writer_id + 1) * max_blocks // num_writers
-    nisa.dma_copy(
-        dst=block_to_expert[block_write_lo:block_write_hi, :],
-        src=block_experts[block_write_lo:block_write_hi, :],
-        name="route_pack_store_block_experts",
-    )
-
-    block_id_column = sbm.alloc_stack(
-        (max_blocks, 1),
-        dtype=nl.int32,
-        name="route_pack_block_id_column",
-    )
-    nisa.iota(
-        dst=block_id_column,
-        pattern=[[0, 1]],
-        offset=0,
-        channel_multiplier=1,
-        name="route_pack_condition_iota",
-    )
-    active_conditions = sbm.alloc_stack(
-        (max_blocks, 1),
-        dtype=nl.int32,
-        name="route_pack_active_conditions",
-    )
-    active_block_count = sbm.alloc_stack(
-        (max_blocks, 1),
-        dtype=nl.int32,
-        name="route_pack_active_block_count",
-    )
-    stream_shuffle_broadcast(
-        block_ends[0:1, num_local_experts - 1 : num_local_experts],
-        active_block_count,
-    )
-    nisa.tensor_tensor(
-        dst=active_conditions,
-        data1=block_id_column,
-        data2=active_block_count,
-        op=nl.less,
-        name="route_pack_active_compare",
-    )
-    condition_psum = nl.ndarray((1, max_blocks), dtype=nl.float32, buffer=nl.psum)
-    condition_float = sbm.alloc_stack(
-        (max_blocks, 1),
-        dtype=nl.float32,
-        name="route_pack_condition_float",
-    )
-    nisa.tensor_copy(
-        dst=condition_float,
-        src=active_conditions,
-        name="route_pack_condition_to_float",
-    )
-    nisa.nc_transpose(
-        dst=condition_psum,
-        data=condition_float,
-        name="route_pack_condition_transpose",
-    )
+    #
+    # Every buffer here is PARTITION-MAJOR over blocks, so all of them are capped
+    # at the 128-partition SBUF limit. Above 6,144 tokens per MoE call max_blocks
+    # exceeds 128 and the first op to be validated fails with
+    #   "iota dst partition dimension 160 exceeds maximum 128"
+    # (MEASURED 2026-08-22 at BS=8/chunk1024, max_blocks=160). So tile over blocks
+    # in <=128-partition chunks, exactly as _init_route_metadata already does for
+    # block_to_expert. Compile-time loop with a single iteration at the block
+    # counts that worked before, so those configs are unchanged.
+    #
+    # The condition ROW is (1, max_blocks) -- free dimension, no partition limit --
+    # so it is allocated once outside the loop, filled per tile, and stored once.
     condition_row = sbm.alloc_stack(
         (1, max_blocks),
         dtype=nl.int32,
         name="route_pack_condition_row",
     )
-    nisa.tensor_copy(
-        dst=condition_row,
-        src=condition_psum,
-        name="route_pack_condition_to_int",
-    )
+    for _blk_lo in range(0, max_blocks, 128):
+        _blk_hi = min(_blk_lo + 128, max_blocks)
+        _blk_n = _blk_hi - _blk_lo
+        sbm.open_scope(name=f"route_pack_block_meta_{_blk_lo}")
+        block_ids = sbm.alloc_stack(
+            (_blk_n, num_local_experts),
+            dtype=nl.int32,
+            name=f"route_pack_block_ids_{_blk_lo}",
+        )
+        # offset carries the tile base so block ids stay GLOBAL across tiles.
+        nisa.iota(
+            dst=block_ids,
+            pattern=[[0, num_local_experts]],
+            offset=_blk_lo,
+            channel_multiplier=1,
+            name=f"route_pack_block_iota_{_blk_lo}",
+        )
+        ends_broadcast = sbm.alloc_stack(
+            (_blk_n, num_local_experts),
+            dtype=nl.int32,
+            name=f"route_pack_ends_broadcast_{_blk_lo}",
+        )
+        stream_shuffle_broadcast(block_ends, ends_broadcast)
+        ended_experts = sbm.alloc_stack(
+            (_blk_n, num_local_experts),
+            dtype=nl.int32,
+            name=f"route_pack_ended_experts_{_blk_lo}",
+        )
+        nisa.tensor_tensor(
+            dst=ended_experts,
+            data1=block_ids,
+            data2=ends_broadcast,
+            op=nl.greater_equal,
+            name=f"route_pack_block_expert_compare_{_blk_lo}",
+        )
+        block_experts = sbm.alloc_stack(
+            (_blk_n, 1),
+            dtype=nl.int32,
+            name=f"route_pack_block_experts_{_blk_lo}",
+        )
+        nisa.tensor_reduce(
+            dst=block_experts,
+            data=ended_experts,
+            op=nl.add,
+            axis=1,
+            name=f"route_pack_block_expert_reduce_{_blk_lo}",
+        )
+        # Intersect this tile with the writer's block range (num_writers > 1 at
+        # LNC=2); both bounds are compile-time ints, so this is a Python test.
+        _w_lo = max(_blk_lo, writer_id * max_blocks // num_writers)
+        _w_hi = min(_blk_hi, (writer_id + 1) * max_blocks // num_writers)
+        if _w_hi > _w_lo:
+            nisa.dma_copy(
+                dst=block_to_expert[_w_lo:_w_hi, :],
+                src=block_experts[_w_lo - _blk_lo : _w_hi - _blk_lo, :],
+                name=f"route_pack_store_block_experts_{_blk_lo}",
+            )
+
+        block_id_column = sbm.alloc_stack(
+            (_blk_n, 1),
+            dtype=nl.int32,
+            name=f"route_pack_block_id_column_{_blk_lo}",
+        )
+        nisa.iota(
+            dst=block_id_column,
+            pattern=[[0, 1]],
+            offset=_blk_lo,
+            channel_multiplier=1,
+            name=f"route_pack_condition_iota_{_blk_lo}",
+        )
+        active_conditions = sbm.alloc_stack(
+            (_blk_n, 1),
+            dtype=nl.int32,
+            name=f"route_pack_active_conditions_{_blk_lo}",
+        )
+        active_block_count = sbm.alloc_stack(
+            (_blk_n, 1),
+            dtype=nl.int32,
+            name=f"route_pack_active_block_count_{_blk_lo}",
+        )
+        stream_shuffle_broadcast(
+            block_ends[0:1, num_local_experts - 1 : num_local_experts],
+            active_block_count,
+        )
+        nisa.tensor_tensor(
+            dst=active_conditions,
+            data1=block_id_column,
+            data2=active_block_count,
+            op=nl.less,
+            name=f"route_pack_active_compare_{_blk_lo}",
+        )
+        condition_psum = nl.ndarray((1, _blk_n), dtype=nl.float32, buffer=nl.psum)
+        condition_float = sbm.alloc_stack(
+            (_blk_n, 1),
+            dtype=nl.float32,
+            name=f"route_pack_condition_float_{_blk_lo}",
+        )
+        nisa.tensor_copy(
+            dst=condition_float,
+            src=active_conditions,
+            name=f"route_pack_condition_to_float_{_blk_lo}",
+        )
+        nisa.nc_transpose(
+            dst=condition_psum,
+            data=condition_float,
+            name=f"route_pack_condition_transpose_{_blk_lo}",
+        )
+        nisa.tensor_copy(
+            dst=condition_row[0:1, _blk_lo:_blk_hi],
+            src=condition_psum,
+            name=f"route_pack_condition_to_int_{_blk_lo}",
+        )
+        sbm.close_scope()
+
     condition_write_lo = writer_id * max_blocks // num_writers
     condition_write_hi = (writer_id + 1) * max_blocks // num_writers
     nisa.dma_copy(
@@ -1157,13 +1179,19 @@ def nki_pack_local_routes_35b(
     block_size: int,
 ):
     """Standalone route packer for device correctness and isolated profiling."""
+    T, K = expert_indices.shape
     return _pack_local_routes_impl(
         expert_indices,
         expert_lo,
         num_local_experts,
         block_size,
         nl.shared_hbm,
-        scatter_barrier=True,
+        # Mirror the production wrappers instead of hardcoding True. Hardcoding it
+        # made this entry unable to exercise the TILED path at all on LNC=1: the
+        # tiled scan's per-slice core_barrier is illegal there
+        # ("core_barrier() requires LNC degree >= 2"), so the gate silently only
+        # ever tested the direct packer.
+        scatter_barrier=_scatter_barrier_default(T * K),
     )
 
 

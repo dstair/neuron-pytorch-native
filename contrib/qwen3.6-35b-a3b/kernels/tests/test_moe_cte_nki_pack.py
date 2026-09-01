@@ -9,7 +9,11 @@ import numpy as np
 import torch
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT), str(ROOT / "kernels")]
+# kernels/ FIRST, matching static_decode_35b.py. With ROOT first, any stale
+# top-level copy of a kernel module SHADOWS kernels/<name>.py -- the trn2 box
+# carries 23 such pre-August leftovers, and this test silently validated a
+# 5-week-old moe_cte_35b.py because of it (2026-08-22).
+sys.path[:0] = [str(ROOT / "kernels"), str(ROOT)]
 
 from moe_cte_adapter import pack_local_routes
 from moe_cte_35b import (  # noqa: E402
@@ -82,7 +86,7 @@ def assert_metadata_equal(actual, expected, context: str):
             )
 
 
-def run_metadata_matrix(backend: str):
+def run_metadata_matrix(backend: str, token_counts=(1024, 2048)):
     num_local_experts = 32 if LNC_DEGREE == 1 else 64
     if backend == "simulation":
         import nki
@@ -109,7 +113,7 @@ def run_metadata_matrix(backend: str):
             return tuple(output.cpu() for output in outputs)
 
     checked = 0
-    for tokens in (1024, 2048):
+    for tokens in token_counts:
         for expert_lo in range(0, 256, num_local_experts):
             for block_size in (256, 512):
                 for case_name, routes in route_cases(
@@ -425,6 +429,14 @@ def main():
     parser.add_argument("--intermediate-size", type=int, default=512)
     parser.add_argument("--block-size", type=int, choices=(256, 512), default=256)
     parser.add_argument("--routes-from-topk", action="store_true")
+    parser.add_argument(
+        "--metadata-tokens",
+        default="1024,2048",
+        help="comma-separated tokens-per-call for the exact metadata matrix. "
+        "The 1024/2048 default keeps max_blocks <= 128, i.e. a SINGLE "
+        "block-metadata tile; pass a larger count (e.g. 8192 -> max_blocks 160) "
+        "to exercise the multi-tile path.",
+    )
     parser.add_argument("--routes-dir")
     parser.add_argument(
         "--inputs-dir",
@@ -450,7 +462,10 @@ def main():
         )
         return
 
-    run_metadata_matrix(args.backend)
+    run_metadata_matrix(
+        args.backend,
+        tuple(int(x) for x in args.metadata_tokens.split(",")),
+    )
     if args.fused:
         run_fused_equivalence()
 

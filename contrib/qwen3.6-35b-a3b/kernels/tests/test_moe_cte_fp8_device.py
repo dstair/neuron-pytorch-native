@@ -24,7 +24,11 @@ import sys
 import torch
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT), str(ROOT / "kernels")]
+# kernels/ FIRST, matching static_decode_35b.py. With ROOT first, any stale
+# top-level copy of a kernel module SHADOWS kernels/<name>.py -- the trn2 box
+# carries 23 such pre-August leftovers, and this test silently validated a
+# 5-week-old moe_cte_35b.py because of it (2026-08-22).
+sys.path[:0] = [str(ROOT / "kernels"), str(ROOT)]
 
 from moe_cte_adapter import pack_local_routes  # noqa: E402
 from moe_cte_fp8_35b import nki_moe_cte_fp8_routed_35b  # noqa: E402
