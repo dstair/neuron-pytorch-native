@@ -167,7 +167,37 @@ docker run --rm --name "$NAME" --privileged --network host --ipc host \
 RC=$?
 NEFFS=$(sudo find "$CACHE/neff_cache" -name '*.neff' 2>/dev/null | wc -l)
 BIG=$(sudo find "$CACHE/neff_cache" -name '*.neff' -size +1M 2>/dev/null | wc -l)
-echo "DOCKER_EXIT=$RC neffs=$NEFFS big_neffs=$BIG $(date -u +%FT%TZ)" | tee -a "$LOG"
+# Distinct size classes = distinct graphs; each should have one NEFF per rank.
+CLASSES=$(sudo find "$CACHE/neff_cache" -name '*.neff' -size +1M -printf '%s\n' 2>/dev/null \
+  | awk '{printf "%d\n", $1/1048576}' | sort -u | wc -l)
+EXPECTED=$(( SPLITS * 8 ))
+echo "DOCKER_EXIT=$RC neffs=$NEFFS big_neffs=$BIG size_classes=$CLASSES expected_big=$EXPECTED $(date -u +%FT%TZ)" \
+  | tee -a "$LOG"
+
 # Exit code is NOT the gate: a trn2 NEFF cannot load on trn1, so a successful
-# cross-compile ends non-zero. The gate is "did the big per-rank NEFFs persist".
-[[ "$BIG" -ge 1 ]] && exit 0 || exit 1
+# cross-compile ALWAYS ends non-zero (rank N SIGSEGVs on load with "additional fields
+# for dynamic dma on v2 arch missing from neff", which SIGTERMs its siblings). The cache
+# write finalizes at compile time, before load, so that ending is expected.
+#
+# But "$BIG -ge 1" was FAR too lenient: on 2026-09-01 a run whose ranks were SIGTERM'd
+# partway emitted 25 of 32 large NEFFs and still exited 0. That matters differently by
+# purpose, so make the purpose explicit:
+#   - restoring a TIMING cache needs every NEFF; a missing one is a mid-run cache miss
+#     (or a silent recompile on the trn2, whose 128 GB host is why we cross-compile).
+#   - PROFILING needs only one representative per size class, since capture-replay
+#     replays a single NEFF across 8 simulated workers.
+# XC_ALLOW_PARTIAL=1 selects the profiling gate. Default demands the full set.
+if [[ "$BIG" -ge "$EXPECTED" ]]; then
+  echo "GATE PASS: complete ($BIG/$EXPECTED large NEFFs, $CLASSES size classes)" | tee -a "$LOG"
+  exit 0
+fi
+if [[ "${XC_ALLOW_PARTIAL:-0}" == "1" && "$CLASSES" -ge 1 && "$BIG" -ge 1 ]]; then
+  echo "GATE PASS (PARTIAL, profiling only): $BIG/$EXPECTED large NEFFs in $CLASSES size" \
+       "classes. Enough to capture-replay; NOT enough to restore as a timing cache." | tee -a "$LOG"
+  exit 0
+fi
+echo "GATE FAIL: only $BIG/$EXPECTED large NEFFs ($CLASSES size classes)." \
+     "Set XC_ALLOW_PARTIAL=1 if this is for profiling. Otherwise retry, and consider a" \
+     "higher --prefill-splits: more splits = smaller per-segment graph = less walrus RSS." \
+  | tee -a "$LOG"
+exit 1
