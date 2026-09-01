@@ -31,7 +31,9 @@ while true; do
   fi
   touch /tmp/wd-seen-$NAME
   AVAIL=$(awk '/MemAvailable/ {printf "%d", $2/1048576}' /proc/meminfo)
-  NCC=$(pgrep -c -f 'neuronx-cc|walrus_driver' 2>/dev/null || echo 0)
+  # `pgrep -c` already prints 0 on no-match AND exits 1, so a `|| echo 0` fallback
+  # appends a SECOND 0 and puts a newline inside the variable, splitting the log line.
+  NCC=$(pgrep -c -f 'neuronx-cc|walrus_driver' 2>/dev/null | head -1)
   echo "$(date -u +%FT%TZ) avail=${AVAIL}GB cc_procs=${NCC}" >>"$LOG"
   if (( AVAIL < THRESHOLD_GB )); then
     echo "$(date -u +%FT%TZ) THRESHOLD BREACH avail=${AVAIL}GB -> stopping $NAME" >>"$LOG"

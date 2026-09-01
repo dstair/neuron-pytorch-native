@@ -69,20 +69,34 @@ if [[ ! -f "$SHIM" ]]; then
     >>"$LOG" 2>&1 || { echo "FATAL: shim build failed (see $LOG)"; exit 1; }
 fi
 
-# Preflight: prove the shim makes torch_neuronx report trn2 on trn1 hardware. Cheap
-# (~20 s) and it is the single point of failure that would otherwise waste the whole
-# compile by writing trn1-keyed cache entries.
-PLATFORM=$(docker run --rm --privileged \
+# Preflight: prove the shim actually rewrites the family INSIDE the cache-key
+# constructor. This is the single point of failure that would otherwise waste the
+# whole compile by silently writing trn1-keyed entries that miss on the trn2.
+#
+# Do NOT gate on `_C._get_platform_target()` -- the shim is deliberately selective
+# (it checks its own backtrace for CompilationCacheKey + CompileOnlyKernelExecution),
+# so that call correctly returns the PHYSICAL target trn1 even when the shim is
+# working perfectly. Instead run the shipped validate_cache_override.py, which forces
+# a real cache-key construction via _C.compile_graph(), and with SHIM_DEBUG=1 assert
+# the shim's own line reports the override. NRT family 5 == trn2 (2 == trn1).
+PREFLIGHT=$(docker run --rm --privileged \
   -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
   -e LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so \
   -e QWEN35_CACHE_PLATFORM_TARGET=trn2 -e NEURON_LOGICAL_NC_CONFIG=1 \
+  -e QWEN35_PLATFORM_TARGET_SHIM_DEBUG=1 \
   -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$SHIM":/opt/qwen35/libnrt_platform_target_override.so:ro \
-  "$IMAGE" /opt/torch-neuronx/.venv/bin/python -c \
-    'from torch_neuronx import _C; print(_C._get_platform_target())' 2>&1 | tail -1)
-if [[ "$PLATFORM" != "trn2" ]]; then
-  echo "FATAL: shim preflight reported '$PLATFORM', expected trn2" | tee -a "$LOG"; exit 1
+  -v "$SRC/deploy/cross_compile/validate_cache_override.py":/opt/qwen35/v.py:ro \
+  "$IMAGE" bash -lc 'source /opt/torch-neuronx/.venv/bin/activate 2>/dev/null || true
+    python /opt/qwen35/v.py' 2>&1)
+printf '%s\n' "$PREFLIGHT" | grep -F 'qwen35-platform-override' >>"$LOG" 2>&1
+if ! printf '%s\n' "$PREFLIGHT" |
+     grep -qE 'qwen35-platform-override .*target=trn2 overridden_family=5'; then
+  { echo "FATAL: shim did not override the cache key to trn2 (family 5)."
+    printf '%s\n' "$PREFLIGHT" | tail -20; } | tee -a "$LOG"
+  exit 1
 fi
+PLATFORM=trn2
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # A --privileged container creates the cache root-owned; a non-sudo rm fails SILENTLY
