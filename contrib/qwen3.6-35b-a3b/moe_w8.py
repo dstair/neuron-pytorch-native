@@ -438,6 +438,85 @@ def requantize_official_fp8_output_block(
     return result, result_scales, stats
 
 
+def _block_quant_stats(source, scale_expanded):
+    """Dequant quality for a 256-block grid, plus the E4M3 saturation count."""
+    quantized = encode_legacy_e4m3(source / scale_expanded)
+    reconstructed = decode_legacy_e4m3(quantized) * scale_expanded
+    stats = QuantizationStats()
+    stats.update(source, reconstructed)
+    stats.block_count = scale_expanded.numel()
+    # An absmax scale maps its own block maximum to exactly LEGACY_E4M3_MAX, and
+    # a scale REDUCED over the contraction axis is >= each block's own scale, so
+    # neither grid can truly saturate. What DOES exceed the max is the absmax
+    # element itself, by ~1 ULP of the float32 divide (~99 values in 33.5M for
+    # gate_up) -- encode_legacy_e4m3 clamps those to the top code they would have
+    # rounded to anyway. Tolerate that, so the count stays a real tripwire for a
+    # scale grid that loses RANGE rather than only resolution.
+    stats.clipped_count = int(
+        (source.abs() > scale_expanded * (LEGACY_E4M3_MAX * (1.0 + 1e-6))).sum()
+    )
+    return quantized, stats
+
+
+def quantize_gate_up_256block(gate_up_bf16, block=256, output_block=False):
+    """Quantize gate/up experts [E,H,2,I] to 256x256-block legacy-E4M3 (FP8 CTE).
+
+    Returns (int8 [E,H,2,I], scale [E,H//256,2,I//256,128], stats). One absmax
+    scale per (H-256-block, gate/up, I-256-block); dequant is
+    decode_legacy_e4m3(int8) * scale. The scale is broadcast over the 128
+    partition rows the kernel loads; the layout matches nkilib's block-quant
+    double_row path (moe_cte_torch_ref, is_block_quant). Vectorized (no per-block
+    Python loop) for load-time use across all 40 layers.
+
+    ``output_block=True`` reduces the scale grid over the H-block (contraction)
+    axis, so one scale serves the whole contraction for a given output block,
+    and broadcasts it back to the same tensor shape. That makes the EXISTING
+    kernel produce output-block numerics at the old op count -- the numerics-first
+    staging step for hoisting the per-chunk Vector scale-add out of the H loop.
+    """
+    E, H, two_dim, I = gate_up_bf16.shape
+    if two_dim != 2 or H % block or I % block:
+        raise ValueError(f"gate_up must be [E,H,2,I] with H,I divisible by {block}")
+    HB, IB = H // block, I // block
+    w = gate_up_bf16.float().reshape(E, HB, block, 2, IB, block)
+    scale = w.abs().amax(dim=(2, 5)).clamp_min(1e-12) / LEGACY_E4M3_MAX  # [E,HB,2,IB]
+    if output_block:
+        # max over the contraction blocks = the true absmax of the whole output
+        # block's column, so the reduced grid is still saturation-free.
+        scale = scale.amax(dim=1, keepdim=True).expand(E, HB, 2, IB)
+    scale = scale.contiguous()
+    i8, stats = _block_quant_stats(w, scale[:, :, None, :, :, None])
+    i8 = i8.reshape(E, H, 2, I)
+    scale_tab = (
+        scale.to(torch.float32)[..., None].expand(E, HB, 2, IB, 128).contiguous()
+    )
+    return i8, scale_tab, stats
+
+
+def quantize_down_256block(down_bf16, block=256, output_block=False):
+    """Quantize down experts [E,I,H] to 256x256-block legacy-E4M3 (FP8 CTE).
+
+    Returns (int8 [E,I,H], scale [E,I//256,H//256,128], stats). Contraction is
+    over I, so ``output_block=True`` reduces the grid over the I-block axis.
+    See quantize_gate_up_256block.
+    """
+    E, I, H = down_bf16.shape
+    if I % block or H % block:
+        raise ValueError(f"down must be [E,I,H] with I,H divisible by {block}")
+    IB, HB = I // block, H // block
+    w = down_bf16.float().reshape(E, IB, block, HB, block)
+    scale = w.abs().amax(dim=(2, 4)).clamp_min(1e-12) / LEGACY_E4M3_MAX  # [E,IB,HB]
+    if output_block:
+        scale = scale.amax(dim=1, keepdim=True).expand(E, IB, HB)
+    scale = scale.contiguous()
+    i8, stats = _block_quant_stats(w, scale[:, :, None, :, None])
+    i8 = i8.reshape(E, I, H)
+    scale_tab = (
+        scale.to(torch.float32)[..., None].expand(E, IB, HB, 128).contiguous()
+    )
+    return i8, scale_tab, stats
+
+
 def requantize_official_fp8_row(
     raw,
     source_scales,

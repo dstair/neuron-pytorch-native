@@ -40,6 +40,8 @@ from moe_w8 import (
     build_local_affinities,
     OfficialFP8ExpertReader,
     QuantizationStats,
+    quantize_down_256block,
+    quantize_gate_up_256block,
     ROW_FP8_PROJECTION_CHOICES,
 )
 from topology_35b import LNC_DEGREE
@@ -193,9 +195,50 @@ USE_MOE_NKILIB = os.environ.get("MOE_NKILIB", "0") == "1"
 # metadata is built at runtime with fixed tensor shapes by moe_cte_adapter.py.
 USE_MOE_CTE = os.environ.get("MOE_CTE", "0") == "1"
 USE_MOE_CTE_NKI_PACK = os.environ.get("MOE_CTE_NKI_PACK", "0") == "1"
+# FP8xFP8 prefill CTE: experts resident as 256x256-block legacy-E4M3 (int8), run as
+# double_row FP8 matmuls (Trainium2 2x). Prefill-only; decode uses MOE_FUSED_W8.
+USE_MOE_CTE_FP8 = os.environ.get("MOE_CTE_FP8", "0") == "1"
+# Reduce the 256-block scale grid over the CONTRACTION-block axis so one scale
+# serves a whole output block. With the tensor shape kept, this makes the
+# existing kernel produce output-block numerics at the old op count -- the
+# numerics gate for hoisting the per-256-chunk Vector scale-add out of the H
+# loop (bwmm_shard_on_I.py:1364-1390 / :2133-2140, 26% of prefill Vector time).
+MOE_CTE_FP8_OUTPUT_BLOCK = os.environ.get("MOE_CTE_FP8_OUTPUT_BLOCK", "0") == "1"
+# Pre-registered gate for the reduced grid (the full grid scores ~0.9996).
+MOE_CTE_FP8_MIN_COSINE = float(os.environ.get("MOE_CTE_FP8_MIN_COSINE", "0.999"))
+
+
+def _gate_fp8_cte_quant(layer_idx, which, stats):
+    """Print and gate the 256-block dequant quality for the FP8 CTE experts."""
+    grid = "output_block" if MOE_CTE_FP8_OUTPUT_BLOCK else "full"
+    line = (
+        f"[fp8-cte-quant] l{layer_idx} {which} grid={grid} "
+        f"cosine={stats.cosine:.7f} nrmse={stats.normalized_rmse:.5f} "
+        f"clipped={stats.clipped_count} scales={stats.block_count}"
+    )
+    if layer_idx == 0 or stats.cosine < MOE_CTE_FP8_MIN_COSINE:
+        print(line, flush=True)
+    if stats.cosine < MOE_CTE_FP8_MIN_COSINE:
+        raise ValueError(
+            f"l{layer_idx} {which} failed the FP8 CTE {grid}-grid quality gate: "
+            f"cosine={stats.cosine:.7f} < {MOE_CTE_FP8_MIN_COSINE}"
+        )
+    if stats.clipped_count:
+        raise ValueError(
+            f"l{layer_idx} {which} {grid} grid saturated E4M3 on "
+            f"{stats.clipped_count} values; the reduced scale must only lose "
+            "resolution, never range"
+        )
+
+
 if USE_MOE_CTE:
     if USE_MOE_NKILIB:
         raise RuntimeError("MOE_CTE and MOE_NKILIB are mutually exclusive")
+if USE_MOE_CTE_FP8:
+    if not USE_MOE_CTE:
+        raise RuntimeError("MOE_CTE_FP8=1 requires MOE_CTE=1")
+    if not USE_MOE_CTE_NKI_PACK:
+        raise RuntimeError("MOE_CTE_FP8=1 requires MOE_CTE_NKI_PACK=1 (routed path)")
 
 # High-batch decode-only fused W8 experts. FP8 defaults to row-scaled legacy
 # E4M3 in nkilib's all-expert scheduler. Block power-of-two conversion preserves
@@ -369,6 +412,9 @@ if USE_MOE_NKILIB or USE_MOE_CTE:
     from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
 if USE_MOE_CTE:
     from torch_neuronx import wrap_nki
+    if USE_MOE_CTE_FP8:
+        from moe_cte_fp8_35b import nki_moe_cte_fp8_routed_35b
+        _nkilib_moe_cte_fp8_hop = wrap_nki(nki_moe_cte_fp8_routed_35b)[LNC_DEGREE]
     if USE_MOE_CTE_NKI_PACK:
         from moe_cte_35b import nki_moe_cte_routed_35b
         _nkilib_moe_cte_hop = wrap_nki(nki_moe_cte_routed_35b)[LNC_DEGREE]
@@ -1011,6 +1057,40 @@ class StaticDecode35B(nn.Module):
                     self.register_buffer(f"l{i}_k_down", down_k)
                     self.register_buffer(f"l{i}_k_gu_s", gs.squeeze(-1).reshape(Ec, 2, II).contiguous())  # [E,2,I]
                     self.register_buffer(f"l{i}_k_dn_s", ds.squeeze(-1).contiguous())                     # [E,H]
+                elif USE_MOE_CTE_FP8:
+                    # FP8xFP8 prefill: build the BF16 nkilib layout, then 256x256-block
+                    # quantize to int8 (legacy-E4M3) + scale tables for the double_row
+                    # path. Only the FP8 experts stay resident (the memory win); decode
+                    # is a separate run that uses MOE_FUSED_W8, not these buffers, so
+                    # reusing the l{i}_k_* names as int8 here is safe for prefill.
+                    gate_up_k = gu.reshape(Ec, 2, II, HH).permute(0, 3, 1, 2).contiguous()  # [E,H,2,I]
+                    down_k = dn.permute(0, 2, 1).contiguous()                              # [E,I,H]
+                    gu_i8, gu_scale, gu_st = quantize_gate_up_256block(
+                        gate_up_k, output_block=MOE_CTE_FP8_OUTPUT_BLOCK
+                    )
+                    dn_i8, dn_scale, dn_st = quantize_down_256block(
+                        down_k, output_block=MOE_CTE_FP8_OUTPUT_BLOCK
+                    )
+                    _gate_fp8_cte_quant(i, "gate_up", gu_st)
+                    _gate_fp8_cte_quant(i, "down", dn_st)
+
+                    # Pad experts to E+1 with an all-zero dummy expert (index E). The route
+                    # packer marks padding blocks with the sentinel expert id == E; the CTE
+                    # kernel gathers weights/scales/affinity by that id BEFORE the padding
+                    # skip, so without the pad it reads index E out of an E-expert table
+                    # (scatter/gather DGE OOB). With the dummy row the gather is in-bounds
+                    # and padding blocks contribute 0 (zero weights/scale + zero affinity).
+                    # The affinity is padded to E+1 in _moe_cte. ~1/E extra expert HBM.
+                    def _pad_expert_dim(t):
+                        pad = torch.zeros(
+                            (1, *t.shape[1:]), dtype=t.dtype, device=t.device
+                        )
+                        return torch.cat([t, pad], dim=0).contiguous()
+
+                    self.register_buffer(f"l{i}_k_gate_up", _pad_expert_dim(gu_i8))
+                    self.register_buffer(f"l{i}_k_gate_up_scale", _pad_expert_dim(gu_scale))
+                    self.register_buffer(f"l{i}_k_down", _pad_expert_dim(dn_i8))
+                    self.register_buffer(f"l{i}_k_down_scale", _pad_expert_dim(dn_scale))
                 else:
                     gate_up_k = gu.reshape(Ec, 2, II, HH).permute(0, 3, 1, 2).contiguous()  # [E,H,2,I]
                     down_k = dn.permute(0, 2, 1).contiguous()                              # [E,I,H]
@@ -1124,6 +1204,33 @@ class StaticDecode35B(nn.Module):
             return self._moe_fused_w8(i, x2d, lead).to(x.dtype)
         if USE_MOE_CTE:
             if prefill:
+                # The CTE MoE deadlocks (NRT status 5, "hang on instructions
+                # BETWEEN collective operations") once ONE call processes more
+                # than ~2048 tokens. Measured 2026-08-20 at 4L/seq1024, TP=8:
+                # 2048 tokens completes at block_size 512 (64 blocks) AND at 256
+                # (96 blocks, bit-identical); 3072 hangs at BOTH 512 (80 blocks)
+                # and 256 (128 blocks). Block count overlaps across the working
+                # and hanging sets (80-96) and packed_len 32768 appears on both
+                # sides, so the wall is tokens per call — not block count, not
+                # the packed buffer length, and not the loop expression
+                # (dynamic_range / static unroll / fori_loop all hang alike).
+                # MoE is per-token independent, so cap the tokens per CTE call
+                # instead of shrinking --bucket-chunk. That keeps the bucket
+                # large, so GQA/DeltaNet setup and the per-chunk collectives
+                # still amortize over few chunks: capping the bucket instead
+                # (BS=16/chunk128, 79 chunks vs 20) lost 14.7% at 40L/seq10k.
+                cap = int(os.environ.get("MOE_CTE_MAX_TOKENS", "0"))
+                T = x2d.shape[0]
+                if cap > 0 and T > cap:
+                    parts = []
+                    for cs in range(0, T, cap):
+                        ce = min(cs + cap, T)
+                        parts.append(self._moe_cte(i, x2d[cs:ce], (ce - cs,)))
+                    return (
+                        torch.cat(parts, dim=0)
+                        .reshape(*lead, D.HIDDEN)
+                        .to(x.dtype)
+                    )
                 return self._moe_cte(i, x2d, lead).to(x.dtype)
             # Decode: the context-encoding kernel can't meta-specialize T=1, and the
             # sparse/reference tail below needs the plain per-expert weights that the
@@ -1365,10 +1472,31 @@ class StaticDecode35B(nn.Module):
         affinities = torch.cat(
             [affinities, torch.zeros(1, E, dtype=affinities.dtype, device=x2d.device)]
         ).to(torch.bfloat16)
+        if USE_MOE_CTE_FP8:
+            # FP8 experts/scales are padded to E+1 (dummy expert E). The kernel gathers
+            # affinity by the block's expert id too, so pad the expert axis with a zero
+            # dummy column: padding blocks (sentinel id == E) read affinity 0 in-bounds.
+            affinities = torch.cat(
+                [affinities,
+                 torch.zeros(affinities.shape[0], 1, dtype=affinities.dtype, device=x2d.device)],
+                dim=1,
+            )
         hidden = torch.cat(
             [x2d.to(torch.bfloat16), torch.zeros(1, D.HIDDEN, dtype=torch.bfloat16, device=x2d.device)]
         )
-        if USE_MOE_CTE_NKI_PACK:
+        if USE_MOE_CTE_FP8:
+            routed = _nkilib_moe_cte_fp8_hop(
+                hidden,
+                affinities.reshape(-1, 1),
+                getattr(self, f"l{i}_k_gate_up"),        # int8 legacy-E4M3
+                getattr(self, f"l{i}_k_down"),           # int8 legacy-E4M3
+                getattr(self, f"l{i}_k_gate_up_scale"),  # [E,H//256,2,I//256,128]
+                getattr(self, f"l{i}_k_down_scale"),     # [E,I//256,H//256,128]
+                sel.to(torch.int32),
+                self.e_lo,
+                block_size,
+            )
+        elif USE_MOE_CTE_NKI_PACK:
             routed = _nkilib_moe_cte_hop(
                 hidden,
                 affinities.reshape(-1, 1),
