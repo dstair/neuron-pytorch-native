@@ -25,12 +25,45 @@ NAME=q35-prefill-fp8bs-${TAG}
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # Caches are created root-owned by the privileged container; a non-sudo rm fails
 # SILENTLY and a stale NEFF gets served. Always sudo-clear.
-sudo rm -rf "$CACHE" /mnt/nvme/lnc1-work/nbackend
+#
+# QWEN35_KEEP_CACHE=1 skips the clear, for the ONE legitimate case: repeating the
+# IDENTICAL config to measure run-to-run spread. A 40L compile is ~45 min, so a cold
+# repeat is expensive enough that people skip the repeat instead -- and then attribute a
+# single-run delta to whatever changed, which is how a 3.2% host-stack difference and a
+# 3.2% variance become indistinguishable. Timing is unaffected by cache reuse: the TIMED
+# figure is a separate post-warmup pass.
+#
+# Use it ONLY when nothing graph-affecting changed. If source, flags, nkilib or the
+# container image moved, the cache key moves with them and a stale hit is silent -- so the
+# guard below refuses to reuse a cache whose recorded provenance does not match.
+PROV="$CACHE/.qwen35_provenance"
+NEW_PROV="image=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) src_py_md5=$(cd "$SRC" && find . -name '*.py' -not -path '*/__pycache__/*' | sort | xargs md5sum | md5sum | awk '{print $1}') nkilib_md5=$(cd "$NKILIB" && find . -name '*.py' -not -path '*/__pycache__/*' | sort | xargs md5sum | md5sum | awk '{print $1}')"
+if [[ "${QWEN35_KEEP_CACHE:-0}" == "1" && -d "$CACHE" ]]; then
+  if [[ -f "$PROV" ]] && [[ "$(cat "$PROV")" == "$NEW_PROV" ]]; then
+    echo "KEEP_CACHE: provenance matches, reusing warm cache at $CACHE"
+  else
+    echo "KEEP_CACHE REFUSED: provenance changed, clearing to avoid a silent stale hit"
+    echo "  was: $(cat "$PROV" 2>/dev/null || echo '<none>')"
+    echo "  now: $NEW_PROV"
+    sudo rm -rf "$CACHE"
+  fi
+else
+  sudo rm -rf "$CACHE"
+fi
+sudo rm -rf /mnt/nvme/lnc1-work/nbackend
 mkdir -p /mnt/nvme/lnc1-work/logs "$CACHE"
+echo "$NEW_PROV" | sudo tee "$PROV" >/dev/null
 if grep -q "only work on TRN2" "$NKILIB/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py"; then
   echo "FATAL: $NKILIB is NOT patched for LNC=1" | tee "$LOG"; exit 1
 fi
-echo "START $(date -u +%FT%TZ) tag=$TAG maxseq=$MAXSEQ blk=$BLK maxtok=$MAXTOK ob=${OB} hoist=${HOIST:-follow-ob}" | tee "$LOG"
+# TAG does not encode every variable (notably not the packer variant), so re-running a
+# config truncates the previous log via the tee below -- that is how the 3,871.0 tok/s
+# measurement lost its log. Preserve the old one before truncating; $LOG stays the
+# canonical "latest" path so existing tooling keeps working.
+if [[ -s "$LOG" ]]; then
+  cp -p "$LOG" "${LOG%.log}_$(date -u +%Y%m%dT%H%M%SZ).log"
+fi
+echo "START $(date -u +%FT%TZ) tag=$TAG maxseq=$MAXSEQ blk=$BLK maxtok=$MAXTOK ob=${OB} hoist=${HOIST:-follow-ob} keep_cache=${QWEN35_KEEP_CACHE:-0}" | tee "$LOG"
 docker run --rm --name "$NAME" --privileged --network host --ipc host \
   -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
   -e NEURON_LOGICAL_NC_CONFIG=1 -e QWEN35_LNC=1 \
