@@ -684,6 +684,61 @@ historical results in this section must not be attributed to it.
 
 ### Prefill (prompt throughput)
 
+#### FP8 CTE MoE prefill (2026-08-21/22) — fastest measured, but at N=10,000
+
+**Every row in this sub-table is `N=10,000`, not the `N=20,000` used by the main table
+below.** They are therefore not directly comparable to it. Prompt-length sensitivity was
+measured separately and is small (~0.5% from 10k to 20k, see "Context-length sweep"), but
+an FP8 run at N=20,000 has **not** been done. All rows: 40 layers, TP=8/LNC=1, bucket
+1024 unless noted, O1, beta-5, `MOE_CTE_FP8=1`, **5.08 GB/core** (BF16 CTE is 8.94).
+
+| Config | BS | tok/MoE call | Latency | Prompt tok/s |
+|---|---:|---:|---:|---:|
+| **Output-block scale grid + PSUM hoist + uncapped packer** | **6** | **6,144** | **13.686 s** | **4,383.9 aggregate** |
+| same levers, BS=4 | 4 | 4,096 | 9.326 s | 4,289.2 aggregate |
+| same levers, BS=8 — **worse**, tokens/call is not monotone | 8 | 8,192 | — | 4,271.9 aggregate |
+| same levers, bucket 2048 — **worse**, intra-chunk work grows as `S·chunk/2` | 3 | 6,144 | — | 4,187.5 aggregate |
+| same levers, bucket 256 | 16 | 4,096 | 40.721 s | 3,929.2 aggregate |
+| output-block grid + hoist only, capped packer | 16 | 2,048 | 41.333 s | 3,871.0 aggregate |
+| **BF16 CTE reference at the only config where both were run** | 2 | 2,048 | — | **4,227.7 aggregate** |
+| FP8 *before* the output-block hoist, same config as that BF16 row | 2 | 2,048 | — | 3,920.3 aggregate |
+| pre-lever FP8 baseline | 16 | 2,048 | 43.536 s | 3,675.1 aggregate |
+
+Clean per-lever attribution, all three at BS=4/bucket 1024 so only the lever changes:
+
+| Variant | Prompt tok/s | Delta |
+|---|---:|---|
+| capped at 2,048 tok/call, no output-block grid | 3,846.2 | — |
+| + output-block grid + PSUM hoist + batched packer shift | 4,150.9 | **+7.9%** |
+| + uncapped (6,144 tok/call) | 4,289.2 | **+3.3%** |
+
+`1.079 × 1.033 = 1.115`, matching the +11.5% end-to-end exactly, so the two levers compose
+cleanly and the output-block hoist is the larger one.
+
+**What this does and does not show.** At the one config where BF16 and FP8 were both
+measured (BS=2, 2,048 tok/call) **BF16 was 7.8% faster** — the FP8 dequant tax. The
+output-block hoist removed that tax, and the tokens-per-call tuning then pushed FP8 past
+the BF16 *configuration*. But **BF16 CTE was never re-run at BS=6/bucket 1024**, so the
+FP8-versus-BF16 question at the tuned operating point is open, and the headline gap should
+not be attributed to FP8 alone. The memory result needs no such qualification: 5.08 vs
+8.94 GB/core.
+
+Two caveats on the numerics:
+
+- Capping is **not** bit-identical to not capping at 40L (`sum=-4.87432719e+05` capped vs
+  `-4.93343469e+05` uncapped; norm within 0.12%, top5 identical). Two calls of 2,048
+  versus one of 6,144 group the expert blocks differently, so the FP reduction order
+  changes. Expected reassociation, not a defect.
+- The output-block hoist moved the 4-layer logits norm by −0.35%, outside a pre-registered
+  0.2% gate. **The gate was mis-specified, not the code wrong:** it assumed the hoist only
+  reorders same-precision arithmetic, but the down-projection accumulator `block_new_lst`
+  is bf16, so the baseline rounds the partial sum to bf16 *between* contraction blocks
+  while the hoist accumulates both in fp32 PSUM and rounds once. bf16's relative quantum is
+  ~2⁻⁹ ≈ 0.2%, so a 0.35% shift is the expected size — and the hoisted path has **one fewer
+  rounding**, i.e. it is the more accurate of the two. Tokens are identical either way.
+
+#### BF16 prefill at the targeted N=20,000 long-context regime
+
 | Test | Framework | Config | Latency | Prompt tok/s |
 |---|---|---|---|---|
 | **beta-5 container, per-GQA-layer rope-KV, same source (compiler-only win, bit-identical, reproduced 9.768 s / 4,095.2)** | PyTorch Native | BS=2, N=20000 each, bucket=1024, pg256, splits=4 | **9.761 s** | **4,097.9 aggregate** |

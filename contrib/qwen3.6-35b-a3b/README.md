@@ -37,9 +37,31 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 
 | Phase | Best | Config | Recipe |
 |---|---|---|---|
-| **Prefill** | **4,097.9 agg prompt tok/s** | packed **C32 n=4** at **TP=8/LNC=1**, correct per-GQA-layer in-place rope-KV write, both vocab tensors load-time sharded (`PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1`), `--scratchpad-page-size-mb 256`, BS=2, N=20,000, bucket 1024, O1, **beta-5 container** (reproduced 4,095.2, within 0.07%; **+2.4%** over beta-4's 4,002.1; bit-identical fingerprint) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
+| **Prefill (FP8 CTE MoE)** | **4,383.9 agg prompt tok/s** | **FP8 CTE MoE** (`MOE_CTE_FP8=1`) with the **output-block scale grid + PSUM hoist** and the **uncapped route packer** (`MOE_CTE_MAX_TOKENS=0` → 6,144 tokens/MoE call), on the same packed **C32 n=4** DeltaNet at **TP=8/LNC=1**; BS=6, **N=10,000**, bucket 1024, O1, beta-5, **5.08 GB/core** (vs 8.94 BF16). Fingerprint `top5=[220,13,197,198,62]`. **Not a like-for-like swap of the row below — different BS *and* N; see the caveat.** | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) §3d |
+| Prefill (BF16, the long-context headline) | 4,097.9 agg prompt tok/s | packed **C32 n=4** at **TP=8/LNC=1**, correct per-GQA-layer in-place rope-KV write, both vocab tensors load-time sharded (`PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1`), `--scratchpad-page-size-mb 256`, BS=2, **N=20,000**, bucket 1024, O1, **beta-5 container** (reproduced 4,095.2, within 0.07%; **+2.4%** over beta-4's 4,002.1; bit-identical fingerprint) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) §3c |
 | Prefill (TP=4/LNC=2) | 2,791.7 agg prompt tok/s | stable **C32 + 4-stream block-diagonal pack, SBUF-resident, hoisted-transpose finish** (`DN_PACK_C32=1 DN_PACK_N=4`), BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+22.6% over unpacked C32 @ 2,276.9; +33.6% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
 | **Decode** | **681.3 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv + per-layer DeltaNet state (`DN_PERLAYER_STATE=1`), TP=8/LNC=1, O1, **beta-5 container**, seq=256 (**+7.8%** over beta-4's 632.0; **582.3 tok/s** at seq=1024; bit-identical `0cc59fb25112`) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
+
+> **Read the two prefill rows carefully — they are not the same measurement.** The FP8
+> row is BS=6 at N=10,000; the BF16 row is BS=2 at N=20,000, which is the regime this
+> model actually targets. Three things follow:
+>
+> 1. **N differs, and the effect is measured, not assumed:** aggregate tok/s is nearly
+>    flat in prompt length (2,803.6 @5k → 2,790.6 @10k → 2,775.6 @20k on the TP=4 packed-C32
+>    config), because prefill tiles into fixed 1024-token chunks. So N=10,000 flatters a
+>    number by only ~0.5% — small, but it is not zero. **An FP8 run at N=20,000 has not
+>    been done.**
+> 2. **BS differs, and the batch/tokens-per-call tuning was applied only to FP8.** The
+>    nominal +7.0% (4,383.9 vs 4,097.9) is FP8 *plus* the output-block hoist *plus* raising
+>    tokens-per-MoE-call to its measured optimum of 6,144 — not FP8 alone.
+>    **BF16 CTE has never been run at BS=6/bucket 1024**,
+>    so how much of the gap is FP8 rather than tuning is **open**. At the one config where
+>    both were measured (BS=2/bucket 1024), BF16 was *faster*: 4,227.7 vs FP8's 3,920.3 —
+>    the ~7% FP8 dequant tax, which the output-block hoist then removed.
+> 3. **The memory win is unambiguous and needs no caveat:** 5.08 vs 8.94 GB/core, i.e. FP8
+>    prefill runs in 57% of the HBM. That is what FP8 reliably buys here — capacity.
+>
+> Two runs would close this out: FP8 at N=20,000, and BF16 CTE at BS=6/bucket 1024.
 
 Container lineage: the current numbers are on the **beta-5** DLC
 (`concourse-release-0461d3b@sha256:94413ce1ffea…`, built 2026-08-05). Both paths are
@@ -99,6 +121,11 @@ unless noted; combine per the recipes.
 | `MOE_CTE=1` | Long-token nkilib context-encoding MoE kernel for prefill |
 | `MOE_CTE_NKI_PACK=1` | Fused NKI route packer inside the CTE call (replaces compiled `one_hot().cumsum()`); used by the validated BS=2/4 prefill |
 | `MOE_CTE_BLOCK=512` | CTE MoE block size |
+| `MOE_CTE_FP8=1` | Run the CTE MoE experts in **FP8** during prefill — **the fastest prefill path** (§3d of the recipe). Scales are derived at load from the BF16 checkpoint, so no FP8 checkpoint is needed. 5.08 vs 8.94 GB/core |
+| `MOE_CTE_FP8_OUTPUT_BLOCK=1` | Reduce the 256×256 FP8 block-scale grid over the **contraction**-block axis, making the scale chunk-independent. Pair with the hoist below; **+7.9%** together. Requires `patches/nkilib-output-block-quant.patch` |
+| `MOE_CTE_FP8_OB_HOIST=1` | Apply that single scale **once** at the PSUM→SBUF convergence point instead of per contraction chunk (8 Vector ops → 1 for gate_up, 2 → 1 for down). Defaults to follow `MOE_CTE_FP8_OUTPUT_BLOCK`. Setting the grid **without** the patch silently compiles the old op count |
+| `MOE_CTE_MAX_TOKENS=0` | Cap on tokens per MoE call; `0` = uncapped. Now a **tuning knob**, not the old deadlock workaround (that was `nisa.local_gather` in our tiled route packer, since fixed). Optimum is **6,144 tokens/call** and it is **not monotone** — 8,192 is 2.6% *worse* |
+| `MOE_CTE_FORCE_TILED=1` | Force the tiled stable-scan route packer regardless of assignment count (diagnostic; the direct `nonzero_with_count` path handles ≤16,384 assignments) |
 | `MOE_PREFILL_CHUNK` | MoE prefill chunk size (default 128) |
 | `MOE_NKILIB=1` | nkilib fused MoE path (BF16) |
 | `MOE_FP8=1` | Older per-row FP8 grouped-matvec MoE path |

@@ -1,6 +1,14 @@
 # Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32)
 
-Reproduces the fastest validated **prefill** configuration. The current best is
+**Fastest measured: ≈4,384 aggregate prompt tok/s** — the **FP8 CTE MoE** path at
+TP=8/LNC=1, BS=6, **N=10,000**, in **5.08 GB/core**. See **§3d**, and read its scope
+note: that is BS=6/N=10,000, whereas the long-context BF16 headline below is
+BS=2/N=20,000, so the two are not a like-for-like swap.
+
+**Best at the targeted N=20,000 long-context regime: ≈4,096 tok/s** (BF16, §3c). If you
+want the number for this model's stated regime, that is still the one to quote.
+
+Reproduces the fastest validated **prefill** configuration. The BF16 best is
 **≈4,096 aggregate prompt tok/s** at **TP=8/LNC=1** on the **beta-5 container**
 (`concourse-release-0461d3b@sha256:94413ce1ffea…`, built 2026-08-05) with the
 **correct in-place rope-KV write** (one cache buffer per GQA layer) — see §3c and §4.
@@ -38,14 +46,19 @@ is BF16, no FP8 experts needed), `QWEN35_NKILIB_DIR`, `QWEN35_COMPILER_CACHE_DIR
 
 ## 1. Host requirements — compile **and** run on the SAME Trn2
 
-Unlike decode, prefill's best topology is **TP=4 / LNC=2**, which **cannot be
-cross-compiled on Trn1** (LNC=2 fails at `dist.init_process_group("neuron")` on
-Trn1 — Trn1 cross-compile is TP=8/LNC=1 only). So prefill compiles **natively on
-the Trn2** and benches in the same run. No device-to-device transfer step.
+**Prefill's best topology is TP=8 / LNC=1** (§3c BF16, §3d FP8). The TP=4/LNC=2 path
+(§3a) is the simpler fallback — no vocab sharding, no nkilib patch — and it is the only
+one that *cannot* be cross-compiled on Trn1, since LNC=2 fails at
+`dist.init_process_group("neuron")` there (Trn1 cross-compile is TP=8/LNC=1 only).
+
+Either way the simplest route is to compile **natively on the Trn2** and bench in the same
+run — no device-to-device transfer. Cross-compiling on a trn1.32xlarge is worth it only
+when a config's peak host RAM exceeds the Trn2's ~124 GB; the §3d BS=6 config compiles
+natively at `--splits 4` and does **not** need it.
 
 | Item | Requirement |
 |---|---|
-| Host | **Trn2.3xlarge** (`QWEN35_RUN_HOST`), native LNC=2 (4 logical cores) |
+| Host | **Trn2.3xlarge** (`QWEN35_RUN_HOST`); `NEURON_LOGICAL_NC_CONFIG=1` for the fastest TP=8/LNC=1 paths (8 cores), default LNC=2 for §3a (4 logical cores) |
 | **Swap** | **~11 GB swap required** — Trn2 has **none by default**; add a swapfile first (§2) or the compile OOMs |
 | optlevel | **O1 only.** O2/O3 are compile-cost-prohibitive (walrus >51 min on a single 10-layer segment, OOM-risks the box) |
 | Cold compile time | ~27 min at O1 (compiles all regions **and** benches + fingerprints in one run) |
@@ -194,7 +207,8 @@ same page size 256 — a clean compiler-only win. beta-4 changes no numerics.
 > valid build — do not use it as a reference. Root cause and the re-land plan are in
 > `BENCHMARK.md`.
 
-**Re-landed correctly: 4,002.1 tok/s (+9.8%) — current best.** The fix is one cache
+**Re-landed correctly: 4,002.1 tok/s (+9.8%)** — then superseded twice, by beta-5's
+4,097.9 (same source, compiler-only) and by the FP8 CTE path in §3d. The fix is one cache
 buffer per GQA layer (`kv_k = [kv_cache_k[gi].clone() for gi …]`, kernel called with
 `group_index=0, num_groups=1`), so each traced segment mutates each buffer exactly
 once and correctness no longer depends on `--prefill-splits`. Gated at 40 layers,
@@ -269,22 +283,129 @@ traced graph, and the metadata guard refuses to mix it with the LNC=2 cache.
 
 ---
 
+### 3d. Fastest measured — FP8 CTE MoE (≈4,384 tok/s at BS=6/N=10,000, 5.08 GB/core)
+
+Same packed-C32 DeltaNet and same TP=8/LNC=1 topology as §3c, with the MoE experts run
+in **FP8 inside the CTE kernel** (`MOE_CTE_FP8=1`). This supersedes the "FP8 prefill is a
+future lever" note that used to sit in §5.
+
+Three changes together produce the number; each was measured separately:
+
+1. **Output-block FP8 scale grid + PSUM hoist** (`MOE_CTE_FP8_OUTPUT_BLOCK=1
+   MOE_CTE_FP8_OB_HOIST=1`). The 256×256 block-quant grid forced the H contraction into
+   256-element chunks, each needing its own Vector scale-multiply *before* accumulation —
+   62,304 Vector instructions, ~26% of prefill Vector time. Reducing the grid over the
+   *contraction*-block axis makes the scale chunk-independent, so the chunks
+   PSUM-accumulate and are scaled **once**: 8 Vector ops → 1 for gate_up, 2 → 1 for down.
+   Worth **+7.9%**, and it is what erased the FP8 dequant tax.
+2. **Uncapped route packer** (`MOE_CTE_MAX_TOKENS=0`). Raising tokens-per-MoE-call from
+   2,048 to 6,144 amortizes the packer's per-call fixed costs: **+3.3%** at 40L.
+3. **BS=6 / bucket 1024**, which puts tokens-per-MoE-call at exactly its measured
+   optimum. This is **not** monotone — see the scope note.
+
+Two extra requirements on top of §3c's:
+
+- **`patches/nkilib-output-block-quant.patch`** must be applied to the mounted nkilib
+  (adds `is_output_block_quant`, default `False`, so the BF16 and existing block-quant
+  paths are untouched). Without it, `OB=1 HOIST=1` silently compiles the **old op count**
+  and the recipe quietly reverts to baseline speed. Verify with
+  `grep -c is_output_block_quant .../moe_cte/bwmm_shard_on_I.py` (expect ≥1).
+- The `moe_cte` **LNC=1** patch from §3c is still required.
+
+Prefill stays a **BF16-checkpoint** path: the FP8 expert scales are computed at load from
+the BF16 weights, so no FP8 checkpoint is needed. Each layer logs
+`[fp8-cte-quant] … grid=output_block cosine=0.99965 nrmse=0.0265 clipped=0`.
+
+```bash
+source .env
+# BS=6, N=10000, fp8=1, layers=40, splits=4, bucket=1024, block=512,
+# maxtok=0 (uncapped), ob=1, hoist=1
+deploy/run_prefill_fp8_ob.sh 6 10000 1 40 4 1024 512 0 1 1
+```
+
+The graph-affecting environment it sets (copy verbatim if you drive it by hand — the
+persistent cache key is `sha256(HLO) × sha256(target|…|compiler_version|flags)`, so any
+drift is a silent cache miss):
+
+```
+MOE_CTE=1 MOE_CTE_NKI_PACK=1 MOE_CTE_BLOCK=512 MOE_CTE_MAX_TOKENS=0 MOE_CTE_FP8=1
+MOE_CTE_FP8_OUTPUT_BLOCK=1 MOE_CTE_FP8_OB_HOIST=1
+GQA_CTE_PREFILL=1 GQA_DYNAMIC_ROPE_KV=1 GQATAIL=1
+DN_CHUNK_NKI=1 DN_NKI=1 CHUNK_SIZE=32 DN_STABLE_C32=0 DN_PACK_C32=1 DN_PACK_N=4
+DN_K_HEADS=2 DN_V_HEADS=4 GQA_Q_HEADS=2
+PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1
+NEURON_LOGICAL_NC_CONFIG=1 NEURON_SCRATCHPAD_PAGE_SIZE=256
+NEURON_CC_FLAGS="--target trn2 --lnc 1 --optlevel 1 --hbm-scratchpad-page-size 256"
+```
+
+**Measured: 13,686 ms for 6 × 10,000 = 60,000 prompt tokens → 4,383.9 aggregate tok/s**,
+5.08 GB/core, `top5=[220,13,197,198,62]`, all finite.
+
+The 2D config search converged — do not re-sweep it:
+
+| BS | bucket | tok/MoE call | aggregate tok/s |
+|---:|---:|---:|---:|
+| 4 | 1024 | 4,096 | 4,289.2 |
+| **6** | **1024** | **6,144** | **4,383.9** |
+| 8 | 1024 | 8,192 | 4,271.9 (**−2.6%**) |
+| 3 | 2048 | 6,144 | 4,187.5 |
+| 16 | 256 | 4,096 | 3,929.2 |
+
+BS=6/bucket 1024 is a local optimum in **both** dimensions. Tokens-per-call is
+**not monotone** — it peaks at 6,144 and BS=8 is *worse*. Bucket size is not monotone
+either: intra-chunk attention work grows as `S·chunk/2`, so 1024→2048 loses 4.5%. Note
+`tokens/call = BS × bucket` when uncapped, so bucket and batch cannot be varied
+independently.
+
+> **Scope note — what this number does and does not claim.**
+> This is BS=6 at **N=10,000**. The §3c BF16 headline is BS=2 at **N=20,000**, which is the
+> regime the model targets, so the comparison is not like-for-like on either axis.
+> - **N:** aggregate tok/s is nearly flat in prompt length (2,803.6 @5k → 2,790.6 @10k →
+>   2,775.6 @20k, measured), so N=10,000 flatters by only ~0.5%. **An FP8 run at
+>   N=20,000 has not been done.**
+> - **BS:** the batch/tokens-per-call tuning was applied **only to FP8**. **BF16 CTE has
+>   never been run at BS=6/bucket 1024**, so how much of the gap is FP8 versus tuning is
+>   open. At the one config where both were measured (BS=2/bucket 1024) **BF16 was
+>   faster** — 4,227.7 vs FP8's 3,920.3, the ~7% dequant tax that lever 1 then removed.
+> - **Memory needs no caveat:** 5.08 vs 8.94 GB/core. Capacity is what FP8 reliably buys.
+>
+> Two runs would close this: FP8 at N=20,000, and BF16 CTE at BS=6/bucket 1024.
+
+Capping is **not** bit-identical to not capping at 40L (`sum=-4.87432719e+05` capped vs
+`-4.93343469e+05` uncapped, norm within 0.12%, top5 identical): 2 calls of 2,048 versus
+1 call of 6,144 group the expert blocks differently, so the FP reduction order changes.
+That is an expected reassociation, not a defect.
+
+`MOE_CTE_MAX_TOKENS` is now a **tuning knob, not a workaround**. It used to cap
+tokens-per-MoE-call at 2,048 because anything larger deadlocked (`NRT status 5`); that was
+root-caused to `nisa.local_gather` in our own tiled route packer and fixed, so set it to 0
+and pick the largest bucket the activation memory allows.
+
+---
+
 ## 4. Reading the result
 
-The bench reports **aggregate prompt tok/s** (total prompt tokens across the BS=2
-batch ÷ prefill wall-time). References for the two configs:
+The bench reports **aggregate prompt tok/s** (total prompt tokens across the batch ÷
+prefill wall-time). References — **note the BS and N columns before comparing rows**:
 
-| Config | Wall time | Aggregate prompt tok/s |
-|---|---:|---:|
-| **Packed C32 ×4, TP=8/LNC=1, per-GQA-layer rope-KV, beta-5 container** (reproduced 9.768 s / 4,095.2) | **9.761 s** | **4,097.9** |
-| **Packed C32 ×4, TP=8/LNC=1, in-place rope-KV write (per-GQA-layer buffers), beta-4** | **9.995 s** | **4,002.1** |
-| Packed C32 ×4, TP=8/LNC=1, cache returned as graph output, beta-4 | 10.974 s | 3,645.0 |
-| **Packed C32 ×4, TP=8/LNC=1** (§3c, vocab-sharded head+embed, pg256; pre-hoisted-transpose) | **11.572 s** | **3,456.8** |
-| Packed C32 ×4, SBUF-resident + hoisted-transpose finish, TP=4/LNC=2 (`DN_PACK_C32=1 DN_PACK_N=4`) — LNC=2 default | 14.328 s | 2,791.7 |
-| Packed C32 ×4, SBUF-resident + transpose-once finish, TP=4/LNC=2 | 14.411 s | 2,775.6 |
-| Packed C32 ×2 (`DN_PACK_N=2`), TP=4/LNC=2 | 15.620 s | 2,560.9 |
-| Unpacked C32 (`DN_PACK_C32=0`), TP=4/LNC=2 | 17.568 s | 2,276.9 |
-| Paired C16, TP=4/LNC=2 | 19.141 s | 2,089.7 |
+| Config | BS | N | Wall time | Aggregate prompt tok/s |
+|---|---:|---:|---:|---:|
+| **FP8 CTE MoE + output-block hoist + uncapped packer, TP=8/LNC=1** (§3d, 5.08 GB/core) | **6** | **10,000** | **13.686 s** | **4,383.9** |
+| FP8 CTE, same levers, BS=4 (§3d table) | 4 | 10,000 | 9.326 s | 4,289.2 |
+| BF16 CTE, the one config where BF16 and FP8 were both measured | 2 | 10,000 | — | 4,227.7 |
+| FP8 CTE *before* the output-block hoist, same BS/bucket as the row above | 2 | 10,000 | — | 3,920.3 |
+
+| Config (BF16, the targeted N=20,000 regime) | BS | N | Wall time | Aggregate prompt tok/s |
+|---|---:|---:|---:|---:|
+| **Packed C32 ×4, TP=8/LNC=1, per-GQA-layer rope-KV, beta-5 container** (reproduced 9.768 s / 4,095.2) | 2 | 20,000 | **9.761 s** | **4,097.9** |
+| **Packed C32 ×4, TP=8/LNC=1, in-place rope-KV write (per-GQA-layer buffers), beta-4** | 2 | 20,000 | **9.995 s** | **4,002.1** |
+| Packed C32 ×4, TP=8/LNC=1, cache returned as graph output, beta-4 | 2 | 20,000 | 10.974 s | 3,645.0 |
+| **Packed C32 ×4, TP=8/LNC=1** (§3c, vocab-sharded head+embed, pg256; pre-hoisted-transpose) | 2 | 20,000 | **11.572 s** | **3,456.8** |
+| Packed C32 ×4, SBUF-resident + hoisted-transpose finish, TP=4/LNC=2 (`DN_PACK_C32=1 DN_PACK_N=4`) — LNC=2 default | 2 | 20,000 | 14.328 s | 2,791.7 |
+| Packed C32 ×4, SBUF-resident + transpose-once finish, TP=4/LNC=2 | 2 | 20,000 | 14.411 s | 2,775.6 |
+| Packed C32 ×2 (`DN_PACK_N=2`), TP=4/LNC=2 | 2 | 20,000 | 15.620 s | 2,560.9 |
+| Unpacked C32 (`DN_PACK_C32=0`), TP=4/LNC=2 | 2 | 20,000 | 17.568 s | 2,276.9 |
+| Paired C16, TP=4/LNC=2 | 2 | 20,000 | 19.141 s | 2,089.7 |
 
 A per-run token-ID/state fingerprint is printed for correctness; the warm and
 timed fingerprints must be identical and finite. Compare across builds to confirm
@@ -296,8 +417,12 @@ identical output.
 
 - **BS=4** also fits at 512-token buckets and measured 39.788 s / 2,010.6
   aggregate tok/s (paired C16). BS=1 single-prompt best is 1,482.8 tok/s.
-- **FP8 prefill** is a future lever (nkilib `moe_cte` MX variant), not yet
-  integrated — this recipe is BF16.
+- **FP8 prefill is integrated and is now the fastest measured path** — see **§3d**
+  (≈4,384 tok/s at BS=6/N=10,000, 5.08 vs 8.94 GB/core). §3a–3c remain BF16. FP8 needed
+  three things to become a *speed* win rather than only a capacity win: the output-block
+  scale grid + PSUM hoist (+7.9%, which removed the ~7% dequant tax), the uncapped route
+  packer (+3.3%), and BS=6 to hit the tokens-per-MoE-call optimum. Read §3d's scope note
+  before quoting it against §3c.
 - Do **not** raise optlevel; O2/O3 do not finish in reasonable time/RAM here, and
   O3 does not extract any extra prefill throughput (measured flat at 2,273.5 tok/s
   after a ~3h45m compile, and it perturbs numerics slightly).
