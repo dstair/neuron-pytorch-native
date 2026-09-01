@@ -1,0 +1,11 @@
+Parameterize is_block_quant on blockwise_mm_baseline_shard_intermediate_hybrid so the
+FP8xFP8 CTE prefill path (moe_cte_fp8_35b.py) can select the shared compute_one_block
+double_row (256x256 block-quant) path. Default False -> BF16 hybrid callers unchanged.
+Apply on top of nkilib-lnc1-moe-cte.patch. Target: nkilib rev 1ee625782,
+src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py
+
+--- a/bwmm_shard_on_I.py   (hybrid signature: after `down_activations=None,`, before `# meta parameters`)
++    is_block_quant: bool = False,
+--- a/bwmm_shard_on_I.py   (hybrid Configs(...) block)
+-        is_block_quant=False,
++        is_block_quant=is_block_quant,

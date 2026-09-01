@@ -1,0 +1,16 @@
+--- a/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py
++++ b/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py
+@@ -645,13 +645,14 @@
+     nisa.register_load(cond_reg, cond_sbuf)
+     block_idx = nl.ndarray((1, 1), buffer=nl.sbuf, dtype=nl.int32)
+     nisa.memset(block_idx, value=NUM_STATIC_BLOCKS)
+-    for i in nl.dynamic_range(NUM_STATIC_BLOCKS, cond_reg):
++    def _dyn_block_body(i):
+         compute_one_block(block_idx, dims, inps, outs, configs, SHARD_ID)
+         if dims.NUM_SHARDS == 2:
+             nisa.core_barrier(output, (0, 1))
+         nisa.tensor_scalar(dst=block_idx, data=block_idx, op0=nl.add, operand0=1)
+         if dims.NUM_SHARDS == 2:
+             nisa.core_barrier(block_idx, (0, 1))
++    nl.fori_loop(NUM_STATIC_BLOCKS, cond_reg, _dyn_block_body)
+     return output
