@@ -28,13 +28,31 @@
 # script -- the cache write finalizes at compile time, before load. Gate on the NEFF
 # count in the cache, never on the exit code.
 #
-# usage: xc_prefill_fp8_trn1.sh [bs] [n] [fp8] [layers] [splits] [bucket] [blk] [maxtok] [ob] [hoist]
+# usage: xc_prefill_fp8_trn1.sh [bs] [n] [fp8] [layers] [splits] [bucket] [blk] [maxtok] [ob] [hoist] [dbginfo]
 # default = the BS=16 sibling of the 4,289.2 tok/s record (bs4 n10000 l40 s4 bc1024 mt0 ob1 ho1)
+#
+# dbginfo=1 adds XLA_IR_DEBUG / XLA_HLO_DEBUG / NEURON_FRAMEWORK_DEBUG so the NEFF
+# carries nki_source_location and a profile can attribute instructions to source lines.
+# Without it ~36% of instruction time lands in <unattributed> (measured 2026-08-22 at
+# BS=6), which is enough to make a component ranking meaningless -- bwmm read as 1.54 ms
+# purely because its source locations were missing.
+#
+# These flags CHANGE THE HLO, hence the cache key, so a dbginfo NEFF is a DIFFERENT
+# cache entry from the shipping one. Hence the -dbg tag suffix: a debug NEFF must never
+# be served to a timed run, and a profiling compile must never invalidate a timing
+# cache. Profile with it; never quote a throughput number from it.
 set -uo pipefail
 BS="${1:-16}"; N="${2:-10000}"; FP8="${3:-1}"; LAYERS="${4:-40}"; SPLITS="${5:-4}"
 BUCKET="${6:-1024}"; BLK="${7:-512}"; MAXTOK="${8:-0}"
-OB="${9:-1}"; HOIST="${10:-1}"
+OB="${9:-1}"; HOIST="${10:-1}"; DBGINFO="${11:-0}"
 MAXSEQ=$(( ( (N + BUCKET - 1) / BUCKET ) * BUCKET ))
+if [[ "$DBGINFO" == "1" ]]; then
+  DBG_ENV=(-e XLA_IR_DEBUG=1 -e XLA_HLO_DEBUG=1 -e NEURON_FRAMEWORK_DEBUG=1)
+  DBG_TAG="-dbg"
+else
+  DBG_ENV=()
+  DBG_TAG=""
+fi
 
 WORK=/mnt/nvme/lnc1-work
 IMAGE=421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -42,7 +60,7 @@ MODEL=/mnt/nvme/Qwen3.5-35B-A3B
 NKILIB=$WORK/nki-library
 SRC=$WORK/src/contrib/qwen3.6-35b-a3b
 SHIM=$WORK/shim/libnrt_platform_target_override.so
-TAG=bs${BS}-n${N}-l${LAYERS}-s${SPLITS}-bc${BUCKET}-blk${BLK}-mt${MAXTOK}-fp8${FP8}-ob${OB}-ho${HOIST:-d}
+TAG=bs${BS}-n${N}-l${LAYERS}-s${SPLITS}-bc${BUCKET}-blk${BLK}-mt${MAXTOK}-fp8${FP8}-ob${OB}-ho${HOIST:-d}${DBG_TAG}
 LOG=$WORK/logs/xc_prefill_${TAG}.log
 CACHE=$WORK/cache-xc-${TAG}
 NAME=q35-xc-prefill-${TAG}
@@ -108,7 +126,7 @@ mkdir -p "$CACHE"
   echo "START $(date -u +%FT%TZ) tag=$TAG"
   echo "  host=$(hostname) image=$(docker image inspect --format '{{.Id}}' "$IMAGE")"
   echo "  maxseq=$MAXSEQ splits=$SPLITS blk=$BLK maxtok=$MAXTOK ob=$OB hoist=$HOIST"
-  echo "  platform_preflight=$PLATFORM cache=$CACHE"
+  echo "  platform_preflight=$PLATFORM cache=$CACHE dbginfo=$DBGINFO"
   echo "  src_py_md5=$(cd "$SRC" && find . -name '*.py' -not -path '*/__pycache__/*' \
         | sort | xargs md5sum | md5sum | awk '{print $1}')"
 } | tee -a "$LOG"
@@ -131,6 +149,7 @@ docker run --rm --name "$NAME" --privileged --network host --ipc host \
   -e DN_NKI=1 -e GQATAIL=1 -e PREFILL_FINGERPRINT=1 \
   -e DN_K_HEADS=2 -e DN_V_HEADS=4 -e GQA_Q_HEADS=2 \
   -e PREFILL_SHARDED_LM_HEAD=1 -e PREFILL_SHARDED_EMBED=1 \
+  ${DBG_ENV[@]+"${DBG_ENV[@]}"} \
   -e PYTHONPATH=/nki-library/src/nkilib_src \
   -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$SHIM":/opt/qwen35/libnrt_platform_target_override.so:ro \
