@@ -37,7 +37,7 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 
 | Phase | Best | Config | Recipe |
 |---|---|---|---|
-| **Prefill (FP8 CTE MoE)** | **4,370.8 agg prompt tok/s** | **FP8 CTE MoE** (`MOE_CTE_FP8=1`) with the **output-block scale grid + PSUM hoist** and the **uncapped route packer** (`MOE_CTE_MAX_TOKENS=0` → 6,144 tokens/MoE call), on the same packed **C32 n=4** DeltaNet at **TP=8/LNC=1**; BS=6, **N=10,000**, bucket 1024, O1, beta-5, **5.08 GB/core** (vs 8.94 BF16). Fingerprint `top5=[220,13,197,198,62]`. Measured at BS=6/N=10,000 — see the scope note. Was published as 4,383.9; see the reproduction note. | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) §3d |
+| **Prefill (FP8 CTE MoE)** | **4,370.6 agg prompt tok/s** | **FP8 CTE MoE** (`MOE_CTE_FP8=1`) with the **output-block scale grid + PSUM hoist** and the **uncapped route packer** (`MOE_CTE_MAX_TOKENS=0` → 6,144 tokens/MoE call), on the same packed **C32 n=4** DeltaNet at **TP=8/LNC=1**; BS=6, **N=10,000**, bucket 1024, O1, beta-5, **5.08 GB/core** (BF16 CTE is 8.95 at BS=2 — different batch, see the scope note). Fingerprint `top5=[220,13,197,198,62]`. Measured at BS=6/N=10,000 — see the scope note. Was published as 4,383.9; see the reproduction note. | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) §3d |
 | **Decode** | **681.3 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv + per-layer DeltaNet state (`DN_PERLAYER_STATE=1`), TP=8/LNC=1, O1, **beta-5 container**, seq=256 (**+7.8%** over beta-4's 632.0; **582.3 tok/s** at seq=1024; bit-identical `0cc59fb25112`) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
 
 > **Scope of the prefill headline: it is BS=6 at N=10,000, not the 20,000-token regime
@@ -61,11 +61,13 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 >
 > Two runs would close this out: FP8 at N=20,000, and BF16 CTE at BS=6/bucket 1024.
 
-> **Reproduction note — the FP8 prefill headline was 4,383.9 and is now 4,370.8 (−0.30%).**
+> **Reproduction note — the FP8 prefill headline was 4,383.9 and is now 4,370.6 (−0.30%).**
 > The 4,383.9 figure was measured 2026-08-22 on a trn2.3xlarge that has since been terminated,
 > and whose host neuron stack was never recorded. Re-measured 2026-09-02 on a fresh
 > trn2.3xlarge (host driver 2.30.2 / runtime 2.34.10) with md5-identical source, nkilib and
-> container image: **13,727.5 ms → 4,370.8 tok/s**, same fingerprint. Run-to-run spread on that
+> container image: **13,727.5 ms → 4,370.8 tok/s** on the untiled kernel, and **13,728.2 ms →
+> 4,370.6 tok/s** on the conditional-tiling kernel that actually ships (0.005% apart), both with
+> the same fingerprint. The headline quotes the shipping build. Run-to-run spread on that
 > box is **0.026%**, so the residual −0.30% is a real host-stack difference, not variance — but
 > with the old box gone there is nothing to A/B against, so it is recorded rather than chased.
 >

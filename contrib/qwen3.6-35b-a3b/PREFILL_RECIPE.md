@@ -338,7 +338,7 @@ NEURON_LOGICAL_NC_CONFIG=1 NEURON_SCRATCHPAD_PAGE_SIZE=256
 NEURON_CC_FLAGS="--target trn2 --lnc 1 --optlevel 1 --hbm-scratchpad-page-size 256"
 ```
 
-**Measured: 13,727.5 ms for 6 × 10,000 = 60,000 prompt tokens → 4,370.8 aggregate tok/s**,
+**Measured: 13,728.2 ms for 6 × 10,000 = 60,000 prompt tokens → 4,370.6 aggregate tok/s**,
 5.08 GB/core, `top5=[220,13,197,198,62]`, all finite. (2026-09-02, trn2.3xlarge; the specific
 instance is in the gitignored `.env`.)
 
@@ -351,7 +351,7 @@ aws-neuronx-collectives 2.34.10.0-74eaafac6   aws-neuronx-tools 2.32.28.0-526c2b
 kernel 6.17.0-1019-aws
 ```
 
-> **This was published as 4,383.9 and is now 4,370.8.** That figure came from 2026-08-22 on
+> **This was published as 4,383.9 and is now 4,370.6.** That figure came from 2026-08-22 on
 > a trn2.3xlarge since terminated, with its host stack unrecorded. On the current
 > box, same source/nkilib/image md5s and same fingerprint, it re-measures 0.30% lower against
 > a run-to-run spread of 0.026% — a real host difference with nothing left to A/B against.
@@ -362,7 +362,7 @@ kernel 6.17.0-1019-aws
 > `kernels/moe_cte_35b.py`, "Materialize block expert IDs".
 
 The 2D config search converged — do not re-sweep it. **Every row below was measured on the
-now-terminated box with the untiled kernel**, so read them against 4,383.9, not 4,370.8; the
+now-terminated box with the untiled kernel**, so read them against 4,383.9, not 4,370.6; the
 shape of the optimum is what they establish, and that is unaffected:
 
 | BS | bucket | tok/MoE call | aggregate tok/s |
@@ -414,7 +414,7 @@ prefill wall-time). References — **note the BS and N columns before comparing 
 
 | Config | BS | N | Wall time | Aggregate prompt tok/s |
 |---|---:|---:|---:|---:|
-| **FP8 CTE MoE + output-block hoist + uncapped packer, TP=8/LNC=1** (§3d, 5.08 GB/core) | **6** | **10,000** | **13.728 s** | **4,370.8** (was 13.686 s / 4,383.9 on the terminated box — §3d note) |
+| **FP8 CTE MoE + output-block hoist + uncapped packer, TP=8/LNC=1** (§3d, 5.08 GB/core) | **6** | **10,000** | **13.728 s** | **4,370.6** (was 13.686 s / 4,383.9 on the terminated box — §3d note) |
 | FP8 CTE, same levers, BS=4 (§3d table) | 4 | 10,000 | 9.326 s | 4,289.2 |
 | BF16 CTE, the one config where BF16 and FP8 were both measured | 2 | 10,000 | — | 4,227.7 |
 | FP8 CTE *before* the output-block hoist, same BS/bucket as the row above | 2 | 10,000 | — | 3,920.3 |
