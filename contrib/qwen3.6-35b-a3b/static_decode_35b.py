@@ -1475,6 +1475,23 @@ class StaticDecode35B(nn.Module):
             return self._moe_fused_w8_parts(i, x2d)
         return self._moe_reference_parts(i, x2d)
 
+    def _shared_expert_parts(self, i, xf):
+        """(sg, sh) for layer i, UNMULTIPLIED -- distinct from _shared_expert above,
+        which returns the product sg*sh. The parts are needed separately because the
+        MOE_SHARED_TP fold multiplies sg into a per-rank PARTIAL before the all-reduce.
+
+        sg is [T,1] and identical on every rank (xf and sh_sigmoid are both
+        replicated), which is what makes that fold exact. Under MOE_SHARED_TP, sh is
+        this rank's partial over the shared intermediate dim; otherwise it is the full
+        shared output."""
+        sg = torch.sigmoid(F.linear(xf, getattr(self, f"l{i}_sh_sigmoid").float()))
+        sh = F.linear(
+            F.silu(F.linear(xf, getattr(self, f"l{i}_sh_gate").float()))
+            * F.linear(xf, getattr(self, f"l{i}_sh_up").float()),
+            getattr(self, f"l{i}_sh_down").float(),
+        )
+        return sg, sh
+
     def _moe_cte(self, i, x2d, lead):
         """Long-token MoE using nkilib's blockwise context-encoding kernel."""
         T = x2d.shape[0]
@@ -1486,6 +1503,21 @@ class StaticDecode35B(nn.Module):
             raise ValueError("MOE_CTE_NKI_PACK supports MOE_CTE_BLOCK=256 or 512")
 
         xf = x2d.float()
+        # MOE_SHARED_TP=1 must fold the shared partial in BEFORE the all-reduce, which
+        # puts the shared-expert matmuls ON the collective's critical path -- in the
+        # replicated form they instead compute CONCURRENTLY with the all-reduce and are
+        # added after it. Measured cost of losing that overlap: -0.28% at 40L/seq10k
+        # (4,358.2 vs 4,370.6) despite removing ~44% of per-rank MoE MACs.
+        #
+        # The shared expert depends only on xf, so emit it HERE, before the routed
+        # kernel, and let it overlap the routed MoE instead of the collective.
+        # MOE_SHARED_HOIST=0 reverts to emitting it at the original site, which is what
+        # the -0.28% measurement used.
+        _sh_hoist = (
+            USE_MOE_SHARED_TP
+            and os.environ.get("MOE_SHARED_HOIST", "1") == "1"
+        )
+        _sh_pre = self._shared_expert_parts(i, xf) if _sh_hoist else None
         logits = F.linear(xf, getattr(self, f"l{i}_router").float())
         rw = F.softmax(logits, dim=1, dtype=torch.float)
         rw_top, sel = torch.topk(rw, D.TOP_K, dim=-1)
@@ -1556,14 +1588,8 @@ class StaticDecode35B(nn.Module):
         if os.environ.get("MOE_CTE_SYNC_BEFORE_SHARED", "0") == "1":
             torch.neuron.synchronize()
 
-        # sg is [T,1] and identical on every rank (xf and sh_sigmoid are both
-        # replicated), which is what makes the sharded fold below exact.
-        sg = torch.sigmoid(F.linear(xf, getattr(self, f"l{i}_sh_sigmoid").float()))
-        sh = F.linear(
-            F.silu(F.linear(xf, getattr(self, f"l{i}_sh_gate").float()))
-            * F.linear(xf, getattr(self, f"l{i}_sh_up").float()),
-            getattr(self, f"l{i}_sh_down").float(),
-        )
+        # Reuse the hoisted value when MOE_SHARED_HOIST=1, else emit it here.
+        sg, sh = _sh_pre if _sh_pre is not None else self._shared_expert_parts(i, xf)
         if USE_MOE_SHARED_TP:
             # sh is this rank's PARTIAL over the shared intermediate dim, so fold it
             # in before the reduce and let the existing all-reduce sum it:
