@@ -5,13 +5,10 @@
 # usage: run_prefill_fp8_cte_test.sh [layers] [bs] [bucket] [fp8=0|1]
 set -uo pipefail
 LAYERS="${1:-4}"; BS="${2:-1}"; BUCKET="${3:-1024}"; FP8="${4:-1}"
-IMAGE=421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-MODEL=/mnt/nvme/Qwen3.5-35B-A3B
-NKILIB=/mnt/nvme/lnc1-work/nki-library
-SRC=/mnt/nvme/lnc1-work/src/contrib/qwen3.6-35b-a3b
+. "$(dirname "$0")/bench_env.sh"   # IMAGE/MODEL/NKILIB/SRC/WORK from .env or derived
 TAG=l${LAYERS}-bs${BS}-b${BUCKET}-fp8${FP8}
-LOG=/mnt/nvme/lnc1-work/logs/prefill_fp8cte_${TAG}.log
-mkdir -p /mnt/nvme/lnc1-work/logs
+LOG=$WORK/logs/prefill_fp8cte_${TAG}.log
+mkdir -p $WORK/logs
 NAME=q35-prefill-fp8cte-${TAG}
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 if grep -q "only work on TRN2" "$NKILIB/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py"; then
@@ -32,7 +29,7 @@ docker run --rm --name "$NAME" --privileged --network host --ipc host \
   -e PYTHONPATH=/nki-library/src/nkilib_src \
   -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$SRC":/work:ro -v "$NKILIB":/nki-library:ro \
-  -v /mnt/nvme/lnc1-work/nbackend:/tmp/neuron_backend \
+  -v $WORK/nbackend:/tmp/neuron_backend \
   -v "$MODEL":/models/Qwen3.5-35B-A3B:ro \
   -w /work "$IMAGE" bash -lc "
     source /opt/torch-neuronx/.venv/bin/activate 2>/dev/null || true

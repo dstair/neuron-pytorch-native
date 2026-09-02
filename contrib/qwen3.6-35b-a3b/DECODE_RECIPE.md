@@ -15,7 +15,7 @@ occupancy gate on both arms. Requires `DN_DIRECT_STATE_OUT=1`.
 
 **beta-5 (2026-08-10): 681.3 tok/s, +7.8% over beta-4's 632.0**, gen hash
 `0cc59fb25112` (== the beta-4 2-token reference) — a clean compiler-only win on the
-newer DLC (`sha256:94413ce1ffea…`, built 2026-08-05), bit-identical. At **seq=1024**
+newer DLC (beta-5, built 2026-08-05), bit-identical. At **seq=1024**
 the same stack decodes **582.3 tok/s** (219.83 ms/tok) — −14.5% vs seq=256, the cost
 of the 4× larger KV cache (GQA reads the full `max_seq_len` cache each step; module
 grows 7.09 → 8.10 GB/core). See §3 and the seq-length note there. All numbers below

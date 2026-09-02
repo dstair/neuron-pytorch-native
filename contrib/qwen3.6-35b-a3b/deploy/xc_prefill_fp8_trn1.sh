@@ -54,11 +54,7 @@ else
   DBG_TAG=""
 fi
 
-WORK=/mnt/nvme/lnc1-work
-IMAGE=421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-MODEL=/mnt/nvme/Qwen3.5-35B-A3B
-NKILIB=$WORK/nki-library
-SRC=$WORK/src/contrib/qwen3.6-35b-a3b
+. "$(dirname "$0")/bench_env.sh"   # IMAGE/MODEL/NKILIB/SRC/WORK from .env or derived
 SHIM=$WORK/shim/libnrt_platform_target_override.so
 TAG=bs${BS}-n${N}-l${LAYERS}-s${SPLITS}-bc${BUCKET}-blk${BLK}-mt${MAXTOK}-fp8${FP8}-ob${OB}-ho${HOIST:-d}${DBG_TAG}
 LOG=$WORK/logs/xc_prefill_${TAG}.log

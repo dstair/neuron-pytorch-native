@@ -4,11 +4,9 @@
 # usage: run_test_fp8_cte.sh [tokens] [hidden] [intermediate] [block_size] [min_cosine]
 set -uo pipefail
 TOK="${1:-512}"; HID="${2:-512}"; INT="${3:-512}"; BLK="${4:-256}"; COS="${5:-0.95}"; LNC="${6:-1}"
-IMAGE=421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-NKILIB=/mnt/nvme/lnc1-work/nki-library
-SRC=/mnt/nvme/lnc1-work/src/contrib/qwen3.6-35b-a3b
-LOG=/mnt/nvme/lnc1-work/logs/test_fp8_cte.log
-mkdir -p /mnt/nvme/lnc1-work/logs
+. "$(dirname "$0")/bench_env.sh"   # IMAGE/MODEL/NKILIB/SRC/WORK from .env or derived
+LOG=$WORK/logs/test_fp8_cte.log
+mkdir -p $WORK/logs
 NAME=q35-test-fp8-cte
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # fail loudly if the nkilib LNC=1 patch is missing (the baseline is_block_quant path
@@ -27,7 +25,7 @@ docker run --rm --name "$NAME" --privileged --network host --ipc host \
   -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$SRC":/work:ro \
   -v "$NKILIB":/nki-library:ro \
-  -v /mnt/nvme/lnc1-work/nbackend:/tmp/neuron_backend \
+  -v $WORK/nbackend:/tmp/neuron_backend \
   -w /work "$IMAGE" bash -lc "
     source /opt/torch-neuronx/.venv/bin/activate 2>/dev/null || true
     python3 kernels/tests/test_moe_cte_fp8_device.py \

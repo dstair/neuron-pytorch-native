@@ -9,7 +9,12 @@
 set -uo pipefail
 TAG="${1:?usage: ingest.sh <tag>}"
 W=${W:-/mnt/nvme/lnc1-work/profile}
-IMAGE=${IMAGE:-421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest}
+IMAGE="${IMAGE:-${QWEN35_NATIVE_IMAGE:-}}"
+if [ -z "${IMAGE:-}" ]; then
+  echo "error: set IMAGE (or QWEN35_NATIVE_IMAGE) to the Neuron DLC reference." >&2
+  echo "  It embeds an AWS account id, so it lives in the gitignored .env, not here." >&2
+  exit 2
+fi
 
 docker run --rm --privileged -v /opt/aws/neuron/lib:/host_neuron_lib:ro \
   -v "$W":/work -w /work "$IMAGE" bash -lc "

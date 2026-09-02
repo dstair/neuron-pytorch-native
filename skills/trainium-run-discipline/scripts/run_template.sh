@@ -13,7 +13,12 @@
 set -uo pipefail
 BS="${1:-2}"; N="${2:-10000}"; LAYERS="${3:-40}"; SPLITS="${4:-4}"; CHUNK="${5:-1024}"
 
-IMAGE=421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+IMAGE="${IMAGE:-${QWEN35_NATIVE_IMAGE:-}}"
+if [ -z "${IMAGE:-}" ]; then
+  echo "error: set IMAGE (or QWEN35_NATIVE_IMAGE) to the Neuron DLC reference." >&2
+  echo "  It embeds an AWS account id, so it lives in the gitignored .env, not here." >&2
+  exit 2
+fi
 MODEL=/mnt/nvme/Qwen3.5-35B-A3B
 SRC=/mnt/nvme/lnc1-work/src/contrib/qwen3.6-35b-a3b
 NKILIB=/mnt/nvme/lnc1-work/nki-library

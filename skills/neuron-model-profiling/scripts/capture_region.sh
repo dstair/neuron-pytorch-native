@@ -21,7 +21,12 @@ TAG="${1:?usage: capture_region.sh <tag> [nranks]}"
 NRANKS="${2:-8}"
 
 W=${W:-/mnt/nvme/lnc1-work/profile}
-IMAGE=${IMAGE:-421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest}
+IMAGE="${IMAGE:-${QWEN35_NATIVE_IMAGE:-}}"
+if [ -z "${IMAGE:-}" ]; then
+  echo "error: set IMAGE (or QWEN35_NATIVE_IMAGE) to the Neuron DLC reference." >&2
+  echo "  It embeds an AWS account id, so it lives in the gitignored .env, not here." >&2
+  exit 2
+fi
 LOG=$W/cap_${TAG}.log
 
 echo "START $(date -u +%FT%TZ) capture tag=$TAG ranks=$NRANKS" > "$LOG"

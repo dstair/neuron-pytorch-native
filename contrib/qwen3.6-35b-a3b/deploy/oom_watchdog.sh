@@ -7,7 +7,8 @@ FLOOR_GB="${1:-10}"
 # exit immediately ("container gone") before the new container had started.
 MARK="/tmp/watchdog_seen_$$"
 trap 'rm -f "$MARK"' EXIT
-LOG=/mnt/nvme/lnc1-work/logs/oom_watchdog.log
+BENCH_ENV_REQUIRE_IMAGE=0 . "$(dirname "$0")/bench_env.sh"   # $WORK
+LOG=$WORK/logs/oom_watchdog.log
 echo "watchdog start $(date -u +%FT%TZ) floor=${FLOOR_GB}GB" >> "$LOG"
 while true; do
   AVAIL=$(awk '/MemAvailable/ {printf "%d", $2/1048576}' /proc/meminfo)

@@ -14,7 +14,7 @@ Several facts here are version-bound and **will** age:
 
 | component | version these skills were written against |
 |---|---|
-| DLC image | `421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest` |
+| DLC image | beta-5, built 2026-08-05 — an internal pre-release; the reference and digest are in the gitignored `.env` as `QWEN35_NATIVE_IMAGE` |
 | Neuron SDK | 2.32 toolchain (`neuronx-cc` 2.27, `nki` 0.6.0) |
 | driver / runtime | driver 2.29, `nrt` 2.33 |
 | hardware | trn2.3xlarge (`NEURON_LOGICAL_NC_CONFIG=1` → 8 cores, TP=8/LNC=1) |

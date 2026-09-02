@@ -21,7 +21,7 @@ NEFF survives.
 
 ```bash
 cd <repo>/contrib/qwen3.6-35b-a3b
-export QWEN35_NATIVE_IMAGE=<concourse DLC image>
+export QWEN35_NATIVE_IMAGE=<internal Neuron DLC image reference>
 export QWEN35_MODEL_DIR=/mnt/nvme/models/Qwen3.5-35B-A3B
 export QWEN35_FP8_MODEL_DIR=/mnt/nvme/models/Qwen3.5-35B-A3B-FP8   # FP8 mode REQUIRES this
 export QWEN35_NKILIB_DIR=/mnt/nvme/nki-library

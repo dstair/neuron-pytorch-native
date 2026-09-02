@@ -18,7 +18,8 @@ set -uo pipefail
 NAME="${1:?usage: xc_oom_watchdog.sh <container-name> [threshold_gb] [interval_s]}"
 THRESHOLD_GB="${2:-45}"
 INTERVAL="${3:-20}"
-LOG=/mnt/nvme/lnc1-work/logs/xc_oom_watchdog_${NAME}.log
+BENCH_ENV_REQUIRE_IMAGE=0 . "$(dirname "$0")/bench_env.sh"   # $WORK
+LOG=$WORK/logs/xc_oom_watchdog_${NAME}.log
 
 echo "watchdog START $(date -u +%FT%TZ) container=$NAME threshold=${THRESHOLD_GB}GB" >>"$LOG"
 while true; do

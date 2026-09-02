@@ -4,7 +4,7 @@ Assessment of the vLLM-Neuron port of Qwen3.6-35B-A3B against this repo's
 PyTorch-Native implementation, and of the Gated DeltaNet (GDN) kernels on both
 sides.
 
-**Source pinned:** `/home/dstair/dev/vllm-neuron`, branch `origin/add-qwen36-moe`,
+**Source pinned:** a local `vllm-neuron` checkout, branch `origin/add-qwen36-moe`,
 tip commit **`65ef8b7`**. Nothing on that branch was modified or checked out; all
 inspection was read-only git plumbing. Paths below of the form
 `vllm_neuron/...` or `Qwen3.6-35B-A3B/...` refer to that commit.
@@ -164,8 +164,8 @@ Three independent blockers. Each would have to be cleared; none is a code change
 
 ### 4a. Topology — the binding one
 
-Their recipe is TP=8. Our Trn2 (`i-0a5d22f9bb7fd47e1`, **trn2.3xlarge**, running,
-`ap-southeast-4c`) is **1 chip / 8 physical NeuronCores / 96 GB**, which
+Their recipe is TP=8. Our Trn2 (a **trn2.3xlarge**) is **1 chip / 8 physical
+NeuronCores / 96 GB**, which
 `neuron-ls` presents as **4 logical cores × 24 GB at LNC=2**. Their validation
 host is a **trn2.48xlarge** — 16 chips / 64 logical cores.
 

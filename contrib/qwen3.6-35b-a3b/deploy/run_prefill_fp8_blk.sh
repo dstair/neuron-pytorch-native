@@ -10,19 +10,16 @@ set -uo pipefail
 BS="${1:-2}"; N="${2:-1024}"; FP8="${3:-1}"; LAYERS="${4:-4}"; SPLITS="${5:-2}"
 BUCKET="${6:-1024}"; BLK="${7:-256}"
 MAXSEQ=$(( ( (N + BUCKET - 1) / BUCKET ) * BUCKET ))
-IMAGE=421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-MODEL=/mnt/nvme/Qwen3.5-35B-A3B
-NKILIB=/mnt/nvme/lnc1-work/nki-library
-SRC=/mnt/nvme/lnc1-work/src/contrib/qwen3.6-35b-a3b
+. "$(dirname "$0")/bench_env.sh"   # IMAGE/MODEL/NKILIB/SRC/WORK from .env or derived
 TAG=bs${BS}-n${N}-l${LAYERS}-s${SPLITS}-bc${BUCKET}-blk${BLK}-fp8${FP8}
-LOG=/mnt/nvme/lnc1-work/logs/prefill_fp8bs_${TAG}.log
-CACHE=/mnt/nvme/lnc1-work/cache-fp8bs-${TAG}
+LOG=$WORK/logs/prefill_fp8bs_${TAG}.log
+CACHE=$WORK/cache-fp8bs-${TAG}
 NAME=q35-prefill-fp8bs-${TAG}
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # Caches are created root-owned by the privileged container; a non-sudo rm fails
 # SILENTLY and a stale NEFF gets served. Always sudo-clear.
-sudo rm -rf "$CACHE" /mnt/nvme/lnc1-work/nbackend
-mkdir -p /mnt/nvme/lnc1-work/logs "$CACHE"
+sudo rm -rf "$CACHE" $WORK/nbackend
+mkdir -p $WORK/logs "$CACHE"
 if grep -q "only work on TRN2" "$NKILIB/src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_I.py"; then
   echo "FATAL: $NKILIB is NOT patched for LNC=1" | tee "$LOG"; exit 1
 fi
