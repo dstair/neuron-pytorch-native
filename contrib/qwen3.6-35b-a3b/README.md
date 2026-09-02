@@ -54,8 +54,10 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 >    output-block hoist is what removed that tax. So do not read the headline as "FP8 is
 >    faster than BF16" without that run.
 >
-> The memory win needs no such qualification: **5.08 vs 8.94 GB/core**, i.e. FP8 prefill
-> runs in 57% of the HBM. Capacity is what FP8 reliably buys here.
+> The memory win survives both caveats, though state it precisely: **5.08 GB/core at BS=6**
+> versus BF16 CTE's **8.95 GB/core at BS=2**. Those are different batches, so it is not a
+> like-for-like row — it is a *stronger* result than one, since FP8 uses 43% less HBM at 3×
+> the batch. Capacity is what FP8 reliably buys here.
 >
 > Two runs would close this out: FP8 at N=20,000, and BF16 CTE at BS=6/bucket 1024.
 

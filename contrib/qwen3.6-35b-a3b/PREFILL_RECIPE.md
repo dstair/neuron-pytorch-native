@@ -389,7 +389,9 @@ independently.
 >   never been run at BS=6/bucket 1024**, so how much of the gap is FP8 versus tuning is
 >   open. At the one config where both were measured (BS=2/bucket 1024) **BF16 was
 >   faster** — 4,227.7 vs FP8's 3,920.3, the ~7% dequant tax that lever 1 then removed.
-> - **Memory needs no caveat:** 5.08 vs 8.94 GB/core. Capacity is what FP8 reliably buys.
+> - **Memory:** 5.08 GB/core **at BS=6** vs BF16 CTE's 8.95 GB/core **at BS=2** — different
+>   batches, so not a like-for-like row, but a stronger result than one: 43% less HBM at 3×
+>   the batch. Capacity is what FP8 reliably buys.
 >
 > Two runs would close this: FP8 at N=20,000, and BF16 CTE at BS=6/bucket 1024.
 

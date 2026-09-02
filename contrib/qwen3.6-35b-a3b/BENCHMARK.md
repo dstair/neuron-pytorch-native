@@ -767,8 +767,11 @@ measured (BS=2, 2,048 tok/call) **BF16 was 7.8% faster** — the FP8 dequant tax
 output-block hoist removed that tax, and the tokens-per-call tuning then pushed FP8 past
 the BF16 *configuration*. But **BF16 CTE was never re-run at BS=6/bucket 1024**, so the
 FP8-versus-BF16 question at the tuned operating point is open, and the headline gap should
-not be attributed to FP8 alone. The memory result needs no such qualification: 5.08 vs
-8.94 GB/core.
+not be attributed to FP8 alone.
+
+The memory result survives, stated precisely: 5.08 GB/core **at BS=6** vs BF16 CTE's
+8.95 GB/core **at BS=2**. Different batches, so not a like-for-like row — but stronger than
+one, since FP8 uses 43% less HBM at 3× the batch.
 
 Two caveats on the numerics:
 
