@@ -3282,6 +3282,18 @@ def main():
             f"(lm_head {lm_head_mode}: "
             f"{mod.lm_head_w.numel() * mod.lm_head_w.element_size() / 1e9:.2f} GB)"
         )
+        # Prove from the log which shared-expert mode actually ran, and prove it from
+        # the loaded TENSOR rather than from the env var -- an env var that never
+        # reaches the container reads as "off" in Python and silently gives you a
+        # second baseline. That happened once; hence the shape in the banner.
+        _shw = mod.l0_sh_gate.shape
+        print(
+            f"  shared expert: {'TP-SHARDED' if USE_MOE_SHARED_TP else 'replicated'}"
+            f" (MOE_SHARED_TP={int(USE_MOE_SHARED_TP)}), "
+            f"l0_sh_gate={tuple(_shw)}"
+            f" [expect ({D.SHARED_INTER // world_size if USE_MOE_SHARED_TP else D.SHARED_INTER}"
+            f", {D.HIDDEN})]"
+        )
 
     B = args.batch_size
     dtype = torch.bfloat16 if not args.cpu else torch.float32

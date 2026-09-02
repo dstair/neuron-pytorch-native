@@ -8,14 +8,23 @@
 #           PSUM-accumulates (the actual ~8x Vector op reduction)
 # OB=1/HOIST=0 is the numerics-first staging step; OB=1/HOIST=1 must reproduce
 # its fingerprint. NO debug flags (LAUNCH_BLOCKING / DGE notifications cost ~15x).
-# usage: run_prefill_fp8_ob.sh [bs] [n] [fp8] [layers] [splits] [bucket] [blk] [maxtok] [ob] [hoist]
+# usage: run_prefill_fp8_ob.sh [bs] [n] [fp8] [layers] [splits] [bucket] [blk] [maxtok] [ob] [hoist] [shared_tp]
 set -uo pipefail
 BS="${1:-2}"; N="${2:-1024}"; FP8="${3:-1}"; LAYERS="${4:-4}"; SPLITS="${5:-2}"
 BUCKET="${6:-1024}"; BLK="${7:-512}"; MAXTOK="${8:-2048}"
 OB="${9:-0}"; HOIST="${10:-}"
+# Shard the replicated shared expert over TP (default off). MUST be plumbed into
+# the container below: an env var that is exported on the HOST but absent from the
+# docker -e list reads as "off" inside, so the run silently becomes a second
+# baseline. That cost one launch on 2026-09-02; the runner now passes it and
+# static_decode_35b.py prints the loaded sh_gate SHAPE so the log proves the mode.
+SHTP="${11:-${MOE_SHARED_TP:-0}}"
 MAXSEQ=$(( ( (N + BUCKET - 1) / BUCKET ) * BUCKET ))
 . "$(dirname "$0")/bench_env.sh"   # IMAGE/MODEL/NKILIB/SRC/WORK from .env or derived
 TAG=bs${BS}-n${N}-l${LAYERS}-s${SPLITS}-bc${BUCKET}-blk${BLK}-mt${MAXTOK}-fp8${FP8}-ob${OB}-ho${HOIST:-d}
+# Append only when set: keeps every previously-measured tag (and its warm cache
+# and log path) byte-identical, while giving the sharded variant its own.
+[ "$SHTP" = "1" ] && TAG="${TAG}-shtp1"
 LOG=$WORK/logs/prefill_fp8bs_${TAG}.log
 CACHE=$WORK/cache-fp8bs-${TAG}
 NAME=q35-prefill-fp8bs-${TAG}
@@ -60,7 +69,7 @@ fi
 if [[ -s "$LOG" ]]; then
   cp -p "$LOG" "${LOG%.log}_$(date -u +%Y%m%dT%H%M%SZ).log"
 fi
-echo "START $(date -u +%FT%TZ) tag=$TAG maxseq=$MAXSEQ blk=$BLK maxtok=$MAXTOK ob=${OB} hoist=${HOIST:-follow-ob} keep_cache=${QWEN35_KEEP_CACHE:-0}" | tee "$LOG"
+echo "START $(date -u +%FT%TZ) tag=$TAG maxseq=$MAXSEQ blk=$BLK maxtok=$MAXTOK ob=${OB} hoist=${HOIST:-follow-ob} shared_tp=${SHTP} keep_cache=${QWEN35_KEEP_CACHE:-0}" | tee "$LOG"
 docker run --rm --name "$NAME" --privileged --network host --ipc host \
   -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
   -e NEURON_LOGICAL_NC_CONFIG=1 -e QWEN35_LNC=1 \
@@ -69,6 +78,7 @@ docker run --rm --name "$NAME" --privileged --network host --ipc host \
   -e NKI_ENABLE_TRACE_CACHE=0 \
   -e MOE_CTE=1 -e MOE_CTE_NKI_PACK=1 -e MOE_CTE_BLOCK=${BLK} -e MOE_CTE_MAX_TOKENS=${MAXTOK} -e MOE_CTE_FP8=${FP8} \
   -e MOE_CTE_FP8_OUTPUT_BLOCK="${OB}" -e MOE_CTE_FP8_OB_HOIST="${HOIST}" \
+  -e MOE_SHARED_TP="${SHTP}" \
   -e GQA_CTE_PREFILL=1 -e GQA_DYNAMIC_ROPE_KV=1 \
   -e DN_CHUNK_NKI=1 -e CHUNK_SIZE=32 -e DN_STABLE_C32=0 -e DN_PACK_C32=1 -e DN_PACK_N=4 \
   -e DN_NKI=1 -e GQATAIL=1 -e PREFILL_FINGERPRINT=1 \
