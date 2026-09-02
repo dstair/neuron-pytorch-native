@@ -104,12 +104,31 @@ into P = N×32 recovers the width: measured **+12.5% at N=2, +19.4% at N=4**, bi
 The cap is hardware: P ≤ 128 → N ≤ 4 at C=32. Having *more* independent streams available (e.g.
 from a larger batch) does **not** allow a wider pack — don't propose N=8 at higher batch.
 
-## Pattern 6 — tile every partition-major buffer to ≤128
+## Pattern 6 — tile every partition-major buffer to ≤128, but tile CONDITIONALLY
 
 Any `[num_items, ...]` SBUF buffer where `num_items` is a problem-size count will compile at
 small scale and fail at large with `memset dst partition dimension N exceeds maximum 128`.
 Tile the initialization and give each chunk a unique op `name=`. Assume this bug exists in any
 path that has only ever run at one size.
+
+**Emit the tiling only when `num_items > 128`.** A tiling loop that runs a single iteration is
+bit-identical but **not free**: measured **−3.0%** of a 40-layer prefill wall clock
+(4,370.8 → 4,244.9 tok/s at BS=6, run-to-run spread 0.026%, identical fingerprint) from tiling
+one route-packer metadata section whose loop ran exactly once. Three mechanisms, all SBUF
+allocation, none visible in the op semantics:
+
+- the added `sbm.open_scope`/`close_scope` pair,
+- hoisting a buffer's allocation above the loop, lengthening its live range,
+- renaming every buffer (`foo` → `foo_0`), which changes allocation order.
+
+So structure it as `tiled = n > 128; tile = 128 if tiled else n`, keep the original op `name=`s
+and the original allocation *positions* on the untiled path, and pass the tile base as `offset`
+so the tiled path stays correct. Guard it with a comment: this looks like duplication a future
+reader will want to collapse.
+
+Generalizes past tiling: **"bit-identical" is a numerics claim, not a performance claim.** This
+workload has repeatedly shown ±1–2% from allocation-order changes alone. A/B any restructuring
+you believe is a no-op, at the config you ship.
 
 ## Correctness hazards that masquerade as performance work
 

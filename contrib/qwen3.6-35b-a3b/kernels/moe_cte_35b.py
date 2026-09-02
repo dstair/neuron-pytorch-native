@@ -409,24 +409,48 @@ def _pack_local_routes_impl(
     #   "iota dst partition dimension 160 exceeds maximum 128"
     # (MEASURED 2026-08-22 at BS=8/chunk1024, max_blocks=160). So tile over blocks
     # in <=128-partition chunks, exactly as _init_route_metadata already does for
-    # block_to_expert. Compile-time loop with a single iteration at the block
-    # counts that worked before, so those configs are unchanged.
+    # block_to_expert.
     #
-    # The condition ROW is (1, max_blocks) -- free dimension, no partition limit --
-    # so it is allocated once outside the loop, filled per tile, and stored once.
-    condition_row = sbm.alloc_stack(
-        (1, max_blocks),
-        dtype=nl.int32,
-        name="route_pack_condition_row",
-    )
-    for _blk_lo in range(0, max_blocks, 128):
-        _blk_hi = min(_blk_lo + 128, max_blocks)
+    # The tiling is emitted ONLY when it is needed. When it was applied
+    # unconditionally the loop ran a single iteration at max_blocks <= 128 and was
+    # bit-identical -- but it still cost **3.0% of prefill wall clock**, MEASURED
+    # 2026-09-02 at BS=6/chunk1024/40L/seq10k on a trn2.3xlarge: untiled
+    # 13,727.5 ms / 4,370.8 tok/s versus tiled 14,132.5 and 14,136.2 ms /
+    # 4,245.5 and 4,244.4 tok/s, all three with the identical fingerprint
+    # sum=-6.51782125e+05 norm=2.05050854e+03 top5=[220,13,197,198,62]. Run-to-run
+    # spread on that box is 0.026%, so the gap is ~100x the noise. The single
+    # iteration is not free because it perturbs SBUF allocation three ways: the
+    # extra alloc scope, hoisting condition_row's live range over the whole
+    # section, and renaming every buffer (allocation order). This workload has
+    # repeatedly shown +-1-2% sensitivity to exactly that class of change.
+    #
+    # So `max_blocks <= 128` reproduces the pre-tiling op sequence EXACTLY -- same
+    # buffer names, no scope, condition_row allocated at its original position,
+    # `offset=0`, and the whole-buffer (not sliced) copies -- while larger block
+    # counts take the tiled loop that lifted the ceiling. Keep it that way: the
+    # names and the alloc ORDER are load-bearing, not cosmetic.
+    _meta_tiled = max_blocks > 128
+    _meta_tile = 128 if _meta_tiled else max_blocks
+    # The condition ROW is (1, max_blocks) -- free dimension, no partition limit.
+    # Tiled, it must outlive the loop so each tile can fill its slice; untiled it
+    # is allocated below at the position the original code allocated it.
+    condition_row = None
+    if _meta_tiled:
+        condition_row = sbm.alloc_stack(
+            (1, max_blocks),
+            dtype=nl.int32,
+            name="route_pack_condition_row",
+        )
+    for _blk_lo in range(0, max_blocks, _meta_tile):
+        _blk_hi = min(_blk_lo + _meta_tile, max_blocks)
         _blk_n = _blk_hi - _blk_lo
-        sbm.open_scope(name=f"route_pack_block_meta_{_blk_lo}")
+        _sfx = f"_{_blk_lo}" if _meta_tiled else ""
+        if _meta_tiled:
+            sbm.open_scope(name=f"route_pack_block_meta_{_blk_lo}")
         block_ids = sbm.alloc_stack(
             (_blk_n, num_local_experts),
             dtype=nl.int32,
-            name=f"route_pack_block_ids_{_blk_lo}",
+            name=f"route_pack_block_ids{_sfx}",
         )
         # offset carries the tile base so block ids stay GLOBAL across tiles.
         nisa.iota(
@@ -434,70 +458,71 @@ def _pack_local_routes_impl(
             pattern=[[0, num_local_experts]],
             offset=_blk_lo,
             channel_multiplier=1,
-            name=f"route_pack_block_iota_{_blk_lo}",
+            name=f"route_pack_block_iota{_sfx}",
         )
         ends_broadcast = sbm.alloc_stack(
             (_blk_n, num_local_experts),
             dtype=nl.int32,
-            name=f"route_pack_ends_broadcast_{_blk_lo}",
+            name=f"route_pack_ends_broadcast{_sfx}",
         )
         stream_shuffle_broadcast(block_ends, ends_broadcast)
         ended_experts = sbm.alloc_stack(
             (_blk_n, num_local_experts),
             dtype=nl.int32,
-            name=f"route_pack_ended_experts_{_blk_lo}",
+            name=f"route_pack_ended_experts{_sfx}",
         )
         nisa.tensor_tensor(
             dst=ended_experts,
             data1=block_ids,
             data2=ends_broadcast,
             op=nl.greater_equal,
-            name=f"route_pack_block_expert_compare_{_blk_lo}",
+            name=f"route_pack_block_expert_compare{_sfx}",
         )
         block_experts = sbm.alloc_stack(
             (_blk_n, 1),
             dtype=nl.int32,
-            name=f"route_pack_block_experts_{_blk_lo}",
+            name=f"route_pack_block_experts{_sfx}",
         )
         nisa.tensor_reduce(
             dst=block_experts,
             data=ended_experts,
             op=nl.add,
             axis=1,
-            name=f"route_pack_block_expert_reduce_{_blk_lo}",
+            name=f"route_pack_block_expert_reduce{_sfx}",
         )
         # Intersect this tile with the writer's block range (num_writers > 1 at
         # LNC=2); both bounds are compile-time ints, so this is a Python test.
+        # Untiled this collapses to the original block_write_lo:block_write_hi.
         _w_lo = max(_blk_lo, writer_id * max_blocks // num_writers)
         _w_hi = min(_blk_hi, (writer_id + 1) * max_blocks // num_writers)
         if _w_hi > _w_lo:
             nisa.dma_copy(
                 dst=block_to_expert[_w_lo:_w_hi, :],
                 src=block_experts[_w_lo - _blk_lo : _w_hi - _blk_lo, :],
-                name=f"route_pack_store_block_experts_{_blk_lo}",
+                name=f"route_pack_store_block_experts{_sfx}",
             )
 
         block_id_column = sbm.alloc_stack(
             (_blk_n, 1),
             dtype=nl.int32,
-            name=f"route_pack_block_id_column_{_blk_lo}",
+            name=f"route_pack_block_id_column{_sfx}",
         )
         nisa.iota(
             dst=block_id_column,
             pattern=[[0, 1]],
             offset=_blk_lo,
             channel_multiplier=1,
-            name=f"route_pack_condition_iota_{_blk_lo}",
+            name=f"route_pack_condition_iota{_sfx}",
         )
         active_conditions = sbm.alloc_stack(
             (_blk_n, 1),
             dtype=nl.int32,
-            name=f"route_pack_active_conditions_{_blk_lo}",
+            name=f"route_pack_active_conditions{_sfx}",
         )
         active_block_count = sbm.alloc_stack(
             (_blk_n, 1),
             dtype=nl.int32,
-            name=f"route_pack_active_block_count_{_blk_lo}",
+            name=f"route_pack_active_block_count{_sfx}",
         )
         stream_shuffle_broadcast(
             block_ends[0:1, num_local_experts - 1 : num_local_experts],
@@ -508,30 +533,40 @@ def _pack_local_routes_impl(
             data1=block_id_column,
             data2=active_block_count,
             op=nl.less,
-            name=f"route_pack_active_compare_{_blk_lo}",
+            name=f"route_pack_active_compare{_sfx}",
         )
         condition_psum = nl.ndarray((1, _blk_n), dtype=nl.float32, buffer=nl.psum)
         condition_float = sbm.alloc_stack(
             (_blk_n, 1),
             dtype=nl.float32,
-            name=f"route_pack_condition_float_{_blk_lo}",
+            name=f"route_pack_condition_float{_sfx}",
         )
         nisa.tensor_copy(
             dst=condition_float,
             src=active_conditions,
-            name=f"route_pack_condition_to_float_{_blk_lo}",
+            name=f"route_pack_condition_to_float{_sfx}",
         )
         nisa.nc_transpose(
             dst=condition_psum,
             data=condition_float,
-            name=f"route_pack_condition_transpose_{_blk_lo}",
+            name=f"route_pack_condition_transpose{_sfx}",
         )
+        if condition_row is None:
+            # Untiled: original allocation site, AFTER the transpose.
+            condition_row = sbm.alloc_stack(
+                (1, max_blocks),
+                dtype=nl.int32,
+                name="route_pack_condition_row",
+            )
         nisa.tensor_copy(
-            dst=condition_row[0:1, _blk_lo:_blk_hi],
+            # Untiled, pass the whole buffer rather than a full-width slice, so
+            # the emitted access pattern matches the pre-tiling code exactly.
+            dst=condition_row[0:1, _blk_lo:_blk_hi] if _meta_tiled else condition_row,
             src=condition_psum,
-            name=f"route_pack_condition_to_int_{_blk_lo}",
+            name=f"route_pack_condition_to_int{_sfx}",
         )
-        sbm.close_scope()
+        if _meta_tiled:
+            sbm.close_scope()
 
     condition_write_lo = writer_id * max_blocks // num_writers
     condition_write_hi = (writer_id + 1) * max_blocks // num_writers

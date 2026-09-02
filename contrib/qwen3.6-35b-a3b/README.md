@@ -37,34 +37,46 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 
 | Phase | Best | Config | Recipe |
 |---|---|---|---|
-| **Prefill (FP8 CTE MoE)** | **4,383.9 agg prompt tok/s** | **FP8 CTE MoE** (`MOE_CTE_FP8=1`) with the **output-block scale grid + PSUM hoist** and the **uncapped route packer** (`MOE_CTE_MAX_TOKENS=0` → 6,144 tokens/MoE call), on the same packed **C32 n=4** DeltaNet at **TP=8/LNC=1**; BS=6, **N=10,000**, bucket 1024, O1, beta-5, **5.08 GB/core** (vs 8.94 BF16). Fingerprint `top5=[220,13,197,198,62]`. **Not a like-for-like swap of the row below — different BS *and* N; see the caveat.** | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) §3d |
-| Prefill (BF16, the long-context headline) | 4,097.9 agg prompt tok/s | packed **C32 n=4** at **TP=8/LNC=1**, correct per-GQA-layer in-place rope-KV write, both vocab tensors load-time sharded (`PREFILL_SHARDED_LM_HEAD=1 PREFILL_SHARDED_EMBED=1`), `--scratchpad-page-size-mb 256`, BS=2, **N=20,000**, bucket 1024, O1, **beta-5 container** (reproduced 4,095.2, within 0.07%; **+2.4%** over beta-4's 4,002.1; bit-identical fingerprint) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) §3c |
-| Prefill (TP=4/LNC=2) | 2,791.7 agg prompt tok/s | stable **C32 + 4-stream block-diagonal pack, SBUF-resident, hoisted-transpose finish** (`DN_PACK_C32=1 DN_PACK_N=4`), BS=2, N=20,000, bucket 1024, TP=4/LNC=2, O1 (+22.6% over unpacked C32 @ 2,276.9; +33.6% over paired-C16 @ 2,089.7) | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) |
+| **Prefill (FP8 CTE MoE)** | **4,370.8 agg prompt tok/s** | **FP8 CTE MoE** (`MOE_CTE_FP8=1`) with the **output-block scale grid + PSUM hoist** and the **uncapped route packer** (`MOE_CTE_MAX_TOKENS=0` → 6,144 tokens/MoE call), on the same packed **C32 n=4** DeltaNet at **TP=8/LNC=1**; BS=6, **N=10,000**, bucket 1024, O1, beta-5, **5.08 GB/core** (vs 8.94 BF16). Fingerprint `top5=[220,13,197,198,62]`. Measured at BS=6/N=10,000 — see the scope note. Was published as 4,383.9; see the reproduction note. | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) §3d |
 | **Decode** | **681.3 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv + per-layer DeltaNet state (`DN_PERLAYER_STATE=1`), TP=8/LNC=1, O1, **beta-5 container**, seq=256 (**+7.8%** over beta-4's 632.0; **582.3 tok/s** at seq=1024; bit-identical `0cc59fb25112`) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
 
-> **Read the two prefill rows carefully — they are not the same measurement.** The FP8
-> row is BS=6 at N=10,000; the BF16 row is BS=2 at N=20,000, which is the regime this
-> model actually targets. Three things follow:
+> **Scope of the prefill headline: it is BS=6 at N=10,000, not the 20,000-token regime
+> this model targets.** Two things follow, and neither is closed:
 >
-> 1. **N differs, and the effect is measured, not assumed:** aggregate tok/s is nearly
->    flat in prompt length (2,803.6 @5k → 2,790.6 @10k → 2,775.6 @20k on the TP=4 packed-C32
->    config), because prefill tiles into fixed 1024-token chunks. So N=10,000 flatters a
->    number by only ~0.5% — small, but it is not zero. **An FP8 run at N=20,000 has not
->    been done.**
-> 2. **BS differs, and the batch/tokens-per-call tuning was applied only to FP8.** The
->    nominal +7.0% (4,383.9 vs 4,097.9) is FP8 *plus* the output-block hoist *plus* raising
->    tokens-per-MoE-call to its measured optimum of 6,144 — not FP8 alone.
->    **BF16 CTE has never been run at BS=6/bucket 1024**,
->    so how much of the gap is FP8 rather than tuning is **open**. At the one config where
->    both were measured (BS=2/bucket 1024), BF16 was *faster*: 4,227.7 vs FP8's 3,920.3 —
->    the ~7% FP8 dequant tax, which the output-block hoist then removed.
-> 3. **The memory win is unambiguous and needs no caveat:** 5.08 vs 8.94 GB/core, i.e. FP8
->    prefill runs in 57% of the HBM. That is what FP8 reliably buys here — capacity.
+> 1. **N=10,000 flatters the number slightly.** Aggregate tok/s is nearly flat in prompt
+>    length — measured 2,803.6 @5k → 2,790.6 @10k → 2,775.6 @20k — because prefill tiles
+>    into fixed 1024-token chunks. So the effect is only ~0.5%, but it is not zero, and
+>    **an FP8 run at N=20,000 has not been done.**
+> 2. **How much of the gain is FP8 rather than tuning is open.** The batch and
+>    tokens-per-MoE-call tuning was applied only to the FP8 path; **BF16 CTE has never been
+>    run at BS=6/bucket 1024.** At the one config where both were measured (BS=2/bucket
+>    1024) BF16 was *faster* — 4,227.7 vs FP8's 3,920.3, the ~7% FP8 dequant tax — and the
+>    output-block hoist is what removed that tax. So do not read the headline as "FP8 is
+>    faster than BF16" without that run.
+>
+> The memory win needs no such qualification: **5.08 vs 8.94 GB/core**, i.e. FP8 prefill
+> runs in 57% of the HBM. Capacity is what FP8 reliably buys here.
 >
 > Two runs would close this out: FP8 at N=20,000, and BF16 CTE at BS=6/bucket 1024.
 
+> **Reproduction note — the FP8 prefill headline was 4,383.9 and is now 4,370.8 (−0.30%).**
+> The 4,383.9 figure was measured 2026-08-22 on a trn2.3xlarge that has since been terminated,
+> and whose host neuron stack was never recorded. Re-measured 2026-09-02 on a fresh
+> trn2.3xlarge (host driver 2.30.2 / runtime 2.34.10) with md5-identical source, nkilib and
+> container image: **13,727.5 ms → 4,370.8 tok/s**, same fingerprint. Run-to-run spread on that
+> box is **0.026%**, so the residual −0.30% is a real host-stack difference, not variance — but
+> with the old box gone there is nothing to A/B against, so it is recorded rather than chased.
+>
+> The first re-measurement attempt came in at **4,244.9 (−3.2%)**, and that gap was *ours*: the
+> block-metadata tiling landed in `af4c000` **after** the record was set, and although it is
+> bit-identical at BS=6 (its loop runs a single iteration), emitting it unconditionally cost
+> **3.0%** through SBUF allocation alone. It is now emitted only when `max_blocks > 128`, which
+> keeps both the lifted BS=8 compile ceiling and the fast path. Two lessons carried into the
+> [profiling skill](../../skills/): **record the host neuron stack alongside every benchmark
+> number**, and **a bit-identical no-op restructuring is not a performance no-op.**
+
 Container lineage: the current numbers are on the **beta-5** DLC
-(`concourse-release-0461d3b@sha256:94413ce1ffea…`, built 2026-08-05). Both paths are
+(built 2026-08-05; the image reference and digest are in the gitignored `.env`). Both paths are
 clean compiler-only wins over beta-4, bit-identical in numerics. Other reference points:
 beta-4 headlines were **4,002.1** prefill / **632.0** decode; the pre-beta-4 TP=8/LNC=1
 prefill was **3,456.8**; the prior FP8 `block_pow2_coalesced` decode **343.6 tok/s @

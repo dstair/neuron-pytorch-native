@@ -1,6 +1,6 @@
 # Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32)
 
-**Fastest measured: ≈4,384 aggregate prompt tok/s** — the **FP8 CTE MoE** path at
+**Fastest measured: ≈4,371 aggregate prompt tok/s** — the **FP8 CTE MoE** path at
 TP=8/LNC=1, BS=6, **N=10,000**, in **5.08 GB/core**. See **§3d**, and read its scope
 note: that is BS=6/N=10,000, whereas the long-context BF16 headline below is
 BS=2/N=20,000, so the two are not a like-for-like swap.
@@ -10,7 +10,7 @@ want the number for this model's stated regime, that is still the one to quote.
 
 Reproduces the fastest validated **prefill** configuration. The BF16 best is
 **≈4,096 aggregate prompt tok/s** at **TP=8/LNC=1** on the **beta-5 container**
-(`concourse-release-0461d3b@sha256:94413ce1ffea…`, built 2026-08-05) with the
+(built 2026-08-05) with the
 **correct in-place rope-KV write** (one cache buffer per GQA layer) — see §3c and §4.
 That is **+2.4%** over the beta-4 headline (4,002.1), which was itself +9.8% over the
 beta-4 compiler-only baseline (≈3,645) and +15.8% over the pre-beta-4 TP=8/LNC=1
@@ -187,7 +187,7 @@ tokens `[11751, 13, 198, 760, 6511, 314, ...]`, matching the C32/C16 baseline.
 > degenerate output or as a failed gate.
 
 **beta-4 container: 3,645.0 tok/s (+5.4%), numerics bit-identical.** The DLC swap
-(`sha256:9d37a773…` → `sha256:ad7f7bbcd468…`) with **this recipe's source unchanged**
+(pre-beta-4 → beta-4) with **this recipe's source unchanged**
 measures 10,974.1 ms / **3,645.0 aggregate prompt tok/s** at an unchanged
 8.95 GB/core, reproducing this recipe's fingerprint *exactly*
 (`sum=-3.17835375e+05 norm=1.20818213e+03 top5=[517,607,261,294,15089]`). Same source,
@@ -219,7 +219,7 @@ tok/s** at an unchanged **8.95 GB/core**, `kv_k` **100% non-zero** in *every* gr
 suggested — skipping the cache re-export is worth +9.8% on its own.
 
 **beta-5 container: 4,097.9 tok/s (+2.4%) — current best, 2026-08-10.** The same source
-(`.clone()` per GQA layer) on the beta-5 DLC (`sha256:94413ce1ffea…`, 2026-08-05, 6 days
+(`.clone()` per GQA layer) on the beta-5 DLC (built 2026-08-05, 6 days
 newer than beta-4) measured **9,761.1 ms / 4,097.9 aggregate prompt tok/s**, reproduced
 at **9,767.5 ms / 4,095.2** (within 0.07%), at an unchanged 8.95 GB/core, `kv_k`
 104,857,597/104,857,600, and this recipe's reference fingerprint reproduced **exactly**
@@ -338,10 +338,32 @@ NEURON_LOGICAL_NC_CONFIG=1 NEURON_SCRATCHPAD_PAGE_SIZE=256
 NEURON_CC_FLAGS="--target trn2 --lnc 1 --optlevel 1 --hbm-scratchpad-page-size 256"
 ```
 
-**Measured: 13,686 ms for 6 × 10,000 = 60,000 prompt tokens → 4,383.9 aggregate tok/s**,
-5.08 GB/core, `top5=[220,13,197,198,62]`, all finite.
+**Measured: 13,727.5 ms for 6 × 10,000 = 60,000 prompt tokens → 4,370.8 aggregate tok/s**,
+5.08 GB/core, `top5=[220,13,197,198,62]`, all finite. (2026-09-02, trn2.3xlarge; the specific
+instance is in the gitignored `.env`.)
 
-The 2D config search converged — do not re-sweep it:
+Host neuron stack for this number — **record this with every benchmark**, the container
+bind-mounts the host's `/opt/aws/neuron` so these versions are part of the measurement:
+
+```
+aws-neuronx-dkms 2.30.2.0   aws-neuronx-runtime-lib 2.34.10.0-ac18d186d
+aws-neuronx-collectives 2.34.10.0-74eaafac6   aws-neuronx-tools 2.32.28.0-526c2b7f6
+kernel 6.17.0-1019-aws
+```
+
+> **This was published as 4,383.9 and is now 4,370.8.** That figure came from 2026-08-22 on
+> a trn2.3xlarge since terminated, with its host stack unrecorded. On the current
+> box, same source/nkilib/image md5s and same fingerprint, it re-measures 0.30% lower against
+> a run-to-run spread of 0.026% — a real host difference with nothing left to A/B against.
+>
+> The first re-measurement read **4,244.9 (−3.2%)** and that part was our own code: the
+> block-metadata tiling (`af4c000`) landed after the record, and though bit-identical at BS=6
+> it cost **3.0%** by itself. It is now emitted only above 128 blocks. See
+> `kernels/moe_cte_35b.py`, "Materialize block expert IDs".
+
+The 2D config search converged — do not re-sweep it. **Every row below was measured on the
+now-terminated box with the untiled kernel**, so read them against 4,383.9, not 4,370.8; the
+shape of the optimum is what they establish, and that is unaffected:
 
 | BS | bucket | tok/MoE call | aggregate tok/s |
 |---:|---:|---:|---:|
@@ -390,7 +412,7 @@ prefill wall-time). References — **note the BS and N columns before comparing 
 
 | Config | BS | N | Wall time | Aggregate prompt tok/s |
 |---|---:|---:|---:|---:|
-| **FP8 CTE MoE + output-block hoist + uncapped packer, TP=8/LNC=1** (§3d, 5.08 GB/core) | **6** | **10,000** | **13.686 s** | **4,383.9** |
+| **FP8 CTE MoE + output-block hoist + uncapped packer, TP=8/LNC=1** (§3d, 5.08 GB/core) | **6** | **10,000** | **13.728 s** | **4,370.8** (was 13.686 s / 4,383.9 on the terminated box — §3d note) |
 | FP8 CTE, same levers, BS=4 (§3d table) | 4 | 10,000 | 9.326 s | 4,289.2 |
 | BF16 CTE, the one config where BF16 and FP8 were both measured | 2 | 10,000 | — | 4,227.7 |
 | FP8 CTE *before* the output-block hoist, same BS/bucket as the row above | 2 | 10,000 | — | 3,920.3 |

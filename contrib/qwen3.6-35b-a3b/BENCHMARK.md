@@ -24,7 +24,7 @@ container** that became **3,645.0 tok/s** (+5.4% over 3,456.8, same source, same
 size 256 — a clean compiler-only win, verified numerically bit-identical). On beta-4 the
 in-place rope-KV write, now **correct** (one cache buffer per GQA layer), reached
 **4,002.1 tok/s** (+9.8% over 3,645.0). The current best is **4,097.9 tok/s** on the
-**beta-5 container** (`sha256:94413ce1ffea…`, 2026-08-05; +2.4% over 4,002.1, identical
+**beta-5 container** (built 2026-08-05; +2.4% over 4,002.1, identical
 source, bit-identical fingerprint, reproduced at 4,095.2) — another clean compiler-only
 win. Decode's current best is **681.3 tok/s** at BS=128 (beta-5, O1, `DN_PERLAYER_STATE`;
 +7.8% over beta-4's 632.0; 582.3 tok/s at seq=1024); see the beta-5 section below.
@@ -694,7 +694,8 @@ an FP8 run at N=20,000 has **not** been done. All rows: 40 layers, TP=8/LNC=1, b
 
 | Config | BS | tok/MoE call | Latency | Prompt tok/s |
 |---|---:|---:|---:|---:|
-| **Output-block scale grid + PSUM hoist + uncapped packer** | **6** | **6,144** | **13.686 s** | **4,383.9 aggregate** |
+| **Output-block scale grid + PSUM hoist + uncapped packer** — re-measured 2026-09-02 on a new box | **6** | **6,144** | **13.728 s** | **4,370.8 aggregate** |
+| ↳ the same config as originally published, on the now-terminated predecessor box | 6 | 6,144 | 13.686 s | 4,383.9 aggregate |
 | same levers, BS=4 | 4 | 4,096 | 9.326 s | 4,289.2 aggregate |
 | same levers, BS=8 — **worse**, tokens/call is not monotone | 8 | 8,192 | — | 4,271.9 aggregate |
 | same levers, bucket 2048 — **worse**, intra-chunk work grows as `S·chunk/2` | 3 | 6,144 | — | 4,187.5 aggregate |
@@ -714,6 +715,52 @@ Clean per-lever attribution, all three at BS=4/bucket 1024 so only the lever cha
 
 `1.079 × 1.033 = 1.115`, matching the +11.5% end-to-end exactly, so the two levers compose
 cleanly and the output-block hoist is the larger one.
+
+##### Reproduction A/B (2026-09-02): unconditional block-metadata tiling cost 3.0%
+
+The headline was re-measured on a fresh trn2.3xlarge (host driver 2.30.2 / runtime 2.34.10)
+after the original box was terminated. Source, nkilib and container image are
+md5-identical across all rows; the fingerprint (`sum=-6.51782125e+05 norm=2.05050854e+03
+top5=[220,13,197,198,62]`, 5.08 GB/core) is **identical in every row**, so nothing here changes
+arithmetic.
+
+| variant | box | wall | agg tok/s |
+|---|---|---:|---:|
+| untiled block metadata | predecessor, terminated | 13,686.3 ms | **4,383.9** (as published) |
+| untiled block metadata | current | 13,727.5 ms | 4,370.8 |
+| **conditional tiling (the fix, shipping)** | **current** | **13,728.2 ms** | **4,370.6** |
+| tiling always emitted (`af4c000`), run 1 | current | 14,132.5 ms | 4,245.5 |
+| tiling always emitted, run 2 | current | 14,136.2 ms | 4,244.4 |
+
+The fix lands **0.005%** off the untiled path — ~5× below the 0.026% run-to-run spread — so
+the fast path is fully recovered, and `+3.0%` over the always-tiled build is confirmed at the
+shipping config.
+
+Two separate effects, and they were initially conflated:
+
+1. **Our code, −3.0%, fixed.** `af4c000` tiled the route packer's partition-major block-metadata
+   section to lift a 128-partition `iota` ceiling that blocked BS=8. It landed *after* the
+   record was set. At BS=6, `max_blocks = 128`, so the tiling loop runs exactly one iteration
+   and is bit-identical — and it still cost 3.0%, because it adds an SBUF alloc scope, extends
+   `condition_row`'s live range across the whole section, and renames every buffer (changing
+   allocation order). The tiling is now emitted only when `max_blocks > 128`, keeping both the
+   lifted ceiling and the fast path. Do not "simplify" it back to unconditional.
+2. **Host stack, −0.30%, recorded not chased.** What remains between 4,383.9 and 4,370.8 is
+   ~11× the 0.026% run-to-run spread, so it is real, but the old box's neuron versions were
+   never recorded and the box is gone — there is no target to A/B against. The process fix is
+   the durable one: **record the host neuron stack with every benchmark number.**
+
+The lesson worth generalizing: **a restructuring that is bit-identical is not therefore
+performance-neutral.** This workload has shown ±1–2% sensitivity to SBUF allocation order
+several times (SBUF-resident intermediates +0.7%, transpose-once +1.4%); a "no-op" loop that
+runs once is still a different allocation problem for the compiler.
+
+A second, methodological one: **NEFF bytes cannot gate this.** Comparing the fix's NEFFs
+against the untiled build's was attempted as a stronger-than-timing equivalence proof and is
+invalid — `neuronx-cc` is not byte-reproducible. Only **8 of 108** NEFFs matched, including two
+files of *identical* size (10,493 B) with different md5s for a helper kernel neither change
+touches. The gates that do hold are the output fingerprint, device memory, and timing against
+a measured spread.
 
 **What this does and does not show.** At the one config where BF16 and FP8 were both
 measured (BS=2, 2,048 tok/call) **BF16 was 7.8% faster** — the FP8 dequant tax. The
@@ -926,10 +973,10 @@ The four recorded runs at this config, in order, give a clean attribution:
 
 | # | date | compiler | source | page | TIMED | agg prompt tok/s | fingerprint `sum` / `norm` |
 |---|---|---|---|---:|---:|---:|---|
-| 1 | 07-29 20:30 | old `9d37a773…` | pre-07-30 | 256 | 11,571.5 ms | 3,456.8 | `-3.17835375e+05` / `1.20818213e+03` |
-| 2 | 07-30 01:30 | old `9d37a773…` | pre-07-30 (`src-old` replay) | 256 | 11,573.7 ms | 3,456.1 | `-3.17835375e+05` / `1.20818213e+03` |
-| 3 | 07-30 01:12 | old `9d37a773…` | rope-KV rev2 | 64 | 10,912.5 ms | 3,665.5 | **`-3.29478219e+05`** / **`1.22990430e+03`** |
-| 4 | 08-03 17:37 | **beta-4** `ad7f7bbcd468…` | rope-KV rev2 | 256 | **10,284.3 ms** | **3,889.4** | **`-3.29478219e+05`** / **`1.22990430e+03`** |
+| 1 | 07-29 20:30 | pre-beta-4 | pre-07-30 | 256 | 11,571.5 ms | 3,456.8 | `-3.17835375e+05` / `1.20818213e+03` |
+| 2 | 07-30 01:30 | pre-beta-4 | pre-07-30 (`src-old` replay) | 256 | 11,573.7 ms | 3,456.1 | `-3.17835375e+05` / `1.20818213e+03` |
+| 3 | 07-30 01:12 | pre-beta-4 | rope-KV rev2 | 64 | 10,912.5 ms | 3,665.5 | **`-3.29478219e+05`** / **`1.22990430e+03`** |
+| 4 | 08-03 17:37 | **beta-4** | rope-KV rev2 | 256 | **10,284.3 ms** | **3,889.4** | **`-3.29478219e+05`** / **`1.22990430e+03`** |
 
 **Numerics: beta-4 introduces no drift at all.** Runs 3 and 4 are **bit-identical** —
 same `sum`, same `norm` to all printed digits, same `top5=[517,607,15089,258,261]` —
@@ -944,10 +991,10 @@ stale baseline. Module resident is 8.95 GB/core on both sides.
 **Throughput: the +12.5% is real but is not all the compiler's.** It spans two
 changes plus a page-size difference, and the one cell that would separate them —
 old compiler + rope-KV rev2 + page 256 — was never run, and can no longer be run
-because the host holds only `sha256:ad7f7bbcd468fc27accfde039421e9367614a8d12dc9fa452d587feb514c2798`
-(the swap was a re-pull of the same `concourse-release-0461d3b:latest` tag, so
-`9d37a773…` was replaced, not co-installed; no dangling layers, and ECR
-`DescribeImages` is denied to this host's role). What the data does support:
+because the host now holds only the beta-4 image (the swap was a re-pull of the *same*
+mutable tag, so the pre-beta-4 image was replaced, not co-installed; no dangling layers,
+and ECR `DescribeImages` is denied to this host's role). Digests for each image label are
+in the gitignored `.env`. What the data does support:
 the rope-KV rewrite alone is worth **+6.0%** at page 64 (3,456 → 3,665.5), and
 beta-4 plus the page-64→256 change together add a further **+6.1%**
 (3,665.5 → 3,889.4). Attributing the whole +12.5% to "compiler scheduling" is not
@@ -1172,7 +1219,7 @@ numerical change on either path**. The fp8 expert conversion also reports its us
 **Throughput: −26.7%, and not yet attributable.** 395.11 vs 289.53 ms/tok is a real
 regression, but it confounds O1-vs-default with old-vs-beta-4, and **neither
 confound can be lifted on this host**: beta-4 at the default optlevel is the
-configuration that OOMs, and the old image is gone (only `ad7f7bbcd468…` remains, no
+configuration that OOMs, and the old image is gone (only beta-4 remains, no
 dangling layers, ECR `DescribeImages` denied to this role). The honest statement is
 that the only configuration in which beta-4 full-graph decode compiles is O1, and
 that configuration is 26.7% slower than the recorded default-optlevel baseline.
@@ -1455,8 +1502,8 @@ are what carry the equivalence claim. KV occupancy was `[384]×10`.
 
 ### beta-5 container (2026-08-10): both paths faster, numerics bit-identical
 
-The **beta-5** DLC (`concourse-release-0461d3b@sha256:94413ce1ffea…`, built
-2026-08-05T10:02Z — **6 days newer** than beta-4 `sha256:ad7f7bbcd468…`) was pulled
+The **beta-5** DLC (built 2026-08-05T10:02Z — **6 days newer** than beta-4; both
+digests are in the gitignored `.env`) was pulled
 onto the native trn2.3xlarge and both published configs re-run against it with the
 **same source** (per-GQA-layer rope-KV for prefill; O1 + `DN_PERLAYER_STATE=1` for
 decode). Both are clean compiler-only wins with no numerical change. `ecr:DescribeImages`
@@ -1504,7 +1551,7 @@ its own MoE kernels and CPU oracle.
 ### vLLM-Neuron port (different regime — not a ranking)
 
 A separate vLLM-Neuron port of this model exists and was validated by its authors
-(`/home/dstair/dev/vllm-neuron`, `origin/add-qwen36-moe` @ `65ef8b7`). Its measured
+(a local `vllm-neuron` checkout, `origin/add-qwen36-moe` @ `65ef8b7`). Its measured
 numbers, for reference:
 
 | Metric | vLLM-Neuron port | Config |

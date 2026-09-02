@@ -129,6 +129,25 @@ Always re-measure at the batch you ship, and never generalize a single-batch mea
 The accompanying microbenchmark was dispatch-bound and did not predict either result.
 
 
+## Unconditional partition-tiling of a section that fits — costs 3.0%
+
+Not a lever that failed; a *robustness* change that quietly cost throughput, which is the same
+trap from the other direction. Tiling the CTE route packer's partition-major block-metadata
+section to ≤128 partitions lifted a real compile ceiling (BS=8 / `max_blocks=160` had failed
+with `iota dst partition dimension 160 exceeds maximum 128`) and was shipped as "buys ~zero
+throughput". Nobody tested whether it **cost** any.
+
+At the shipping config the loop runs one iteration and is bit-identical. It was still
+**−3.0%**: 4,370.8 → 4,244.9 tok/s at BS=6/chunk1024/40L/seq10k, two tiled runs at 0.026%
+spread, identical fingerprint. Cause is SBUF allocation only — an added alloc scope, a hoisted
+live range, and renamed buffers changing allocation order.
+
+Fix is conditional emission (`> 128` only), not reverting the ceiling fix. See Pattern 6.
+
+**The transferable claim: "bit-identical" says nothing about performance.** And a change
+justified as robustness still needs a throughput A/B at the config you ship, because "should be
+free" is a prediction, and this workload has falsified that prediction at ±1–2% several times.
+
 ## Extrapolating a saturating curve past its last point — burned twice in one session
 
 2026-08-22, tokens-per-MoE-call at 40L/seq10k: 2,048 → 4,096 = **+3.3%**; 4,096 → 6,144 =

@@ -98,6 +98,27 @@ Compiling **8 ranks of a large graph in parallel** exhausted 124 GB of host RAM.
 If host RAM is the constraint, cross-compile on a large-RAM host and transplant the cache
 rather than growing the graph.
 
+## 6. Record the host neuron stack with every number you quote
+
+The container consumes the **host's** `/opt/aws/neuron` by bind mount, so the host driver /
+runtime / collectives versions are part of the measurement, not the environment. Capture them
+next to the result:
+
+```bash
+dpkg -l | grep -E 'aws-neuron|neuron-dkms' > host_neuron_versions.txt   # or apt list --installed
+```
+
+Cost of not doing it, paid once: a 4,383.9 tok/s prefill record was measured on a box that was
+later terminated. On a fresh box the identical source, nkilib and image gave 4,370.8 — a real
+−0.30% against a 0.026% run-to-run spread, but **unattributable and unfixable**, because there
+was no record of what the old host ran and no box left to A/B. It also cost hours of suspicion
+aimed at the wrong thing.
+
+Corollary: when a number does not reproduce on new hardware, separate *your* deltas from the
+host's before blaming either. Bisect your own commits first — in that incident 3.0% of the 3.2%
+turned out to be a local commit that landed *after* the record, and only the residual 0.30% was
+the host.
+
 ## Sizing rules learned empirically (calibrate per model)
 
 - Cap **in-flight tokens** (`batch × chunk`) rather than batch. On the 35B at 40 layers,
@@ -119,5 +140,11 @@ Never accept a speedup without an equivalence check, and pick the right strength
   measuring.
 - A matching generation hash is **not** an equivalence gate — ours agreed across a real defect
   *and* across the fix for it. Occupancy plus norms caught what the hash missed.
+- **A matching NEFF md5 is not an equivalence gate either, and a mismatching one proves
+  nothing.** `neuronx-cc` is not byte-reproducible: recompiling the *same* source gave
+  **8 of 108** matching NEFFs, including two files of identical size (10,493 B) with different
+  md5s for a helper kernel the change could not touch. So do not gate on NEFF bytes in either
+  direction. Gate on the output fingerprint (top-k **and** sum/norm **and** finite **and**
+  occupancy) plus device memory, and on timing against a known spread.
 - Beware silent finite-but-wrong: mutating one tensor twice in a traced graph loses writes, and
   the output stays plausible. Check occupancy of every buffer you expect to be written.
