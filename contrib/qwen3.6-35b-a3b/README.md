@@ -41,25 +41,23 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 | **Decode** | **681.3 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv + per-layer DeltaNet state (`DN_PERLAYER_STATE=1`), TP=8/LNC=1, O1, **beta-5 container**, seq=256 (**+7.8%** over beta-4's 632.0; **582.3 tok/s** at seq=1024; bit-identical `0cc59fb25112`) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
 
 > **Scope of the prefill headline: it is BS=6 at N=10,000, not the 20,000-token regime
-> this model targets.** Two things follow, and neither is closed:
+> this model targets.** Aggregate tok/s is nearly flat in prompt length — measured
+> 2,803.6 @5k → 2,790.6 @10k → 2,775.6 @20k, because prefill tiles into fixed 1024-token
+> chunks — so N=10,000 flatters the figure by only ~0.5%. An FP8 run at N=20,000 has not been
+> done, and on that scaling evidence is not expected to change the picture.
 >
-> 1. **N=10,000 flatters the number slightly.** Aggregate tok/s is nearly flat in prompt
->    length — measured 2,803.6 @5k → 2,790.6 @10k → 2,775.6 @20k — because prefill tiles
->    into fixed 1024-token chunks. So the effect is only ~0.5%, but it is not zero, and
->    **an FP8 run at N=20,000 has not been done.**
-> 2. **How much of the gain is FP8 rather than tuning is open.** The batch and
->    tokens-per-MoE-call tuning was applied only to the FP8 path; **BF16 CTE has never been
->    run at BS=6/bucket 1024.** At the one config where both were measured (BS=2/bucket
->    1024) BF16 was *faster* — 4,227.7 vs FP8's 3,920.3, the ~7% FP8 dequant tax — and the
->    output-block hoist is what removed that tax. So do not read the headline as "FP8 is
->    faster than BF16" without that run.
+> **What FP8 buys here is capacity, and the capacity is what buys the throughput.** BF16 CTE
+> **cannot run this configuration at all**: at BS=6/bucket 1024 its module loads at
+> 8.94 GB/core, then the 6,144-token activation working set fails to allocate — 48 MB
+> intermediates, on all four ranks, `NRT EXECUTION FAILED: Failed to load model with
+> collectives` (measured 2026-09-02; host RAM was never the constraint). FP8's 5.08 GB/core
+> leaves 3.86 GB/core more headroom, which is precisely what makes BS=6 reachable.
 >
-> The memory win survives both caveats, though state it precisely: **5.08 GB/core at BS=6**
-> versus BF16 CTE's **8.95 GB/core at BS=2**. Those are different batches, so it is not a
-> like-for-like row — it is a *stronger* result than one, since FP8 uses 43% less HBM at 3×
-> the batch. Capacity is what FP8 reliably buys here.
->
-> Two runs would close this out: FP8 at N=20,000, and BF16 CTE at BS=6/bucket 1024.
+> So the honest comparison is *best-to-best at equal N*, not like-for-like: FP8 **4,370.6** at
+> BS=6 versus BF16's **4,227.7** at BS=2, both N=10,000 — **+3.4%**. Read that as FP8
+> unlocking an operating point BF16 cannot occupy, **not** as FP8 being the faster kernel. At
+> the one configuration where both fit (BS=2/bucket 1024) **BF16 was faster** — 4,227.7 vs
+> FP8's 3,920.3, the ~7% dequant tax the output-block hoist later removed.
 
 > **Reproduction note — the FP8 prefill headline was 4,383.9 and is now 4,370.6 (−0.30%).**
 > The 4,383.9 figure was measured 2026-08-22 on a trn2.3xlarge that has since been terminated,

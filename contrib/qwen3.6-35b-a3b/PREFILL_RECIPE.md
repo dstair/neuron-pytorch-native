@@ -385,15 +385,16 @@ independently.
 > - **N:** aggregate tok/s is nearly flat in prompt length (2,803.6 @5k → 2,790.6 @10k →
 >   2,775.6 @20k, measured), so N=10,000 flatters by only ~0.5%. **An FP8 run at
 >   N=20,000 has not been done.**
-> - **BS:** the batch/tokens-per-call tuning was applied **only to FP8**. **BF16 CTE has
->   never been run at BS=6/bucket 1024**, so how much of the gap is FP8 versus tuning is
->   open. At the one config where both were measured (BS=2/bucket 1024) **BF16 was
->   faster** — 4,227.7 vs FP8's 3,920.3, the ~7% dequant tax that lever 1 then removed.
-> - **Memory:** 5.08 GB/core **at BS=6** vs BF16 CTE's 8.95 GB/core **at BS=2** — different
->   batches, so not a like-for-like row, but a stronger result than one: 43% less HBM at 3×
->   the batch. Capacity is what FP8 reliably buys.
->
-> Two runs would close this: FP8 at N=20,000, and BF16 CTE at BS=6/bucket 1024.
+> - **BS: BF16 CTE cannot reach this configuration.** Measured 2026-09-02 — BF16 at
+>   BS=6/bucket 1024 loads its module at 8.94 GB/core, then **OOMs on activations** at device
+>   load (48 MB intermediates, all four ranks, `NRT EXECUTION FAILED: Failed to load model
+>   with collectives`). FP8's 5.08 GB/core leaves 3.86 GB/core more headroom, which is what
+>   makes BS=6 reachable. So the comparison is best-to-best at equal N: FP8 **4,370.6**
+>   (BS=6) vs BF16 **4,227.7** (BS=2), both N=10,000 = **+3.4%** — FP8 unlocking an operating
+>   point BF16 cannot occupy, *not* a faster kernel. At the one config where both fit
+>   (BS=2/bucket 1024) **BF16 was faster**: 4,227.7 vs FP8's 3,920.3.
+> - **Memory:** 5.08 GB/core at BS=6 vs BF16's 8.94 GB/core at BS=2 (BF16 at BS=6 does not
+>   load). Capacity is what FP8 reliably buys, and here capacity is the throughput lever.
 
 Capping is **not** bit-identical to not capping at 40L (`sum=-4.87432719e+05` capped vs
 `-4.93343469e+05` uncapped, norm within 0.12%, top5 identical): 2 calls of 2,048 versus
