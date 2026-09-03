@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """CPU algebra checks for sharding the SHARED expert over TP (MOE_SHARED_TP).
 
+REFUTED ON DEVICE 2026-09-02 -- the MOE_SHARED_TP flag has been REVERTED and no longer
+exists. At 40L/seq10k it measured -0.28% throughput (gate was >= +1.5%) and cosine
+0.9991249 (gate was >= 0.9999), while saving 0.22 GB/core. See
+skills/nki-perf-patterns/references/refuted-levers.md.
+
+This file is kept deliberately, because it is the evidence that the ALGEBRA is exact
+(2e-7 relative in fp32) -- which is what makes the 4% relative-L2 divergence measured
+on device a DEVICE/precision property rather than a math error. Do not re-derive the
+algebra from scratch; read the ledger entry first.
+
 The shared expert is replicated on every rank today, costing about as much per rank
 as the entire expert-parallel routed computation. Sharding it over its intermediate
 dim is exact and needs no new collective, but only if the per-rank partial is folded

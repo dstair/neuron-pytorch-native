@@ -195,22 +195,6 @@ USE_MOE_NKILIB = os.environ.get("MOE_NKILIB", "0") == "1"
 # metadata is built at runtime with fixed tensor shapes by moe_cte_adapter.py.
 USE_MOE_CTE = os.environ.get("MOE_CTE", "0") == "1"
 USE_MOE_CTE_NKI_PACK = os.environ.get("MOE_CTE_NKI_PACK", "0") == "1"
-# Shard the SHARED expert over TP instead of replicating it.
-#
-# The routed experts are expert-parallel, so at TP=8 each rank does 25.2M/8 = 3.15M
-# MACs per token per layer. The shared expert is 2*512*2048 + 2048*512 = 3.15M MACs
-# and is REPLICATED on every rank -- so it costs as much per rank as the entire
-# sharded routed computation, on all 40 layers, for every token. Roughly half of
-# per-rank MoE MACs are this one replicated block.
-#
-# Sharding is exact and needs NO new collective: colwise-shard sh_gate/sh_up over the
-# intermediate dim and rowwise-shard sh_down, then fold the per-rank partial in
-# BEFORE the all-reduce that is already there. The output gate `sg` is a [T,1] scalar
-# computed from replicated inputs, so it is identical on every rank and
-#     sum_r (sg * sh_r) == sg * sum_r sh_r == sg * sh.
-# Numerics are NOT bit-identical: the shared term now enters the fp32 tree-reduce
-# instead of being added after it, which changes summation order.
-USE_MOE_SHARED_TP = os.environ.get("MOE_SHARED_TP", "0") == "1"
 # FP8xFP8 prefill CTE: experts resident as 256x256-block legacy-E4M3 (int8), run as
 # double_row FP8 matmuls (Trainium2 2x). Prefill-only; decode uses MOE_FUSED_W8.
 USE_MOE_CTE_FP8 = os.environ.get("MOE_CTE_FP8", "0") == "1"
@@ -1214,20 +1198,6 @@ class StaticDecode35B(nn.Module):
         """
         lead = x.shape[:-1]
         x2d = x.reshape(-1, D.HIDDEN)
-        # MOE_SHARED_TP shards the shared-expert weights at LOAD time, so every
-        # consumer must fold its partial in BEFORE the all-reduce. Only _moe_cte
-        # does. Every other variant -- including CTE's own DECODE path, which falls
-        # through to _moe_nkilib below -- adds the shared term AFTER the reduce and
-        # would silently return 1/TP of it. Fail at trace time rather than ship a
-        # finite-but-wrong number.
-        if USE_MOE_SHARED_TP and not (USE_MOE_CTE and prefill):
-            raise RuntimeError(
-                "MOE_SHARED_TP=1 is implemented only for the MOE_CTE prefill path "
-                "(_moe_cte). This call would take a variant that adds the shared "
-                "expert after the all-reduce, which with sharded shared weights "
-                f"returns 1/TP of it. prefill={prefill}, MOE_CTE={USE_MOE_CTE}. "
-                "Unset MOE_SHARED_TP, or extend the pre-reduce fold to this variant."
-            )
         if USE_MOE_FUSED_W8 and (
             not USE_MOE_FUSED_W8_ROW_FP8 or uses_row_fp8_layer(i)
         ):
@@ -1475,23 +1445,6 @@ class StaticDecode35B(nn.Module):
             return self._moe_fused_w8_parts(i, x2d)
         return self._moe_reference_parts(i, x2d)
 
-    def _shared_expert_parts(self, i, xf):
-        """(sg, sh) for layer i, UNMULTIPLIED -- distinct from _shared_expert above,
-        which returns the product sg*sh. The parts are needed separately because the
-        MOE_SHARED_TP fold multiplies sg into a per-rank PARTIAL before the all-reduce.
-
-        sg is [T,1] and identical on every rank (xf and sh_sigmoid are both
-        replicated), which is what makes that fold exact. Under MOE_SHARED_TP, sh is
-        this rank's partial over the shared intermediate dim; otherwise it is the full
-        shared output."""
-        sg = torch.sigmoid(F.linear(xf, getattr(self, f"l{i}_sh_sigmoid").float()))
-        sh = F.linear(
-            F.silu(F.linear(xf, getattr(self, f"l{i}_sh_gate").float()))
-            * F.linear(xf, getattr(self, f"l{i}_sh_up").float()),
-            getattr(self, f"l{i}_sh_down").float(),
-        )
-        return sg, sh
-
     def _moe_cte(self, i, x2d, lead):
         """Long-token MoE using nkilib's blockwise context-encoding kernel."""
         T = x2d.shape[0]
@@ -1503,21 +1456,6 @@ class StaticDecode35B(nn.Module):
             raise ValueError("MOE_CTE_NKI_PACK supports MOE_CTE_BLOCK=256 or 512")
 
         xf = x2d.float()
-        # MOE_SHARED_TP=1 must fold the shared partial in BEFORE the all-reduce, which
-        # puts the shared-expert matmuls ON the collective's critical path -- in the
-        # replicated form they instead compute CONCURRENTLY with the all-reduce and are
-        # added after it. Measured cost of losing that overlap: -0.28% at 40L/seq10k
-        # (4,358.2 vs 4,370.6) despite removing ~44% of per-rank MoE MACs.
-        #
-        # The shared expert depends only on xf, so emit it HERE, before the routed
-        # kernel, and let it overlap the routed MoE instead of the collective.
-        # MOE_SHARED_HOIST=0 reverts to emitting it at the original site, which is what
-        # the -0.28% measurement used.
-        _sh_hoist = (
-            USE_MOE_SHARED_TP
-            and os.environ.get("MOE_SHARED_HOIST", "1") == "1"
-        )
-        _sh_pre = self._shared_expert_parts(i, xf) if _sh_hoist else None
         logits = F.linear(xf, getattr(self, f"l{i}_router").float())
         rw = F.softmax(logits, dim=1, dtype=torch.float)
         rw_top, sel = torch.topk(rw, D.TOP_K, dim=-1)
@@ -1588,18 +1526,14 @@ class StaticDecode35B(nn.Module):
         if os.environ.get("MOE_CTE_SYNC_BEFORE_SHARED", "0") == "1":
             torch.neuron.synchronize()
 
-        # Reuse the hoisted value when MOE_SHARED_HOIST=1, else emit it here.
-        sg, sh = _sh_pre if _sh_pre is not None else self._shared_expert_parts(i, xf)
-        if USE_MOE_SHARED_TP:
-            # sh is this rank's PARTIAL over the shared intermediate dim, so fold it
-            # in before the reduce and let the existing all-reduce sum it:
-            #   sum_r (routed_r + sg * sh_r) = routed + sg * sh.
-            # Zero extra collectives; not bit-identical to the post-reduce add,
-            # because the shared term now joins the fp32 tree-reduce.
-            return functional_all_reduce(
-                routed.float() + sg * sh, "sum", self.tp_group
-            ).reshape(*lead, D.HIDDEN)
         routed = functional_all_reduce(routed.float(), "sum", self.tp_group)
+
+        sg = torch.sigmoid(F.linear(xf, getattr(self, f"l{i}_sh_sigmoid").float()))
+        sh = F.linear(
+            F.silu(F.linear(xf, getattr(self, f"l{i}_sh_gate").float()))
+            * F.linear(xf, getattr(self, f"l{i}_sh_up").float()),
+            getattr(self, f"l{i}_sh_down").float(),
+        )
         return (routed + sg * sh).reshape(*lead, D.HIDDEN)
 
     def _moe_nkilib(self, i, x2d, lead):
@@ -2973,21 +2907,6 @@ def load_sharded_weights(
         s = w.shape[1] // ws
         return w[:, r * s:(r + 1) * s].clone()
 
-    # MOE_SHARED_TP: split the shared expert over its intermediate dim, mirroring
-    # what MOE_DECODE_TP already does for the routed experts' intermediate width.
-    # Off by default -> returns the full tensor, so every other path is untouched.
-    if USE_MOE_SHARED_TP and D.SHARED_INTER % world_size:
-        raise RuntimeError(
-            f"MOE_SHARED_TP requires shared_expert_intermediate_size "
-            f"({D.SHARED_INTER}) divisible by TP ({world_size})"
-        )
-
-    def _shared_gate_up_slice(w):        # [SHARED_INTER, H] -> [SHARED_INTER/ws, H]
-        return colwise(w) if USE_MOE_SHARED_TP else w
-
-    def _shared_down_slice(w):           # [H, SHARED_INTER] -> [H, SHARED_INTER/ws]
-        return rowwise(w) if USE_MOE_SHARED_TP else w
-
     def load_experts(lp, layer_index):
         """Load this rank's expert-parallel rows or intermediate-width shards."""
         if w8_mode:
@@ -3090,12 +3009,9 @@ def load_sharded_weights(
             "post_norm": get(lp + "post_attention_layernorm.weight"),
             # MoE — expert-parallel slice + replicated router/shared
             "router": get(lp + "mlp.gate.weight"),                       # [E,H] replicated
-            "sh_gate": _shared_gate_up_slice(get(lp + "mlp.shared_expert.gate_proj.weight")),
-            "sh_up": _shared_gate_up_slice(get(lp + "mlp.shared_expert.up_proj.weight")),
-            "sh_down": _shared_down_slice(get(lp + "mlp.shared_expert.down_proj.weight")),
-            # Stays REPLICATED under MOE_SHARED_TP: it is a [1,H] matvec producing the
-            # [T,1] gate, and that gate must multiply the PRE-reduce partial on every
-            # rank for sum_r (sg * sh_r) == sg * sh to hold.
+            "sh_gate": get(lp + "mlp.shared_expert.gate_proj.weight"),
+            "sh_up": get(lp + "mlp.shared_expert.up_proj.weight"),
+            "sh_down": get(lp + "mlp.shared_expert.down_proj.weight"),
             "sh_sigmoid": get(lp + "mlp.shared_expert_gate.weight"),
         }
         lw.update(expert_weights)
@@ -3307,18 +3223,6 @@ def main():
             f"  module on device: {mem:.2f} GB/core "
             f"(lm_head {lm_head_mode}: "
             f"{mod.lm_head_w.numel() * mod.lm_head_w.element_size() / 1e9:.2f} GB)"
-        )
-        # Prove from the log which shared-expert mode actually ran, and prove it from
-        # the loaded TENSOR rather than from the env var -- an env var that never
-        # reaches the container reads as "off" in Python and silently gives you a
-        # second baseline. That happened once; hence the shape in the banner.
-        _shw = mod.l0_sh_gate.shape
-        print(
-            f"  shared expert: {'TP-SHARDED' if USE_MOE_SHARED_TP else 'replicated'}"
-            f" (MOE_SHARED_TP={int(USE_MOE_SHARED_TP)}), "
-            f"l0_sh_gate={tuple(_shw)}"
-            f" [expect ({D.SHARED_INTER // world_size if USE_MOE_SHARED_TP else D.SHARED_INTER}"
-            f", {D.HIDDEN})]"
         )
 
     B = args.batch_size
