@@ -1,0 +1,51 @@
+{
+ "args": {
+  "n": 2,
+  "device": "neuron",
+  "no_compile": false,
+  "dtype": "bf16",
+  "enc_buckets": "8,16,32",
+  "prefill_buckets": "128,256,512",
+  "max_seq": 768,
+  "max_new": 256,
+  "repeats": 3
+ },
+ "results": [
+  {
+   "id": "1272-128104-0000",
+   "match": true,
+   "div": null,
+   "text": "Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.",
+   "ref_text": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+   "cold": 32.703955698991194,
+   "C": 8,
+   "P": 128,
+   "ntok": 23,
+   "cpu_s": 1.2759451370220631,
+   "enc": 0.01068438496440649,
+   "prefill": 0.007768555078655481,
+   "step": NaN,
+   "step_amort": 0.004396507728167556,
+   "e2e": 0.11512903892435133
+  },
+  {
+   "id": "1272-128104-0001",
+   "match": true,
+   "div": null,
+   "text": "Nor is Mister Quilter's manner less interesting than his matter.",
+   "ref_text": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+   "cold": 0.08514527510851622,
+   "C": 8,
+   "P": 128,
+   "ntok": 14,
+   "cpu_s": 0.8353952639736235,
+   "enc": 0.01061584404669702,
+   "prefill": 0.00804750993847847,
+   "step": NaN,
+   "step_amort": 0.004917060616067969,
+   "e2e": 0.08264421089552343
+  }
+ ],
+ "wer": 0.037037037037037035,
+ "matches": 2
+}
