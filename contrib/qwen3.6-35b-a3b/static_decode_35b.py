@@ -1525,6 +1525,7 @@ class StaticDecode35B(nn.Module):
             return routed.reshape(*lead, D.HIDDEN)
         if os.environ.get("MOE_CTE_SYNC_BEFORE_SHARED", "0") == "1":
             torch.neuron.synchronize()
+
         routed = functional_all_reduce(routed.float(), "sum", self.tp_group)
 
         sg = torch.sigmoid(F.linear(xf, getattr(self, f"l{i}_sh_sigmoid").float()))
@@ -3372,6 +3373,18 @@ def main():
                             for name, t in zip(finite_names, outputs)
                         )
                         print(f"  PREFILL state N={N}: {state}", flush=True)
+                        # sum/norm/top5 cannot express COSINE, and cosine is the gate
+                        # for any change that legitimately alters summation order.
+                        # Worse, sum and norm can disagree about how big a change is:
+                        # sum is a cancellation-prone Sigma(x) over ~248k logits, so a
+                        # correlated perturbation moves it by orders of magnitude more
+                        # than it moves the norm. Dump the logits so cosine and max-abs
+                        # can be computed against a reference run offline.
+                        _lp = os.environ.get("PREFILL_SAVE_LOGITS", "")
+                        if _lp:
+                            torch.save(lf.cpu(), _lp)
+                            print(f"  PREFILL saved logits -> {_lp} {tuple(lf.shape)}",
+                                  flush=True)
                         if os.environ.get("PREFILL_KV_MAP", "0") == "1":
                             # Per-GQA-layer occupancy. Under the shared-cache bug
                             # this read [10485760,0,10485759,0,0,10485760,0,

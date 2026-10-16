@@ -762,16 +762,41 @@ files of *identical* size (10,493 B) with different md5s for a helper kernel nei
 touches. The gates that do hold are the output fingerprint, device memory, and timing against
 a measured spread.
 
-**What this does and does not show.** At the one config where BF16 and FP8 were both
-measured (BS=2, 2,048 tok/call) **BF16 was 7.8% faster** — the FP8 dequant tax. The
-output-block hoist removed that tax, and the tokens-per-call tuning then pushed FP8 past
-the BF16 *configuration*. But **BF16 CTE was never re-run at BS=6/bucket 1024**, so the
-FP8-versus-BF16 question at the tuned operating point is open, and the headline gap should
-not be attributed to FP8 alone.
+##### RESOLVED 2026-09-02: BF16 CTE cannot reach BS=6 — the capacity IS the throughput lever
 
-The memory result survives, stated precisely: 5.08 GB/core **at BS=6** vs BF16 CTE's
-8.95 GB/core **at BS=2**. Different batches, so not a like-for-like row — but stronger than
-one, since FP8 uses 43% less HBM at 3× the batch.
+This was recorded as open ("BF16 CTE was never re-run at BS=6/bucket 1024, so the
+FP8-versus-BF16 question at the tuned operating point is open"). It has now been run, and it
+does not complete:
+
+| config | module on device | result |
+|---|---:|---|
+| FP8 CTE, BS=6/bucket 1024 | **5.08 GB/core** | 4,370.6 tok/s |
+| **BF16 CTE, BS=6/bucket 1024** | **8.94 GB/core** | **device OOM at NEFF load** |
+
+BF16's module *loads* at 8.94 GB/core; it then fails to allocate the 6,144-token activation
+working set — `Failed to allocate DEVICE memory (50331648 bytes)`, i.e. 48 MB intermediates,
+on **all four ranks** (HBM 0–3), ending in `NRT EXECUTION FAILED: Failed to load model with
+collectives, Failed to allocate resource`. Host RAM was never the constraint (73 GB free, the
+OOM watchdog never tripped), so this is a pure device OOM at load — the documented signature
+for "reduce in-flight activations, not weights."
+
+FP8 leaves **3.86 GB/core more headroom**, and that is precisely what makes BS=6 reachable.
+
+**How to state the FP8 result, then.** Best-to-best at equal N, since like-for-like at BS=6
+does not exist: FP8 **4,370.6** (BS=6) vs BF16 **4,227.7** (BS=2), both N=10,000 → **+3.4%**.
+The mechanism is capacity, not arithmetic speed:
+
+- at the one config where **both** fit (BS=2, 2,048 tok/call) **BF16 was 7.8% faster** —
+  4,227.7 vs 3,920.3, the FP8 dequant tax;
+- the output-block hoist removed that tax, and the tokens-per-call tuning then moved FP8 to
+  an operating point **BF16 cannot occupy at all**.
+
+So FP8 does not win by computing faster. It wins by fitting, and the configuration it can fit
+into is faster than the best configuration BF16 can fit into. A prediction made before this
+run — that BF16 at BS=6 would fit in ~9.2 GB/core with ~2.8 GB/core spare — was **wrong**: the
+resident estimate was close (8.94 actual) but it treated the activation working set as
+cancelling between the two paths. It does not cancel; BF16 has 3.86 GB/core less room to hold
+the same activations.
 
 Two caveats on the numerics:
 

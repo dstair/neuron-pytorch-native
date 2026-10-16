@@ -94,6 +94,31 @@ def nki_deltanet_chunked_prefill_v2(
     num_chunks = S // C
     Q_SCALE = 1.0 / math.sqrt(K_DIM)
 
+    # Both divisions above FLOOR, and every write below is exactly
+    # out[base : base+C] for base = stream*S + c*C with c < num_chunks. So any
+    # remainder leaves TAIL ROWS OF `out` NEVER WRITTEN -- and `out` is a fresh
+    # nl.shared_hbm allocation, not zeroed, so those rows are returned as whatever
+    # was already in HBM: finite, plausible, and fed straight into the residual
+    # stream. Nothing downstream can detect it (a finiteness check passes, and the
+    # magnitudes are ordinary), which is why this is asserted rather than trusted.
+    #
+    #   total_rows % num_streams != 0  ->  total_rows - num_streams*S rows unwritten
+    #   S % C != 0                     ->  S % C rows unwritten PER STREAM
+    #
+    # Shipping configs are safe (bucket 1024 with C in {16,32}), so this is latent,
+    # not active. Asserted at trace time, in the style of the DN_STREAM_WINDOW check
+    # below and gqa_rope_kv_35b.py's chunk-divides-TILE assert.
+    assert total_rows % num_streams == 0, (
+        f"chunked prefill: query rows {total_rows} must be divisible by "
+        f"num_streams {num_streams} (= batch {batch_size} * V_HEADS {V_HEADS}); "
+        f"the remainder would return uninitialised rows of `out`"
+    )
+    assert S % C == 0, (
+        f"chunked prefill: per-stream length S={S} must be divisible by "
+        f"CHUNK_SIZE C={C}; S % C = {S % C} tail rows per stream would be "
+        f"returned uninitialised from `out`"
+    )
+
     out = nl.ndarray((total_rows, V_DIM), dtype=nl.float32, buffer=nl.shared_hbm)
     new_state = nl.ndarray(
         (batch_size, V_HEADS * K_DIM, V_DIM),

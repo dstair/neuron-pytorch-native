@@ -148,6 +148,51 @@ Fix is conditional emission (`> 128` only), not reverting the ceiling fix. See P
 justified as robustness still needs a throughput A/B at the config you ship, because "should be
 free" is a prediction, and this workload has falsified that prediction at ±1–2% several times.
 
+## Sharding the replicated shared expert (MOE_SHARED_TP) — fails on BOTH speed and numerics
+
+The premise was real and verified: the shared expert is replicated on every rank (the loader
+comment reads "expert-parallel slice + replicated router/shared"), and per token per layer it
+costs `2*512*2048 + 2048*512 = 3.15M` MACs against the routed experts' `25.2M/8 = 3.15M`
+per rank at TP=8. So **~half of per-rank MoE MACs were one replicated block**, on all 40
+layers. Sharding it over the intermediate dim is exact algebra and needs no new collective:
+`sg` is a replicated `[T,1]` gate, so `sum_r (sg * sh_r) == sg * sh`.
+
+Measured at 40L / seq10k / BS=6 / chunk1024, against pre-registered gates:
+
+| | baseline | MOE_SHARED_TP=1 | gate | verdict |
+|---|---:|---:|---|---|
+| throughput | 4,370.6 tok/s | **4,358.2 (−0.28%)** | ≥ +1.5% | FAIL |
+| cosine vs baseline logits | — | **0.9991249** | ≥ 0.9999 | FAIL |
+| module memory | 5.08 GB/core | **4.86 GB/core** | — | −0.22 GB |
+
+Removing ~44% of per-rank MoE MACs bought **−0.28%**, which is ~11× the 0.026% run spread, so
+a real small regression. The memory saving is exact (`3.15M × 2 B × 40 × 7/8 = 220 MB`), so the
+sharding did precisely what it should. **It is a capacity lever, not a speed lever** — the same
+verdict this workload has now returned for FP8, batch, and context parallel.
+
+Two mechanisms, both of which a FLOP-only bound misses:
+
+1. **The pre-reduce fold destroys an overlap.** Replicated, the shared-expert matmuls compute
+   *concurrently with the all-reduce* and are added after it. Folding the partial in before the
+   reduce puts them on the collective's critical path. Tested the fix — emit the shared expert
+   before the routed kernel so it overlaps that instead (`MOE_SHARED_HOIST`) — and it changed
+   nothing at 4L (163.6 vs 162.7 ms), so lost overlap is not the whole story.
+2. **`sh_down`'s contraction drops 512 → 64**, below the PE array's 128-partition width, so the
+   down-projection wastes half its width and the FLOP saving is nearer 4× than 8×.
+
+**UNEXPLAINED and worth knowing: the on-device numerics diverged 4% (rel L2 3.98e-02, max abs
+0.695 against RMS 1.777) while the CPU algebra is exact to 2e-7 in fp32.** `functional_all_reduce`
+applies no dtype cast, so either the collective does not preserve fp32 for large summands — which
+would be a latent precision property of folding *any* term into a reduce — or the fold has a bug
+that CPU-scale testing cannot see. One run would separate them: shard the weights but reconstruct
+with a second all-reduce and keep the add post-reduce. Not done.
+
+**Lesson: bound the SHAPES, not just the FLOPs.** The Rule 0 bound counted MACs and never asked
+what shapes the remaining work would run in, nor what concurrency the reordering destroyed. Both
+turned out to matter more than the MAC count. Reverted; the CPU algebra test
+(`kernels/tests/test_moe_shared_tp_cpu.py`) is kept as the record that the math was right and the
+divergence is a device property.
+
 ## Extrapolating a saturating curve past its last point — burned twice in one session
 
 2026-08-22, tokens-per-MoE-call at 40L/seq10k: 2,048 → 4,096 = **+3.3%**; 4,096 → 6,144 =

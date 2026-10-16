@@ -458,6 +458,58 @@ def _block_quant_stats(source, scale_expanded):
     return quantized, stats
 
 
+def assert_output_block_scale_grid(gate_up_scales, down_scales):
+    """Fail loudly if these grids are NOT input-block-independent.
+
+    ``nki_moe_fused_w8_fp8_block_coalesced_ob`` (Reduction B1) accumulates the whole
+    contraction natively in PSUM and post-scales each output block ONCE, reading the
+    scale at ``gate_scale_index = output_block`` with the input tile hard-wired to 0
+    (see moe_fused_w8_35b.py's ``coarse_scale`` branch). That rewrite is only valid
+    because
+
+        sum_i (partial_i * s[o]) == s[o] * sum_i partial_i
+
+    which requires ``s`` to be independent of the input block ``i``.
+
+    The hazard this guards is silent, which is why it is checked rather than
+    documented: ``requantize_official_fp8_output_block`` deliberately returns the SAME
+    SHAPE as the per-128x128 grid (values repeated along the input-block axis) so the
+    packing and kernel indexing work unchanged. So handing the B1 kernel a
+    ``block_pow2_coalesced`` weight set compiles, runs, produces finite output of
+    ordinary magnitude -- and is wrong, because 15 of every 16 input blocks get
+    scaled by the wrong factor.
+
+    Checked as a PROPERTY of the tensor rather than as provenance (a marker, a dtype,
+    an env var). The property is the actual precondition: it cannot be forged, cannot
+    be lost through save/load or ``.clone()``, and admits any producer that satisfies
+    it. Both grids carry the contraction axis LAST -- gate/up ``[E,2,I/128,H/128]``
+    contract over H, down ``[E,H/128,I/128]`` contracts over I -- so the requirement
+    is constancy along ``dim=-1``.
+
+    Cheap: one comparison over a grid of a few thousand elements, once at weight load.
+    """
+    for name, grid, contraction in (
+        ("gate/up", gate_up_scales, "H (hidden)"),
+        ("down", down_scales, "I (intermediate)"),
+    ):
+        if grid.shape[-1] == 1:
+            continue                      # single input block: trivially constant
+        first = grid[..., :1]
+        if not torch.equal(grid, first.expand_as(grid)):
+            varying = (grid != first).any(dim=-1).sum().item()
+            raise ValueError(
+                f"block_ob_coalesced requires input-block-independent scales, but the "
+                f"{name} scale grid {tuple(grid.shape)} VARIES along its last axis "
+                f"(the {contraction} contraction axis): {varying} output blocks differ "
+                f"across input blocks. This is what a per-128x128 grid "
+                f"(requantize_official_fp8_pow2 / block_pow2_coalesced) looks like, and "
+                f"the B1 kernel would silently mis-scale every input block but the "
+                f"first -- finite, plausible, wrong. Use "
+                f"requantize_official_fp8_output_block for this impl, or select "
+                f"MOE_FUSED_W8_FP8_IMPL=block_pow2_coalesced."
+            )
+
+
 def quantize_gate_up_256block(gate_up_bf16, block=256, output_block=False):
     """Quantize gate/up experts [E,H,2,I] to 256x256-block legacy-E4M3 (FP8 CTE).
 
@@ -896,6 +948,12 @@ class OfficialFP8ExpertReader:
 
         gate_up_scale_grid = torch.stack(gate_up_scales, dim=0)
         down_scale_grid = torch.stack(down_scales, dim=0)
+        # The B1 kernel's post-accumulation scaling is only correct on an
+        # input-block-independent grid, and the two grid kinds are shape-identical, so
+        # nothing downstream can tell them apart. Verify the property here, where both
+        # grids are still in their official orientation with the contraction axis last.
+        if mode == "fp8" and fp8_impl == "block_ob_coalesced":
+            assert_output_block_scale_grid(gate_up_scale_grid, down_scale_grid)
         if coalesced:
             gate_up_scale_table, down_scale_table = (
                 pack_coalesced_block_scales(
