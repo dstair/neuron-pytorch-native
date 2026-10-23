@@ -1,0 +1,18 @@
+qwen3.5-moe-fp8-trainium2
+Copyright 2026 The Author(s)
+
+Licensed under the Apache License, Version 2.0 (the "License"); see LICENSE.
+
+This project provides the loader and AWS Neuron (NKI) kernel code needed to run
+the official Qwen3.5-35B-A3B FP8 checkpoint on AWS Trainium2. It does NOT
+redistribute model weights.
+
+The FP8 weights are published separately by the Qwen team (Alibaba Cloud) under
+the Apache License, Version 2.0:
+  https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8
+  https://huggingface.co/Qwen/Qwen3.5-35B-A3B   (base model)
+
+This repository contains original code only: a dependency-free safetensors
+reader, CPU-side block-scaled FP8 (E4M3) conversion utilities, and a fused
+Mixture-of-Experts NKI kernel. Users download the weights directly from the
+Qwen repositories above.
