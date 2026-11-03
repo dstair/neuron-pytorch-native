@@ -316,25 +316,31 @@ Calibrations that the harness self-test enforces before it will report anything:
   estimates: `python3 -m sqlft.eval_sql --compare runA.json runB.json`.
 
 Before/after on the **same 128 held-out rows**, same prompt format, same decode settings
-(cached decode, max_new 48):
+(cached decode, max_new 96):
 
 | model | parse_rate [CI] | first_stmt | bind_rate [CI] (of 89) | stage breakdown |
 |---|---:|---:|---:|---|
 | gold (ceiling) | **0.984** | — | — | 2 parse errors |
-| Qwen3.5-4B untuned | 0.539 [0.453, 0.623] | 0.695 | 0.315 [0.228, 0.417] | ok 28, truncated 59, bind_err 20 |
-| **+ 1 epoch LoRA fine-tune** | **0.883** [0.816, 0.928] | **0.930** | **0.652** [0.548, 0.743] | **ok 58, truncated 14, bind_err 23, parse_err 1** |
+| Qwen3.5-4B untuned | 0.602 [0.515, 0.682] | 0.805 | 0.225 [0.150, 0.322] | ok 20, truncated 51, bind_err 36 |
+| **+ 1 epoch LoRA fine-tune** | **0.961** [0.912, 0.983] | **0.961** | **0.697** [0.595, 0.782] | **ok 62, truncated 4, bind_err 25, parse_err 1** |
 
-Paired (McNemar), before vs after: 3 vs 47 discordant rows, **p < 0.001** — the improvement
-is unambiguous. Sources: `runs/lab01_baseline_128_v5.json`, `runs/lab07_eval_ft_128_v5.json`.
+Paired (McNemar), before vs after: 1 vs 47 discordant on parses, **p < 0.001**; 2 vs 44 on
+binds, **p < 0.001**. Sources: `runs/lab01_baseline_128_mn96.json`,
+`runs/lab07_eval_ft_128_mn96.json`.
+
+**The decode cap matters more than it looks.** At max_new 48 the fine-tuned model scored
+0.883 with 14 truncations; at 96 it scores 0.961 with 4 (p = 0.006, paired) — 8 of those
+rows had gold longer than 48 tokens and were unwinnable, 2 more were verbose-but-correct.
+Only 3/128 gold queries exceed 96 tokens (124 max), so 96 is the default. The residual
+failures: 3 degenerate `'SELECT'`-only outputs, 1 gold=124 row, 1 genuine syntax error.
 
 > Historical note: pre-v5 numbers (parse 0.570 baseline, 0.906/0.898 fine-tuned) counted
 > truncations as parse errors and used bind denominators that moved with the model. They
 > are not exactly comparable to the v5 table; both live in `runs/` for reference.
 
-**parse_rate 0.539 → 0.883** against a ceiling of 0.984 — **77% of the achievable gap closed**
-in one epoch. `bind_rate` 2.1×, fully-correct queries 28 → 58, and the residual failures
-are dominated by the decode cap (14 truncations, 17 gold-over-cap rows), not syntax:
-**one genuine parse error** in 128 generations.
+**parse_rate 0.602 → 0.961** against a ceiling of 0.984 — **94% of the achievable gap closed**
+in one epoch. `bind_rate` 3.1×, fully-correct queries 20 → 62, and the residual failures
+are 4 decode-cap truncations and **one genuine parse error** in 128 generations.
 
 > A smaller n=32 run scored a perfect 1.000 and I nearly reported that. It was small-sample
 > luck; 128 rows gives ~0.9. Both numbers are in `runs/`. The 32-row pair is also *not*
@@ -361,11 +367,12 @@ logits is chaotic; the layouts are verified logit-equivalent instead (see below)
 
 Two caveats to carry with the numbers. Part of the gain is learning to emit **EOS** —
 `parse_rate` rewards stopping as much as syntax, and now that is measured rather than
-asserted: the untuned model's `first_stmt_parse_rate` is 0.695 against its 0.539 full-output
-rate, so ~16 points of the baseline failure is *not stopping*, not bad SQL (fine-tuned:
-0.930 vs 0.883). And `bind_rate` is capped well below 1.0 by dataset artifacts — queries
-reading CSV files that do not exist, duplicate column names — not by the model; ~30% of
-eval rows are quarantined out of its denominator entirely.
+asserted: the untuned model's `first_stmt_parse_rate` is 0.805 against its 0.602 full-output
+rate, so ~20 points of the baseline failure is *not stopping*, not bad SQL (fine-tuned:
+0.961 vs 0.961 — the fine-tune closed the ramble gap entirely). And `bind_rate` is capped
+well below 1.0 by dataset artifacts — queries reading CSV files that do not exist,
+duplicate column names — not by the model; ~30% of eval rows are quarantined out of its
+denominator entirely.
 
 The untuned model already writes decent SQL. Its problem is **not stopping** — it emits the
 right statement and then keeps going with more prose:

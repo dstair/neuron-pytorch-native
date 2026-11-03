@@ -46,6 +46,24 @@ Final v5 numbers, 128 rows, cached decode, max_new 48:
 
 Sources: `runs/lab01_baseline_128_v5.json`, `runs/lab07_eval_ft_128_v5.json`.
 
+**max_new 48 → 96 is purely lost points recovered.** Row-level audit of the 14
+truncations: 8 had 48 < gold ≤ 96 (unwinnable at 48), 2 had gold ≤ 48 but the model was
+verbose, 3 were degenerate `'SELECT'`-only outputs (model failures, cap-independent), 1
+had gold = 106. Measured at 96 (`runs/lab07_eval_ft_128_mn96.json`): parse **0.883 →
+0.961** [0.912, 0.983], truncated 14 → 4, ok 58 → 62, bind 0.652 → 0.697, first_stmt ==
+parse (the ramble gap closed too), eval time 8.5 → 9.0 min. Paired vs cap 48: 1 vs 11
+discordant, **p = 0.006** -- significant. The one "regression" (row 103, gold 124) is an
+artifact: at 48 it was cut at a syntactically valid boundary and scored bind_error by
+luck; at 96 it attempts the real query and truncates. Cap defaults are now 96; the last 3
+gold-over-cap rows need 128.
+
+Baseline at 96, for the apples-to-apples (`runs/lab01_baseline_128_mn96.json`): parse
+0.539 → **0.602** (it also truncates less), first_stmt 0.695 → 0.805, but ok 28 → 20 and
+bind 0.315 → 0.225 -- longer completions reference more tables and fail bind more often.
+Canonical before/after at max_new 96: parse **0.602 → 0.961** (1 vs 47 discordant,
+p < 0.001), bind **0.225 → 0.697** (2 vs 44, p < 0.001), 94% of the gap to the 0.984
+ceiling closed in one epoch.
+
 Caution reading across harness versions: pre-v5 numbers counted truncations as parse
 errors and used floating bind denominators, so e.g. the historical 0.906/0.898/0.883
 fine-tuned parse rates and the 0.570 baseline are not exactly comparable to v5's. The
