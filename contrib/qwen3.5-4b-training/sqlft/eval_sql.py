@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import pathlib
 import re
 
@@ -36,13 +37,19 @@ class Verdict:
     binds: bool
     error: str = ""
     # True when the DATASET's own schema will not create, so this row could never bind no
-    # matter what the model emits. Excluded from the bind denominator.
+    # matter what the model emits. Decided from the schema ALONE -- independent of whether
+    # the model's output parses -- so the bind denominator is the same set of rows for
+    # every model and every run.
     schema_unusable: bool = False
+    # True when generation hit the token cap without emitting EOS. A truncation that fails
+    # to parse ("syntax error at end of input") is a decode-cap casualty, not a syntax
+    # failure, so it is reported as its own stage.
+    truncated: bool = False
 
     @property
     def stage(self) -> str:
         if not self.parses:
-            return "parse_error"
+            return "truncated" if self.truncated else "parse_error"
         if self.schema_unusable:
             return "schema_unusable"
         return "ok" if self.binds else "bind_error"
@@ -66,38 +73,55 @@ def _is_syntax_error(exc: BaseException) -> bool:
     return isinstance(exc, duckdb.ParserException)
 
 
-def check_sql(sql: str, schema: str | None = None) -> Verdict:
+def check_sql(sql: str, schema: str | None = None, *, finished: bool = True) -> Verdict:
     import duckdb
 
     sql = sql.strip()
-    if not sql:
-        return Verdict(False, False, "empty output")
 
+    # Schema usability is a property of the DATASET ROW, decided once up front and
+    # independent of whether the model's SQL parses -- INCLUDING the degenerate case of
+    # an empty generation, which must NOT return early before this check (an untuned
+    # model emits comment-only output that extracts to empty; those rows still need
+    # their quarantine counted or the bind denominator changes with the model).
+    schema_unusable = False
+    schema_err = ""
     con = duckdb.connect()
     try:
-        stmts = con.extract_statements(sql)
-    except Exception as e:
-        if _is_syntax_error(e):
-            return Verdict(False, False, _first_line(e))
-        # Parsed fine; the failure is semantic (unknown catalog object, unimplemented).
-        return Verdict(True, False, _first_line(e))
+        if schema is None or not schema.strip():
+            # ~8% of eval rows ship NO schema. There is nothing to bind against, so the
+            # row is unanswerable at the bind stage -- quarantine it like any other
+            # broken schema rather than charging a bind_error to the model.
+            schema_unusable, schema_err = True, "dataset schema: none supplied"
+        else:
+            try:
+                con.execute(schema)
+            except Exception as e:
+                schema_unusable, schema_err = True, f"dataset schema: {_first_line(e)}"
 
-    if schema is None:
-        return Verdict(True, False, "no schema supplied; bind not attempted")
+        if not sql:
+            return Verdict(False, False, "empty output", schema_unusable,
+                           truncated=not finished)
 
-    try:
-        # Trusted dataset input. ~25% of these schemas do not create (FKs referencing
-        # tables that were never emitted), so a failure here is NOT the model's fault.
-        con.execute(schema)
-    except Exception as e:
-        return Verdict(True, False, f"dataset schema: {_first_line(e)}", schema_unusable=True)
+        try:
+            stmts = con.extract_statements(sql)
+        except Exception as e:
+            if _is_syntax_error(e):
+                return Verdict(False, False, _first_line(e), schema_unusable,
+                               truncated=not finished)
+            # Parsed fine; the failure is semantic (unknown catalog object, unimplemented).
+            return Verdict(True, False, _first_line(e), schema_unusable)
 
-    try:
-        for stmt in stmts:
-            con.execute("EXPLAIN " + stmt.query.rstrip().rstrip(";"))
-    except Exception as e:
-        return Verdict(True, False, _first_line(e))
-    return Verdict(True, True)
+        if schema_unusable:
+            return Verdict(True, False, schema_err, schema_unusable=True)
+
+        try:
+            for stmt in stmts:
+                con.execute("EXPLAIN " + stmt.query.rstrip().rstrip(";"))
+        except Exception as e:
+            return Verdict(True, False, _first_line(e))
+        return Verdict(True, True)
+    finally:
+        con.close()
 
 
 # The model may wrap SQL in a fence, add prose, or ramble past the statement. Extracting
@@ -116,28 +140,91 @@ def extract_sql(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def evaluate(pairs: list[tuple[str, str | None]], *, verbose: bool = False) -> dict:
-    """pairs = [(generated_sql, schema_or_None), ...]"""
-    verdicts = [check_sql(extract_sql(sql), schema) for sql, schema in pairs]
+def extract_first_statement(text: str) -> str:
+    """Just the first statement, up to and including the first `;`.
+
+    The untuned model's dominant failure is not stopping: it emits a VALID statement and
+    then rambles (a second question, a second query). `parse_rate` grades the whole output;
+    `first_stmt_parse_rate` grades only the first statement, which separates "cannot write
+    SQL" from "has not learned to stop" -- the EOS confound, made a number.
+    """
+    sql = extract_sql(text)
+    head, sep, _ = sql.partition(";")
+    return head + sep
+
+
+def _wilson(k: int, n: int, z: float = 1.96) -> tuple[float | None, float | None]:
+    """95% Wilson score interval for a binomial proportion.
+
+    The reporting companion to n=128: a point estimate of 0.90 without its interval reads
+    as far more precise than it is (here, roughly +-5 points). Wilson behaves well at the
+    high rates this harness reports, where the normal approximation does not.
+    """
+    if n == 0:
+        return (None, None)
+    p = k / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def evaluate(pairs: list[tuple], *, verbose: bool = False) -> dict:
+    """pairs = [(generated_sql, schema_or_None), ...] or
+              [(generated_sql, schema_or_None, finished_bool), ...]
+
+    `finished` is False when the decode hit the token cap without EOS; a parse failure on
+    such a row is reported as `truncated`, not `parse_error`. 2-tuples mean finished=True
+    (e.g. the gold ceiling, where there is no decode at all).
+    """
+    triples = [(p[0], p[1], p[2] if len(p) > 2 else True) for p in pairs]
+    verdicts = [check_sql(extract_sql(sql), schema, finished=fin)
+                for sql, schema, fin in triples]
+    # "Would the first statement alone have parsed?" -- the EOS-confound probe. Graded
+    # without a schema, so it is purely about syntax.
+    first_parses = [
+        v.parses or check_sql(extract_first_statement(sql)).parses
+        for v, (sql, _s, _f) in zip(verdicts, triples)
+    ]
     n = len(verdicts) or 1
     stages: dict[str, int] = {}
     for v in verdicts:
         stages[v.stage] = stages.get(v.stage, 0) + 1
 
     # bind_rate is over rows whose schema actually creates; anything else is unanswerable.
+    # The quarantine is decided from the schema alone, so this set is IDENTICAL for every
+    # model and every run on the same eval rows.
     bindable = [v for v in verdicts if not v.schema_unusable]
+    n_parse = sum(v.parses for v in verdicts)
+    n_bind = sum(v.binds for v in bindable)
     result = {
         "n": len(verdicts),
-        "parse_rate": sum(v.parses for v in verdicts) / n,
-        "bind_rate": (sum(v.binds for v in bindable) / len(bindable)) if bindable else None,
+        "parse_rate": n_parse / n,
+        "parse_ci95": _wilson(n_parse, len(verdicts)),
+        "first_stmt_parse_rate": sum(first_parses) / n,
+        "bind_rate": (n_bind / len(bindable)) if bindable else None,
+        "bind_ci95": _wilson(n_bind, len(bindable)) if bindable else (None, None),
         "n_bindable": len(bindable),
         "stages": stages,
         "sample_errors": [v.error for v in verdicts
                           if v.error and not v.schema_unusable][:5],
+        # Per-row outcomes, so two runs on the same rows can be compared PAIRED
+        # (compare_runs) instead of by their point estimates alone.
+        "per_row": [
+            {"stage": v.stage, "parses": v.parses, "binds": v.binds,
+             "schema_unusable": v.schema_unusable,
+             "first_stmt_parses": fp, "truncated": v.truncated, "error": v.error,
+             "generated": sql}
+            for v, fp, (sql, _s, _f) in zip(verdicts, first_parses, triples)
+        ],
     }
     if verbose:
-        br = "n/a" if result["bind_rate"] is None else f"{result['bind_rate']:.3f}"
-        print(f"n={result['n']}  parse_rate={result['parse_rate']:.3f}  "
+        lo, hi = result["parse_ci95"]
+        br = "n/a" if result["bind_rate"] is None else (
+            f"{result['bind_rate']:.3f} [{result['bind_ci95'][0]:.3f}, "
+            f"{result['bind_ci95'][1]:.3f}]")
+        print(f"n={result['n']}  parse_rate={result['parse_rate']:.3f} [{lo:.3f}, {hi:.3f}]  "
+              f"first_stmt={result['first_stmt_parse_rate']:.3f}  "
               f"bind_rate={br} (of {result['n_bindable']} bindable)  {result['stages']}")
         for e in result["sample_errors"]:
             print(f"   e.g. {e}")
@@ -173,7 +260,8 @@ def position_ids_from_mask(mask: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def greedy_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 96,
                     seq_len: int = 1024, device="neuron", batch_size: int = 8,
-                    progress: bool = True, chunk: int = 128) -> list[str]:
+                    progress: bool = True, chunk: int = 128,
+                    return_finished: bool = False) -> list[str]:
     """Batched greedy decode, no KV cache, but only as wide as it needs to be.
 
     Why no cache: the trainable NKI GDN kernel takes a full chunk of >=128 tokens and has no
@@ -204,6 +292,7 @@ def greedy_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     eos = tokenizer.eos_token_id
     outputs: list[str] = []
+    finished: list[bool] = []
     n_batches = (len(prompts) + batch_size - 1) // batch_size
     t_start = time.perf_counter()
 
@@ -249,10 +338,11 @@ def greedy_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 
                 break
 
         for g in gen:
+            finished.append(eos in g)
             if eos in g:
                 g = g[: g.index(eos)]
             outputs.append(tokenizer.decode(g, skip_special_tokens=True))
-    return outputs
+    return (outputs, finished) if return_finished else outputs
 
 
 @torch.no_grad()
@@ -317,6 +407,18 @@ def greedy_generate_padded(model, tokenizer, prompts: list[str], max_new_tokens:
     return outputs
 
 
+def gold_over_cap(rows, tokenizer, max_new_tokens: int) -> int:
+    """Rows whose GOLD query is longer than the decode cap -- unwinnable by construction,
+    because the model cannot finish a correct answer either. Reported so a `truncated`
+    stage can be read against how many rows were even winnable.
+    """
+    n = 0
+    for r in rows:
+        if len(tokenizer(r.query, add_special_tokens=False)["input_ids"]) > max_new_tokens:
+            n += 1
+    return n
+
+
 def evaluate_model(model, tokenizer, rows, *, limit: int = 100, max_new_tokens: int = 96,
                    seq_len: int = 1024, device="neuron", batch_size: int = 1,
                    tag: str | None = None) -> dict:
@@ -331,9 +433,16 @@ def evaluate_model(model, tokenizer, rows, *, limit: int = 100, max_new_tokens: 
 
     rows = list(rows)[:limit]
     prompts = [render_prompt(r) for r in rows]
-    gens = greedy_generate(model, tokenizer, prompts, max_new_tokens=max_new_tokens,
-                           seq_len=seq_len, device=device, batch_size=batch_size)
-    result = evaluate([(g, r.schema) for g, r in zip(gens, rows)], verbose=True)
+    gens, finished = greedy_generate(model, tokenizer, prompts,
+                                     max_new_tokens=max_new_tokens, seq_len=seq_len,
+                                     device=device, batch_size=batch_size,
+                                     return_finished=True)
+    result = evaluate([(g, r.schema, f) for g, r, f in zip(gens, rows, finished)],
+                      verbose=True)
+    result["n_gold_over_cap"] = gold_over_cap(rows, tokenizer, max_new_tokens)
+    if result["n_gold_over_cap"]:
+        print(f"note: {result['n_gold_over_cap']} gold queries exceed the {max_new_tokens}-token "
+              f"decode cap (unwinnable rows)")
     result["samples"] = [
         {"question": r.prompt, "gold": r.query, "generated": g}
         for r, g in list(zip(rows, gens))[:5]
@@ -342,6 +451,61 @@ def evaluate_model(model, tokenizer, rows, *, limit: int = 100, max_new_tokens: 
         RUNS.mkdir(parents=True, exist_ok=True)
         (RUNS / f"{tag}.json").write_text(json.dumps(result, indent=2))
         print(f"wrote {RUNS / f'{tag}.json'}")
+    return result
+
+
+# --------------------------------------------------------------------------------------
+
+
+def _binomial_two_sided(k: int, n: int, p: float = 0.5) -> float:
+    """Exact two-sided binomial p-value (no scipy on this box)."""
+    from math import comb
+
+    def pmf(i):
+        return comb(n, i) * p**i * (1 - p) ** (n - i)
+
+    pk = pmf(k)
+    return min(1.0, sum(pmf(i) for i in range(n + 1) if pmf(i) <= pk + 1e-15))
+
+
+def compare_runs(path_a, path_b, *, key: str = "parses") -> dict:
+    """PAIRED comparison of two eval runs on the same rows (McNemar's exact test).
+
+    Point estimates move by a query or two between identical-quality runs (greedy decode
+    is chaotic), so 'run B scored 0.883 vs run A's 0.898' is not evidence of anything on
+    its own. The paired test asks the right question: of the rows where the two runs
+    DISAGREE, is the split consistent with a coin flip? Only a large, lopsided discordant
+    count is a real difference.
+
+    `key` is the per-row boolean to compare: "parses" or "binds".
+    """
+    a = json.loads(pathlib.Path(path_a).read_text())
+    b = json.loads(pathlib.Path(path_b).read_text())
+    ra, rb = a.get("per_row"), b.get("per_row")
+    if not ra or not rb:
+        raise ValueError("both runs need per_row records (re-run with the current harness)")
+    if len(ra) != len(rb):
+        raise ValueError(f"different row counts ({len(ra)} vs {len(rb)}); not the same eval set")
+
+    a_only = sum(1 for x, y in zip(ra, rb) if x[key] and not y[key])
+    b_only = sum(1 for x, y in zip(ra, rb) if y[key] and not x[key])
+    n_disc = a_only + b_only
+    result = {
+        "key": key,
+        "n": len(ra),
+        "a_rate": sum(x[key] for x in ra) / len(ra),
+        "b_rate": sum(x[key] for x in rb) / len(rb),
+        "a_only": a_only,
+        "b_only": b_only,
+        "p_value": _binomial_two_sided(min(a_only, b_only), n_disc) if n_disc else 1.0,
+        "flipped_rows": [i for i, (x, y) in enumerate(zip(ra, rb)) if x[key] != y[key]],
+    }
+    print(f"{path_a.name} vs {path_b.name}  ({key})")
+    print(f"  rates: {result['a_rate']:.3f} vs {result['b_rate']:.3f}  "
+          f"discordant: {a_only} vs {b_only} (of {result['n']})  "
+          f"McNemar p = {result['p_value']:.3f}")
+    print("  -> " + ("no significant difference (p >= 0.05)"
+                       if result["p_value"] >= 0.05 else "SIGNIFICANT difference (p < 0.05)"))
     return result
 
 
@@ -388,11 +552,48 @@ def _self_test() -> int:
     assert check_sql("SELEC a FROM t", schema).stage == "parse_error"
     print("parse_error / bind_error / ok are distinguishable")
 
-    # An uncreatable dataset schema must be quarantined, not charged to the model.
+    # An uncreatable dataset schema must be quarantined, not charged to the model --
+    # whether or not the model's SQL parses (the quarantine is a property of the ROW).
     broken_schema = 'CREATE TABLE a ("x" INT, FOREIGN KEY ("x") REFERENCES nosuch("y"));'
     v = check_sql("SELECT x FROM a", broken_schema)
     assert v.schema_unusable and v.stage == "schema_unusable", v
-    print("uncreatable dataset schema is quarantined, not counted as a model failure")
+    v2 = check_sql("SELEC x FROM a", broken_schema)
+    assert v2.schema_unusable and v2.stage == "parse_error", v2
+    res = evaluate([("SELEC x FROM a", broken_schema), ("SELECT 1", "CREATE TABLE t (x INT)")])
+    assert res["n_bindable"] == 1, res["n_bindable"]  # quarantined despite the parse error
+    v3 = check_sql("SELECT 1", None)
+    assert v3.schema_unusable, v3  # no schema at all: unanswerable, not a model failure
+    # ...including an empty generation (comment-only model output extracts to "").
+    v4 = check_sql("", broken_schema)
+    assert v4.schema_unusable and v4.stage == "parse_error", v4
+    res = evaluate([("-- just a comment", broken_schema), ("SELECT 1", "CREATE TABLE t (x INT)")])
+    assert res["n_bindable"] == 1, res["n_bindable"]
+    print("uncreatable/missing dataset schema is quarantined regardless of model output, "
+          "even an empty one")
+
+    # A decode-cap casualty is reported as truncated, not as a syntax failure.
+    v = check_sql("SELECT * FROM t WHERE x = 'abc", finished=False)
+    assert v.stage == "truncated", v
+    v = check_sql("SELECT * FROM t WHERE x = 'abc", finished=True)
+    assert v.stage == "parse_error", v
+    print("truncation is its own stage, not a parse error")
+
+    # The EOS-confound probe: a valid statement followed by rambling fails parse_rate but
+    # must pass first_stmt_parse_rate.
+    rambled = "SELECT 1; SELECT FROM WHERE garbage"
+    res = evaluate([(rambled, None)])
+    assert res["parse_rate"] == 0.0 and res["first_stmt_parse_rate"] == 1.0, res
+    print("first-statement probe separates 'cannot write SQL' from 'has not learned to stop'")
+
+    # The CI is honest: at n=128 a 0.90 rate has an interval several points wide, and
+    # every run carries per-row records for paired comparison.
+    res = evaluate([("SELECT 1", None)] * 115 + [("SELEC", None)] * 13)
+    lo, hi = res["parse_ci95"]
+    assert lo < 0.898 < hi and hi - lo > 0.03, res["parse_ci95"]
+    assert len(res["per_row"]) == 128
+    assert res["per_row"][0]["stage"] == "schema_unusable"  # SELECT 1, no schema to bind
+    assert res["per_row"][-1]["stage"] == "parse_error"      # SELEC
+    print(f"Wilson CI on 115/128 parses: [{lo:.3f}, {hi:.3f}]; per_row records present")
 
     # Well-formed SQL that merely refers to absent catalog objects must NOT count as a
     # syntax error -- this is the bug the gold parse rate exposed.
@@ -407,5 +608,11 @@ def _self_test() -> int:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
-    ap.parse_args()
+    ap.add_argument("--compare", nargs=2, metavar=("RUN_A.json", "RUN_B.json"),
+                    help="paired (McNemar) comparison of two eval run files")
+    ap.add_argument("--key", choices=("parses", "binds"), default="parses")
+    args = ap.parse_args()
+    if args.compare:
+        raise SystemExit(0 if compare_runs(*args.compare, key=args.key)["p_value"] >= 0
+                         else 1)
     raise SystemExit(_self_test())

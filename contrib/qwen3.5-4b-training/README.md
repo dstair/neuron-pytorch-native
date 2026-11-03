@@ -298,33 +298,48 @@ is the three-run experiment that isolated it; DDP does not need the flag and run
 because "syntactically correct SQL" is literally what it measures. `bind_rate` additionally
 requires every referenced table and column to exist in the row's schema.
 
-Two calibrations that the harness self-test enforces before it will report anything:
+Calibrations that the harness self-test enforces before it will report anything:
 
 - **The ceiling is not 1.0.** 2.78% of the dataset's own gold SQL does not parse in DuckDB
   1.5.5 — malformed `COPY` options, unbalanced parens, and one row that is Python. Gold
-  scores `parse_rate = 0.987` on a 300-row eval sample. Train rows with unparseable gold are
+  scores `parse_rate = 0.984` on the 128-row eval set. Train rows with unparseable gold are
   dropped (`filter_parseable`); eval rows keep their noise so the ceiling stays honest.
-- **~25% of dataset schemas do not create at all** (foreign keys referencing tables that
-  were never emitted). Those rows can never bind regardless of the model, so they are
-  quarantined out of the `bind_rate` denominator rather than charged to the model.
+- **~30% of eval rows can never bind** — 29 whose schemas do not create (foreign keys
+  referencing tables that were never emitted) plus 10 that ship no schema at all. They are
+  quarantined out of the `bind_rate` denominator, decided **from the schema alone**, so the
+  denominator (89 of these 128 rows) is identical for every model and every run.
+- **Truncation is not a syntax error.** A generation that hits the decode cap without EOS
+  and then fails to parse is reported as `truncated`, its own stage; `n_gold_over_cap`
+  reports how many gold queries exceed the cap and are unwinnable by construction.
+- **Every rate carries a Wilson 95% CI**, and every run stores per-row outcomes + generated
+  SQL so two runs can be compared **paired** (McNemar's exact test) rather than by point
+  estimates: `python3 -m sqlft.eval_sql --compare runA.json runB.json`.
 
-Before/after on the **same 128 held-out rows**, same prompt format, same decode settings, same
-GDN path:
+Before/after on the **same 128 held-out rows**, same prompt format, same decode settings
+(cached decode, max_new 48):
 
-| model | parse_rate | bind_rate | fully correct | parse errors |
-|---|---:|---:|---:|---:|
-| gold (ceiling) | **0.984** | — | — | 2 / 128 |
-| Qwen3.5-4B untuned | 0.570 | 0.252 (of 111) | 28 | 55 |
-| **+ 1 epoch LoRA fine-tune** | **0.906** | **0.598** (of 102) | **61** | **12** |
+| model | parse_rate [CI] | first_stmt | bind_rate [CI] (of 89) | stage breakdown |
+|---|---:|---:|---:|---|
+| gold (ceiling) | **0.984** | — | — | 2 parse errors |
+| Qwen3.5-4B untuned | 0.539 [0.453, 0.623] | 0.695 | 0.315 [0.228, 0.417] | ok 28, truncated 59, bind_err 20 |
+| **+ 1 epoch LoRA fine-tune** | **0.883** [0.816, 0.928] | **0.930** | **0.652** [0.548, 0.743] | **ok 58, truncated 14, bind_err 23, parse_err 1** |
 
-Sources: `runs/lab01_baseline_128.json`, `runs/lab07_eval_ft_128.json`.
+Paired (McNemar), before vs after: 3 vs 47 discordant rows, **p < 0.001** — the improvement
+is unambiguous. Sources: `runs/lab01_baseline_128_v5.json`, `runs/lab07_eval_ft_128_v5.json`.
 
-**parse_rate 0.570 → 0.906** against a ceiling of 0.984 — **81% of the achievable gap closed**
-in one epoch. `bind_rate` 2.4×, fully-correct queries 2.2×, parse errors 55 → 12.
+> Historical note: pre-v5 numbers (parse 0.570 baseline, 0.906/0.898 fine-tuned) counted
+> truncations as parse errors and used bind denominators that moved with the model. They
+> are not exactly comparable to the v5 table; both live in `runs/` for reference.
+
+**parse_rate 0.539 → 0.883** against a ceiling of 0.984 — **77% of the achievable gap closed**
+in one epoch. `bind_rate` 2.1×, fully-correct queries 28 → 58, and the residual failures
+are dominated by the decode cap (14 truncations, 17 gold-over-cap rows), not syntax:
+**one genuine parse error** in 128 generations.
 
 > A smaller n=32 run scored a perfect 1.000 and I nearly reported that. It was small-sample
-> luck; 128 rows gives 0.906. Both numbers are in `runs/`. The 32-row pair is also *not*
-> comparable to a 128-row pair, which is why the baseline was re-run at 128.
+> luck; 128 rows gives ~0.9. Both numbers are in `runs/`. The 32-row pair is also *not*
+> comparable to a 128-row pair, which is why the baseline was re-run at 128 — and why every
+> rate now carries a Wilson interval and every comparison is paired.
 
 The improvement is not only formatting. The model learned DuckDB dialect:
 
@@ -344,18 +359,16 @@ The same eval on the faster decode paths (`--batch-size 1` bucketed, then `--dec
 Decoded output is not bit-identical across decode layouts because greedy argmax over bf16
 logits is chaotic; the layouts are verified logit-equivalent instead (see below).
 
-Two caveats to carry with the number. Part of the gain is learning to emit **EOS** —
-`parse_rate` rewards stopping as much as syntax, and the eval logs show it starkly: the untuned
-model never once hit EOS across all 128 rows (`done=0/8` in every batch), while the tuned model
-finished most batches by token ~28. And `bind_rate` is capped well below 1.0 by dataset
-artifacts — queries reading CSV files that do not exist, duplicate column names — not by the
-model; ~20% of rows have schemas that will not even create.
+Two caveats to carry with the numbers. Part of the gain is learning to emit **EOS** —
+`parse_rate` rewards stopping as much as syntax, and now that is measured rather than
+asserted: the untuned model's `first_stmt_parse_rate` is 0.695 against its 0.539 full-output
+rate, so ~16 points of the baseline failure is *not stopping*, not bad SQL (fine-tuned:
+0.930 vs 0.883). And `bind_rate` is capped well below 1.0 by dataset artifacts — queries
+reading CSV files that do not exist, duplicate column names — not by the model; ~30% of
+eval rows are quarantined out of its denominator entirely.
 
-Breakdown of the 32: 7 fully correct, 9 parse-but-don't-bind, 12 parse errors, 4 unanswerable
-(dataset schema won't create).
-
-The model already writes good SQL. Its problem is **not stopping** — it emits the right
-statement and then keeps going with more prose:
+The untuned model already writes decent SQL. Its problem is **not stopping** — it emits the
+right statement and then keeps going with more prose:
 
 ```
 Q    : Create a new enum type 'performancetype' with five possible values: ...
@@ -395,7 +408,8 @@ sqlft/   device.py        neuron device registration, sync, Timer, memory probe
          ckpt.py          activation ckpt / grad accumulation / DCP save-resume
          parallel.py      process group, meshes, DDP/FSDP1/FSDP2/TP
          train.py         the training loop
-         eval_sql.py      DuckDB parse+bind rate, cache-free greedy decode
+         eval_sql.py      DuckDB parse+bind rate, cache-free greedy decode; Wilson CIs,
+                          truncation stage, per-row records, McNemar run comparison
          infer.py         recurrent-cache decode (inference GDN kernels + static KV cache)
          tests/           CPU-only correctness tests
 

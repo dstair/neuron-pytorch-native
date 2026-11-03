@@ -30,6 +30,8 @@ def main() -> int:
     # nki-v15-split16 is correct AND fastest, so it is the right default. Plain `nki` corrupts
     # the forward past ~6 GDN layers and would describe a broken model, not Qwen3.5-4B.
     ap.add_argument("--gdn", choices=GDN_CHOICES, default="nki-v15-split16")
+    ap.add_argument("--decode", choices=("reforward", "cached"), default="reforward",
+                    help="cached = recurrent/KV-cache decode (sqlft.infer; validated by lab09)")
     ap.add_argument("--tag", default="lab01_baseline")
     args = ap.parse_args()
 
@@ -44,11 +46,20 @@ def main() -> int:
                        lora=False, device="neuron")
     model.eval()
 
-    res = eval_sql.evaluate_model(
-        model, tok, rows,
-        limit=args.limit, max_new_tokens=args.max_new,
-        seq_len=args.seq, batch_size=args.batch_size,
-    )
+    if args.decode == "cached":
+        from sqlft import infer
+
+        infer.install_inference_gdn(model)
+        res = infer.evaluate_model_cached(
+            model, tok, rows,
+            limit=args.limit, max_new_tokens=args.max_new, seq_len=args.seq,
+        )
+    else:
+        res = eval_sql.evaluate_model(
+            model, tok, rows,
+            limit=args.limit, max_new_tokens=args.max_new,
+            seq_len=args.seq, batch_size=args.batch_size,
+        )
     res["gold_ceiling"] = ceiling
     res["args"] = vars(args)
 

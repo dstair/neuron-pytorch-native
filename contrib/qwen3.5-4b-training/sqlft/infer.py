@@ -192,8 +192,11 @@ def _forward_last(model, ids, attn_mask, pos_ids, cache, input_mask=None) -> tor
 @torch.no_grad()
 def cached_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 48,
                     seq_len: int = 1024, chunk: int = 128, device: str = "neuron",
-                    progress: bool = True) -> tuple[list[str], list[int]]:
-    """Greedy decode with a recurrent/KV cache. Returns (texts, prompt_token_counts).
+                    progress: bool = True) -> tuple[list[str], list[bool]]:
+    """Greedy decode with a recurrent/KV cache. Returns (texts, finished_flags).
+
+    finished[i] is True when the row emitted EOS inside the cap; False means the output
+    was cut off and a parse failure on it is a truncation, not a syntax error.
 
     Layout matches the current eval exactly: content is LEFT-padded into the smallest
     128-multiple bucket that holds the prompt (the GDN prefill pads internally to its own
@@ -209,7 +212,7 @@ def cached_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
 
     texts: list[str] = []
-    counts: list[int] = []
+    finished: list[bool] = []
     t_start = time.perf_counter()
 
     for n, prompt in enumerate(prompts):
@@ -249,15 +252,15 @@ def cached_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 
             cache.cursor += 1
         sync(dev)
 
+        finished.append(eos in gen)
         if eos in gen:
             gen = gen[: gen.index(eos)]
         texts.append(tokenizer.decode(gen, skip_special_tokens=True))
-        counts.append(L)
         if progress:
             el = time.perf_counter() - t_start
             print(f"  cached gen {n + 1}/{len(prompts)}  prompt={L} tok  new={len(gen)}  "
                   f"elapsed {el / 60:.1f} min", flush=True)
-    return texts, counts
+    return texts, finished
 
 
 def evaluate_model_cached(model, tokenizer, rows, *, limit: int = 128,
@@ -265,13 +268,19 @@ def evaluate_model_cached(model, tokenizer, rows, *, limit: int = 128,
                           device: str = "neuron", tag: str | None = None) -> dict:
     """`eval_sql.evaluate_model` with cached decode. Identical grading."""
     from sqlft.data import render_prompt
-    from sqlft.eval_sql import evaluate
+    from sqlft.eval_sql import evaluate, gold_over_cap
 
     rows = list(rows)[:limit]
     prompts = [render_prompt(r) for r in rows]
-    gens, _ = cached_generate(model, tokenizer, prompts, max_new_tokens=max_new_tokens,
-                              seq_len=seq_len, device=device)
-    result = evaluate([(g, r.schema) for g, r in zip(gens, rows)], verbose=True)
+    gens, finished = cached_generate(model, tokenizer, prompts,
+                                     max_new_tokens=max_new_tokens, seq_len=seq_len,
+                                     device=device)
+    result = evaluate([(g, r.schema, f) for g, r, f in zip(gens, rows, finished)],
+                      verbose=True)
+    result["n_gold_over_cap"] = gold_over_cap(rows, tokenizer, max_new_tokens)
+    if result["n_gold_over_cap"]:
+        print(f"note: {result['n_gold_over_cap']} gold queries exceed the {max_new_tokens}-token "
+              f"decode cap (unwinnable rows)")
     result["samples"] = [
         {"question": r.prompt, "gold": r.query, "generated": g}
         for r, g in list(zip(rows, gens))[:5]

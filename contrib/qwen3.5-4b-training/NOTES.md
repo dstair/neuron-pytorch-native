@@ -3,6 +3,54 @@
 Measured findings, things that broke, and levers tried and refuted. Newest first within a
 section. Anything asserted here has a command next to it.
 
+## Eval methodology rework: honest denominators, CIs, truncation, paired tests
+
+Four harness fixes in `sqlft/eval_sql.py`, each with a self-test gate and a measured
+effect on the reported numbers:
+
+1. **The bind quarantine is now output-independent.** `schema_unusable` used to be marked
+   only when the model's output PARSED, so a worse model quarantined fewer rows and the
+   bind denominator moved with the model (observed: 27 gold / 26 model, then 100 vs 99
+   after the first fix). The quarantine is now computed from the schema alone, BEFORE the
+   parse -- and before the empty-output early return, which was the last hole: an untuned
+   model emits comment-only output that `extract_sql` reduces to `""`, and those rows
+   skipped the schema check entirely (found when the baseline still reported 37 instead
+   of 39). Verified: `evaluate()` reports exactly 39 quarantined on these 128 rows for
+   ANY output (`''`, `'SELEC broken'`, `'SELECT 1'`). Also quarantined now: the **10** eval
+   rows that ship no schema at all (~8%; there is nothing to bind against). `n_bindable`
+   is 89 for gold, baseline and fine-tuned alike.
+2. **Wilson 95% CIs on both rates.** parse 0.883 at n=128 is [0.816, 0.928] -- the point
+   estimate alone always overstated its precision. Every `evaluate()` result carries
+   `parse_ci95` / `bind_ci95`.
+3. **Truncation is its own stage.** Generation reports `finished` (EOS inside the cap);
+   a parse failure on an unfinished row is a decode-cap casualty, not a syntax error.
+   Measured: the fine-tuned model's "15 parse errors" decompose into **14 truncations +
+   1 genuine parse error**. And 17/128 GOLD queries exceed the 48-token cap, so those
+   rows are unwinnable by construction (`n_gold_over_cap` is reported).
+4. **The EOS confound is a number now, and paired tests replace point-estimate
+   comparisons.** `first_stmt_parse_rate` grades only the first statement: baseline
+   0.695 vs parse_rate 0.539 -- 16 points of the baseline's "failure" is not stopping,
+   not bad SQL (fine-tuned: 0.930 vs 0.883). Every run stores `per_row` outcomes +
+   generated SQL; `python3 -m sqlft.eval_sql --compare A.json B.json` runs McNemar's
+   exact test on the discordant rows. Baseline vs fine-tuned: 3 vs 47 discordant,
+   p < 0.001. Same model twice: 0 discordant -- decode is deterministic given a warm
+   compile cache, which is also the test's own sanity check.
+
+Final v5 numbers, 128 rows, cached decode, max_new 48:
+
+| model | parse [CI] | first_stmt | bind [CI] (of 89) | stages |
+|---|---|---|---|---|
+| gold ceiling | 0.984 | -- | -- | 2 parse errors |
+| untuned | 0.539 [0.453, 0.623] | 0.695 | 0.315 [0.228, 0.417] | ok 28, trunc 59, bind_err 20 |
+| + 1 epoch LoRA | 0.883 [0.816, 0.928] | 0.930 | 0.652 [0.548, 0.743] | ok 58, trunc 14, bind_err 23, parse_err 1 |
+
+Sources: `runs/lab01_baseline_128_v5.json`, `runs/lab07_eval_ft_128_v5.json`.
+
+Caution reading across harness versions: pre-v5 numbers counted truncations as parse
+errors and used floating bind denominators, so e.g. the historical 0.906/0.898/0.883
+fine-tuned parse rates and the 0.570 baseline are not exactly comparable to v5's. The
+v5 numbers are the canonical ones going forward.
+
 ## Recurrent-cache decode: eval 31.4 → 10.4 min (3.0×), logit-parity gated
 
 The O(n²) re-forward eval is replaced by `sqlft/infer.py`: prefill once through the kernel
