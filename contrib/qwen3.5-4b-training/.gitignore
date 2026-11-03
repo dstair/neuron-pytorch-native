@@ -1,0 +1,9 @@
+# Measured artifacts: logs and per-run result json. Regenerate with the labs.
+runs/
+
+# Throwaway probes used once to reconcile this box against the inherited recipe. Kept out
+# of the tree because they answer a question that NOTES.md now records the answer to.
+labs/_probe_*.py
+
+__pycache__/
+*.pyc
