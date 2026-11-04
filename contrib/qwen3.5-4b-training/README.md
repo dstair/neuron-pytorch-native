@@ -316,31 +316,33 @@ Calibrations that the harness self-test enforces before it will report anything:
   estimates: `python3 -m sqlft.eval_sql --compare runA.json runB.json`.
 
 Before/after on the **same 128 held-out rows**, same prompt format, same decode settings
-(cached decode, max_new 96):
+(cached decode, max_new 128 — every gold query fits, so no row is unwinnable):
 
 | model | parse_rate [CI] | first_stmt | bind_rate [CI] (of 89) | stage breakdown |
 |---|---:|---:|---:|---|
 | gold (ceiling) | **0.984** | — | — | 2 parse errors |
-| Qwen3.5-4B untuned | 0.602 [0.515, 0.682] | 0.805 | 0.225 [0.150, 0.322] | ok 20, truncated 51, bind_err 36 |
-| **+ 1 epoch LoRA fine-tune** | **0.961** [0.912, 0.983] | **0.961** | **0.697** [0.595, 0.782] | **ok 62, truncated 4, bind_err 25, parse_err 1** |
+| Qwen3.5-4B untuned | 0.586 [0.499, 0.668] | 0.812 | 0.292 [0.208, 0.394] | ok 26, truncated 51, bind_err 30 |
+| **+ 1 epoch LoRA fine-tune** | **0.969** [0.922, 0.988] | **0.969** | **0.708** [0.606, 0.792] | **ok 63, truncated 3, bind_err 25, parse_err 1** |
 
-Paired (McNemar), before vs after: 1 vs 47 discordant on parses, **p < 0.001**; 2 vs 44 on
-binds, **p < 0.001**. Sources: `runs/lab01_baseline_128_mn96.json`,
-`runs/lab07_eval_ft_128_mn96.json`.
+Paired (McNemar), before vs after: 1 vs 50 discordant on parses, **p < 0.001**; 5 vs 42 on
+binds, **p < 0.001**. Sources: `runs/lab01_baseline_128_mn128.json`,
+`runs/lab07_eval_ft_128_mn128.json`.
 
 **The decode cap matters more than it looks.** At max_new 48 the fine-tuned model scored
-0.883 with 14 truncations; at 96 it scores 0.961 with 4 (p = 0.006, paired) — 8 of those
-rows had gold longer than 48 tokens and were unwinnable, 2 more were verbose-but-correct.
-Only 3/128 gold queries exceed 96 tokens (124 max), so 96 is the default. The residual
-failures: 3 degenerate `'SELECT'`-only outputs, 1 gold=124 row, 1 genuine syntax error.
+0.883 with 14 truncations; 96 scores 0.961 (p = 0.006, paired) and 128 scores 0.969 — and
+at 128 `n_gold_over_cap` is 0, so the cap no longer confounds the metric at all (max gold
+is 124). One subtlety found by auditing rows: gold length bounds *matching gold*, not
+*answering well* — two gold > 96 rows already passed at cap 96 because the model wrote a
+terser query. Residual failures: 3 degenerate `'SELECT'`-only outputs and 1 genuine
+syntax error.
 
 > Historical note: pre-v5 numbers (parse 0.570 baseline, 0.906/0.898 fine-tuned) counted
 > truncations as parse errors and used bind denominators that moved with the model. They
 > are not exactly comparable to the v5 table; both live in `runs/` for reference.
 
-**parse_rate 0.602 → 0.961** against a ceiling of 0.984 — **94% of the achievable gap closed**
-in one epoch. `bind_rate` 3.1×, fully-correct queries 20 → 62, and the residual failures
-are 4 decode-cap truncations and **one genuine parse error** in 128 generations.
+**parse_rate 0.586 → 0.969** against a ceiling of 0.984 — **96% of the achievable gap closed**
+in one epoch. `bind_rate` 2.4×, fully-correct queries 26 → 63, and the residual failures
+are 3 degenerate outputs and **one genuine parse error** in 128 generations.
 
 > A smaller n=32 run scored a perfect 1.000 and I nearly reported that. It was small-sample
 > luck; 128 rows gives ~0.9. Both numbers are in `runs/`. The 32-row pair is also *not*

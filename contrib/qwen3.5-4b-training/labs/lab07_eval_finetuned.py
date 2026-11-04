@@ -27,9 +27,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=32)
     ap.add_argument("--layers", type=int, default=32)
     ap.add_argument("--seq", type=int, default=1024)
-    ap.add_argument("--max-new", type=int, default=96,
-                    help="96 covers all but 3 of the 128 eval gold queries; 48 measured "
-                         "as purely lost parse points (see NOTES.md)")
+    ap.add_argument("--max-new", type=int, default=128,
+                    help="128 covers every gold query in the eval set (max 124), so no row "
+                         "is unwinnable by construction (see NOTES.md)")
     ap.add_argument("--batch-size", type=int, default=1,
                     help="1 is fastest: the GDN kernel serialises over batch x heads")
     ap.add_argument("--lora-r", type=int, default=16)

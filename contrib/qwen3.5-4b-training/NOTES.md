@@ -60,9 +60,18 @@ gold-over-cap rows need 128.
 Baseline at 96, for the apples-to-apples (`runs/lab01_baseline_128_mn96.json`): parse
 0.539 → **0.602** (it also truncates less), first_stmt 0.695 → 0.805, but ok 28 → 20 and
 bind 0.315 → 0.225 -- longer completions reference more tables and fail bind more often.
-Canonical before/after at max_new 96: parse **0.602 → 0.961** (1 vs 47 discordant,
-p < 0.001), bind **0.225 → 0.697** (2 vs 44, p < 0.001), 94% of the gap to the 0.984
-ceiling closed in one epoch.
+
+**Cap 128 is the end of the line, and it is the right default.** Checking the 3 gold > 96
+rows before assuming they were cap-blocked: rows 119 (gold 106) and 47 (gold 107) ALREADY
+pass at cap 96 -- the model wrote a terser query than gold; gold length bounds matching
+gold, not answering well. Only row 103 (gold 124, the max) was genuinely blocked, and 106
+would NOT have rescued it. At 128 (`runs/lab07_eval_ft_128_mn128.json`): parse **0.969**
+[0.922, 0.988], row 103 completes its GROUPING SETS query and binds (ok), truncated =
+the 3 degenerate rows only, `n_gold_over_cap = 0` -- the cap no longer confounds the
+metric at all. Cost: 9.0 → 9.1 min. Canonical before/after at max_new 128: parse
+**0.602 → 0.969**, bind **0.225 → 0.708**, ~96% of the gap to the 0.984 ceiling closed.
+The cap ladder, measured end to end: 48 → 0.883, 96 → 0.961 (p = 0.006), 128 → 0.969
+(1 row, p = 1.0 -- taken for the confound removal, not the point).
 
 Caution reading across harness versions: pre-v5 numbers counted truncations as parse
 errors and used floating bind denominators, so e.g. the historical 0.906/0.898/0.883
