@@ -183,3 +183,38 @@ See `docs/ARCHITECTURE.md` for the full component breakdown.
   end-to-end quality evidence.
 - Do not modify the `minimax-h3` branch or the unrelated dirty Qwen files in the
   working tree.
+
+## 9. Progress log
+
+### 2026-11-04 — weights verified + LoRA merged + sampling contract understood
+
+- **All shared weights bit-identical to MiniMax-H3** (DiT, text encoder incl. vision,
+  VAE, audio_vae) — reuse `/data/models/MiniMax-H3/*`, no 130 GB download. Only
+  `fl2va/adapter.safetensors` (2.77 GB, sha256 verified) + small configs downloaded
+  to `/data/models/Pika-H3-Flex/`.
+- **LoRA-at-load implemented** (`patches/pika_lora.patch`, module
+  `plugin_pika_lora.py`): merges rank-128 (scale 1.0) adapter into all 6 projections
+  of 50 DiT + 2 refiner blocks, per-rank from adapter slices, fp32 deltas. Validated:
+  CPU unit test (tp=1, 8 passed) and TP4 fused-QKV sharding orientation (rank r owns
+  output rows [r*1792:(r+1)*1792], param cols = base[rows].T). Applied to box plugin;
+  config `pika_lora_path` (default ""). Backup `/data/omni29/backups/pre_pika_lora_20261104/`.
+- **Sampling contract (diffusers main `pika_h3_flex`, scheduler
+  `scheduling_minimax_h3`):** the DiT/encoder/VAE/denoiser-loop structure is the SAME
+  as MiniMax-H3; the differences are (1) LoRA and (2) the 6-NFE renoise schedule:
+  - base grid `[1.0, 0.75, 0.5, 0.25, 0.1, 0.04, 0.0]` (knots/1000), pushed through
+    shift via `sigmas = shift*base/(1+(shift-1)*base)` with shift=12 (video) / 3
+    (audio) because Pika's scheduler configs set `shift_provided_sigmas: true`.
+    Effective video sigmas ≈ [1, .973, .923, .8, .571, .333, 0], audio ≈
+    [1, .9, .75, .5, .25, .111, 0]. DiT conditions on `t = 1 - sigma` per modality
+    (our pipeline already builds dual video/audio timesteps).
+  - `stochastic_sampling: true` (renoise) per step: `x0 = latents + sigma_i * v`
+    (fp32, data-ward velocity), then `latents = (1-sigma_{i+1})*x0 + sigma_{i+1}*fresh_noise(generator)`.
+    Last step (sigma_next=0) returns x0. Conditioning/anchor rows are never overwritten.
+  - **Installed diffusers 0.40 does NOT implement this**: its `set_timesteps(sigmas=)`
+    uses sigmas verbatim (no shift) and its `step()` is Euler (no generator/renoise).
+    So compute the shifted grid AND the renoise step MANUALLY in the pipeline
+    (~20 lines host-side); do not rely on the installed scheduler's step.
+- **Pipeline source:** diffusers main `src/diffusers/modular_pipelines/pika_h3_flex/`
+  (~4750 lines) is the reference; T2V reduces to our existing t2va loop + the above.
+- Next: implement Pika renoise sampling in `NeuronMiniMaxH3Pipeline` (config-gated),
+  stage yaml with `pika_lora_path` + 6-step contract, T2V bring-up on device.
