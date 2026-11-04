@@ -1,0 +1,146 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Apply a Pika-H3-Flex LoRA adapter to the Neuron MiniMax-H3 DiT at load time.
+
+The adapter (``fl2va/adapter.safetensors``, PEFT format, rank=alpha=128 so the
+scale is 1.0) covers 6 projections in all 50 DiT blocks and both token-refiner
+blocks: ``to_q, to_k, to_v, to_out.0, ff.net.0.proj, ff.net.2``. Merge per
+module: ``W += lora_B @ lora_A``.
+
+The DiT and all other shared weights are bit-identical to MiniMax-H3 (verified
+by ranged-read hashing), so this mutates the already-loaded per-rank params in
+place instead of materializing a 33B merged checkpoint (which would not fit on
+this disk). Deltas are computed per rank from adapter slices that match the
+plugin's TP sharding:
+
+- fused QKV (column-parallel, storage-transposed): rank r owns output rows
+  [r*S:(r+1)*S] of to_q/to_k/to_v; delta_param = (lora_B[rows] @ lora_A).T
+- to_out.0 (row-parallel on input, storage-transposed): rank r owns input cols
+  [r*S:(r+1)*S]; delta_param = (lora_B @ lora_A[:, cols]).T
+- ff.net.0.proj: up uses output rows [r*S:(r+1)*S], gate uses rows
+  [14336 + r*3584 : 14336+(r+1)*3584]; same column-parallel form as QKV
+- ff.net.2 (row-parallel on input): same form as to_out.0
+
+``pika_lora_path = ""`` (default) leaves the model byte-for-byte stock.
+"""
+
+import logging
+
+import torch
+from safetensors import safe_open
+
+logger = logging.getLogger(__name__)
+
+
+def _slice(f, key, rows=None, cols=None):
+    sl = f.get_slice(key)
+    if rows is not None and cols is not None:
+        return sl[rows[0] : rows[1], cols[0] : cols[1]]
+    if rows is not None:
+        return sl[rows[0] : rows[1], :]
+    if cols is not None:
+        return sl[:, cols[0] : cols[1]]
+    return sl[:]
+
+
+def _add_(param, delta_t):
+    """delta_t is [in, out_shard] (param orientation); add in fp32, store bf16.
+
+    Must write in place with copy_: for the fused-QKV case ``param`` is a column
+    slice VIEW, and assigning ``.data`` would rebind the view instead of writing
+    into the parent parameter."""
+    if tuple(delta_t.shape) != tuple(param.shape):
+        raise ValueError(f"delta shape {tuple(delta_t.shape)} != param {tuple(param.shape)}")
+    param.data.copy_((param.data.float() + delta_t.float()).to(param.dtype))
+
+
+def _apply_block_lora(f, block, prefix, tp_rank, tp_size, tp_inner, ffn_inner, gate_base):
+    """Apply LoRA to one block's attention + FFN params. ``gate_base`` is the
+    output-row offset of the gate half inside ff.net.0.proj (14336)."""
+    # --- attention fused QKV (column-parallel) ---
+    s = tp_inner  # output rows per rank per projection
+    qkv = block.attn.qkv_proj_weight
+    for proj, col in (("to_q", 0), ("to_k", s), ("to_v", 2 * s)):
+        ka = f"{prefix}.attn.{proj}.lora_A.default.weight"
+        kb = f"{prefix}.attn.{proj}.lora_B.default.weight"
+        lb = _slice(f, kb, rows=(tp_rank * s, (tp_rank + 1) * s))  # [s, 128]
+        la = _slice(f, ka)  # [128, in]
+        delta = (lb.float() @ la.float()).T.contiguous()  # [in, s]
+        _add_(qkv[:, col : col + s], delta)
+
+    # --- attention out proj (row-parallel on input) ---
+    ka = f"{prefix}.attn.to_out.0.lora_A.default.weight"
+    kb = f"{prefix}.attn.to_out.0.lora_B.default.weight"
+    lb = _slice(f, kb)  # [out, 128]
+    la = _slice(f, ka, cols=(tp_rank * s, (tp_rank + 1) * s))  # [128, s]
+    delta = (lb.float() @ la.float()).T.contiguous()  # [s, out]
+    _add_(block.attn.o_proj_weight, delta)
+
+    # --- FFN net.0.proj (up + gate, column-parallel) ---
+    fi = ffn_inner
+    for proj, name, rows in (
+        ("up", "up_proj_weight", (tp_rank * fi, (tp_rank + 1) * fi)),
+        ("gate", "gate_proj_weight", (gate_base + tp_rank * fi, gate_base + (tp_rank + 1) * fi)),
+    ):
+        ka = f"{prefix}.ff.net.0.proj.lora_A.default.weight"
+        kb = f"{prefix}.ff.net.0.proj.lora_B.default.weight"
+        lb = _slice(f, kb, rows=rows)  # [fi, 128]
+        la = _slice(f, ka)  # [128, in]
+        delta = (lb.float() @ la.float()).T.contiguous()  # [in, fi]
+        _add_(getattr(block.ff, name), delta)
+
+    # --- FFN net.2 (down, row-parallel on input) ---
+    ka = f"{prefix}.ff.net.2.lora_A.default.weight"
+    kb = f"{prefix}.ff.net.2.lora_B.default.weight"
+    lb = _slice(f, kb)  # [out, 128]
+    la = _slice(f, ka, cols=(tp_rank * fi, (tp_rank + 1) * fi))  # [128, fi]
+    delta = (lb.float() @ la.float()).T.contiguous()  # [fi, out]
+    _add_(block.ff.down_proj_weight, delta)
+
+
+def apply_pika_lora(model, adapter_path):
+    """Apply the Pika LoRA adapter to a loaded Neuron MiniMaxH3Transformer3DModel.
+
+    Mutates per-rank params in place (on the host, after ``load_state_dict`` and
+    before ``.to(device)``). Returns the number of block modules updated.
+    """
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    cfg = model.config
+    tp_inner = (cfg.num_attention_heads // tp_size) * cfg.attention_head_dim
+    ffn_inner = cfg.ffn_dim // tp_size
+    gate_base = cfg.ffn_dim  # gate half's output-row offset inside ff.net.0.proj
+
+    updated = 0
+    with safe_open(adapter_path, framework="pt", device="cpu") as f:
+        for i, block in enumerate(model.transformer_blocks):
+            _apply_block_lora(
+                f, block, f"transformer_blocks.{i}", tp_rank, tp_size, tp_inner, ffn_inner, gate_base
+            )
+            updated += 1
+        refiner = getattr(model, "token_refiner", None)
+        if refiner is not None:
+            for i, block in enumerate(refiner.refiner_blocks):
+                _apply_block_lora(
+                    f,
+                    block,
+                    f"token_refiner.refiner_blocks.{i}",
+                    tp_rank,
+                    tp_size,
+                    tp_inner,
+                    ffn_inner,
+                    gate_base,
+                )
+                updated += 1
+    logger.info(
+        "Applied Pika LoRA %s to %d block modules (tp_rank=%d/%d)",
+        adapter_path,
+        updated,
+        tp_rank,
+        tp_size,
+    )
+    return updated
