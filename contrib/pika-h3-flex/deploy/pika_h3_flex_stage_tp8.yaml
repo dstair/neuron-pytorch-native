@@ -1,0 +1,31 @@
+# Pika-H3-Flex on a trn2.48xlarge (32 NeuronCores, LNC2): TP=8, no CP.
+# Same memory options as the proven single-device TP4 config; per-rank HBM pressure is
+# halved at TP8, so these are conservative (first bring-up keeps them).
+#   host_weights_dir: on the 48xl bootstrap this points at EBS (/data/nvme) unless the
+#     instance store is formatted and mounted at /mnt/nvme.
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    runtime:
+      devices: "0-7"
+    engine_args:
+      model_class_name: MiniMaxH3ModularPipeline
+      dtype: bfloat16
+      vae_use_tiling: true
+      model_config:
+        pika_lora_path: /data/models/Pika-H3-Flex/fl2va/adapter.safetensors
+        pika_renoise: true
+        adaln_on_host: true
+        compile_per_block: true
+        rope_by_matmul: true
+        attention_heads_per_call: 2
+        adaln_cache: true
+        text_encoder_stream_layers: 4
+        vae_swap_dit_blocks: 25
+        vae_fused_vit: true
+        host_weights_dir: /data/nvme/minimax_h3
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 1
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 8
