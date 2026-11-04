@@ -1,0 +1,119 @@
+--- a/vllm_omni_neuron/diffusion/models/minimax_h3/pipeline_minimax_h3.py
++++ b/vllm_omni_neuron/diffusion/models/minimax_h3/pipeline_minimax_h3.py
+@@ -185,6 +185,9 @@
+         # The video decoder's 36 ViT blocks on fused NKI kernels (qkv_cte with QK RMSNorm and
+         # RoPE, attention_cte, output_projection_cte, mlp_cte); see minimax_h3_vit_block.
+         self._vae_fused_vit = bool(model_config.pop("vae_fused_vit", False))
++        # Pika-H3-Flex: 6-NFE renoise (stochastic) sampling contract. Off by default;
++        # requires pika_lora_path on the transformer and the Pika scheduler configs.
++        self._pika_renoise = bool(model_config.pop("pika_renoise", False))
+         # The TP group, not WORLD: under CP the world is tp * cp, which the vision tower's 16
+         # heads do not divide.
+         self.text_encoder = NeuronQwen3VLTextEncoder(
+@@ -405,7 +408,9 @@
+             self._adaln_cache.popitem(last=False)
+         return tables
+ 
+-    def denoise(self, prompt_embeds, layout, video_rows, audio_rows, num_steps):
++    def denoise(self, prompt_embeds, layout, video_rows, audio_rows, num_steps, generator=None):
++        if self._pika_renoise:
++            return self._denoise_pika(prompt_embeds, layout, video_rows, audio_rows, generator)
+         if getattr(self.transformer.config, "first_block_cache_threshold", 0.0) <= 0:
+             return self._denoise(prompt_embeds, layout, video_rows, audio_rows, num_steps)
+         self.transformer.reset_first_block_cache()
+@@ -502,6 +507,87 @@
+             self._latent_dump_request = request_index + 1
+         return video_rows, step_seconds
+ 
++    @staticmethod
++    def _pika_shifted_sigmas(shift: float) -> torch.Tensor:
++        """Pika's base 6-step grid pushed through the exponential shift (shift_provided_sigmas).
++
++        Matches diffusers main's MiniMaxH3Scheduler with ``shift_provided_sigmas=True``:
++        ``sigmas = shift * base / (1 + (shift - 1) * base)`` over the released knots.
++        """
++        base = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.1, 0.04, 0.0], dtype=torch.float32)
++        return shift * base / (1.0 + (shift - 1.0) * base)
++
++    def _denoise_pika(self, prompt_embeds, layout, video_rows, audio_rows, generator):
++        """Pika-H3-Flex 6-NFE renoise loop (``stochastic_sampling``), host-side like ``_denoise``.
++
++        The installed diffusers 0.40 scheduler does not implement the shift-applied sigma grid or
++        the renoise step, so both are computed here exactly as diffusers main does: per modality,
++        the DiT is conditioned on ``t = 1 - sigma_i``; each step predicts the clean sample
++        ``x0 = latents + sigma_i * v`` (fp32, data-ward velocity) and re-noises to the next sigma
++        with fresh noise from the request's generator (video rows first, then audio rows).
++        """
++        position_ids, token_tags, video_indices, audio_indices, text_indices, _, _ = layout
++        sig_v = self._pika_shifted_sigmas(float(self.scheduler.config.shift))
++        sig_a = self._pika_shifted_sigmas(float(self.audio_scheduler.config.shift))
++        if sig_v.numel() != sig_a.numel():
++            raise ValueError("video and audio Pika schedules have different lengths")
++        dit_inputs = {
++            "encoder_hidden_states": prompt_embeds.to(self.dtype).to(self.device),
++            "timestep_indices": (token_tags == MINIMAX_H3_AUDIO_TAG).long().to(self.device),
++            "token_tags": token_tags.to(self.device),
++            "position_ids": position_ids.float().to(self.device),
++            "video_indices": video_indices.to(self.device),
++            "audio_indices": audio_indices.to(self.device),
++            "text_indices": text_indices.to(self.device),
++        }
++        step_seconds = []
++        for i in range(sig_v.numel() - 1):
++            t0 = time.perf_counter()
++            timestep = torch.stack([1.0 - sig_v[i], 1.0 - sig_a[i]]).to(self.device)
++            block_modulations = tuple(
++                m.to(self.device) for m in self.block_modulations(timestep)
++            )
++            noise_pred, audio_noise_pred = self.transformer(
++                hidden_states=video_rows[None].to(self.dtype).to(self.device),
++                audio_hidden_states=audio_rows[None].to(self.dtype).to(self.device),
++                timestep=timestep,
++                block_modulations=block_modulations,
++                return_dict=False,
++                **dit_inputs,
++            )
++            # Renoise (stochastic_sampling): x0 = latents + sigma_i * v, then re-noise to sigma_{i+1}.
++            x0_v = video_rows + sig_v[i] * noise_pred.cpu()[0].float()
++            x0_a = audio_rows + sig_a[i] * audio_noise_pred.cpu()[0].float()
++            noise_v = torch.randn(
++                video_rows.shape, generator=generator, dtype=torch.float32
++            )
++            noise_a = torch.randn(
++                audio_rows.shape, generator=generator, dtype=torch.float32
++            )
++            video_rows = (1.0 - sig_v[i + 1]) * x0_v + sig_v[i + 1] * noise_v
++            audio_rows = (1.0 - sig_a[i + 1]) * x0_a + sig_a[i + 1] * noise_a
++            step_seconds.append(time.perf_counter() - t0)
++        dump_dir = os.environ.get("MINIMAX_H3_DUMP_LATENTS_DIR")
++        if dump_dir and self.is_output_rank:
++            os.makedirs(dump_dir, exist_ok=True)
++            request_index = getattr(self, "_latent_dump_request", 0)
++            torch.save(
++                {
++                    "video_rows": video_rows,
++                    "audio_rows": audio_rows,
++                    "prompt_embeds": prompt_embeds.cpu(),
++                    "position_ids": position_ids.cpu(),
++                    "token_tags": token_tags.cpu(),
++                    "video_sigmas": sig_v.cpu(),
++                    "audio_sigmas": sig_a.cpu(),
++                    "step_seconds": step_seconds,
++                    "sampling": "pika_renoise_6nfe",
++                },
++                os.path.join(dump_dir, f"request_{request_index:03d}.pt"),
++            )
++            self._latent_dump_request = request_index + 1
++        return video_rows, step_seconds
++
+     def unpack_video(self, video_rows, num_latent_frames, latent_height, latent_width):
+         """The reference's after-denoise unpack: ``(1, C, T, H, W)`` video latents."""
+         patch_t, patch_h, patch_w = self.transformer.config.patch_size
+@@ -630,6 +716,7 @@
+             patchify_video_latents(latents, patch_size),
+             audio_rows,
+             num_steps,
++            generator=generator,
+         )
+         denoise_seconds = time.perf_counter() - t0
+ 

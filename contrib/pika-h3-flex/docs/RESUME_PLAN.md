@@ -218,3 +218,31 @@ See `docs/ARCHITECTURE.md` for the full component breakdown.
   (~4750 lines) is the reference; T2V reduces to our existing t2va loop + the above.
 - Next: implement Pika renoise sampling in `NeuronMiniMaxH3Pipeline` (config-gated),
   stage yaml with `pika_lora_path` + 6-step contract, T2V bring-up on device.
+
+### 2026-11-04 (later) — T2V bring-up WORKS on device
+
+- **Pika T2V runs end-to-end on Trainium** (`/data/omni29/runs/pika_t2v_20261104`):
+  LoRA merged on all 4 ranks (52 modules each), 6-step renoise, seed 42, 768p/124f.
+  Warm request 2: text encode 83.2s, **denoise 181.0s**, VAE 21.0s, total 285.5s, exit 0.
+  Output video is a coherent, high-quality parrot clip matching the prompt
+  (`results/pika_t2v_contact_sheet.png`). Latents finite, repeat deterministic.
+- **Steady-state DiT = 12.6s/step** (matches MiniMax-H3). Step 0 carries ~105s
+  one-time per-process warmup (first block_modulations / DiT executor), not a
+  per-step cost. Sigmas match the reference grid exactly
+  (`results/t2v_warm_summary.json`).
+- **Disk fix:** the Pika text-encoder host-weight map tried to write ~50 GB of NEW
+  maps (tagged by model basename). Since the encoder is bit-identical to MiniMax-H3,
+  **hardlinked the existing MiniMax-H3 maps (text encoder, VAE, DiT swap blocks)
+  under the Pika tag** — reused ~67 GB with zero extra space. The failed run left
+  ~49 GB of `.tmp` partial writes; deleted. Model dir built at
+  `/data/models/Pika-H3-Flex-Neuron` (symlinks shared weights, keeps Pika
+  scheduler/audio_scheduler/tokenizer/processor/fl2va).
+- Code: `patches/pika_lora.patch` (LoRA-at-load), `patches/pika_renoise_sampling.patch`
+  (6-NFE renoise in the pipeline, `_denoise_pika`), `deploy/pika_h3_flex_stage.yaml`.
+  Unit tests: 10 passed on the live box (sigma grid, renoise formula, LoRA merge).
+
+**Open follow-ups:** (1) investigate/eliminate the ~105s step-0 warmup (likely
+first block_modulations or DiT executor load per process); (2) FL2VA keyframe
+conditioning (needs the vision tower + anchor rows — encoder has the vision
+weights); (3) Ref2VA (transformer_ref + vision encoder); (4) stronger quality gate
+vs the official Pika runtime if available.

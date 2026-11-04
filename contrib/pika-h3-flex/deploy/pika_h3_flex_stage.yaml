@@ -1,0 +1,41 @@
+# Pika-H3-Flex on one trn2 device (FL2VA LoRA + 6-NFE renoise) (4 NeuronCores, e.g. a trn2.3xlarge): TP=4, no CP.
+#   adaln_on_host: the 50 blocks' AdaLN projections (6.5 GB per rank at TP4) stay on the host.
+#   compile_per_block: the DiT runs one graph per block (shared NEFF), not the whole model.
+#   rope_by_matmul: partial RoPE as a small matmul instead of strided slices (bit-exact).
+#   attention_heads_per_call: attention_cte over 2 heads per launch (~12% per DiT step).
+#   adaln_cache: a schedule's AdaLN projections computed once and reused by later requests.
+#   text_encoder_stream_layers: the conditioner's 50 blocks (12.9 GB per rank) stay on the
+#     host and stream through the device 4 at a time.
+#   vae_swap_dit_blocks: the video decoder (4.85 GB per rank) stays on the host and swaps in
+#     for the decode, while the DiT's last 25 blocks (4.8 GB per rank) step out.
+#   vae_fused_vit: the video decoder's ViT blocks on fused NKI kernels (~30% faster per tile).
+#   host_weights_dir: a local NVMe directory for those host copies, memory-mapped so the kernel
+#     can drop and re-read them instead of swapping; on a trn2.3xlarge (124 GB) the swaps around
+#     the VAE decode otherwise page from swap (1-22 s per swap, measured). Point it at the
+#     instance store: mkfs + mount it at /mnt/nvme (see the docs).
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    runtime:
+      devices: "0-3"
+    engine_args:
+      model_class_name: MiniMaxH3ModularPipeline
+      dtype: bfloat16
+      vae_use_tiling: true
+      model_config:
+        pika_lora_path: /data/models/Pika-H3-Flex/fl2va/adapter.safetensors
+        pika_renoise: true
+        adaln_on_host: true
+        compile_per_block: true
+        rope_by_matmul: true
+        attention_heads_per_call: 2
+        adaln_cache: true
+        text_encoder_stream_layers: 4
+        vae_swap_dit_blocks: 25
+        vae_fused_vit: true
+        host_weights_dir: /mnt/nvme/minimax_h3
+      parallel_config:
+        tensor_parallel_size: 4
+        ring_degree: 1
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 4
