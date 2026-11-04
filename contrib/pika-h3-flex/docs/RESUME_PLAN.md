@@ -41,10 +41,13 @@ See `docs/ARCHITECTURE.md` for the full component breakdown.
 - Plugin (Neuron vLLM-Omni) on box: `/data/omni29/plugin` (private
   aws-neuron/private-vllm-omni-neuron-staging, base `a2614a2`, archive, no .git,
   plus our experiment patches). Backups under `/data/omni29/backups/`.
-- Weights: MiniMax-H3 at `/data/models/MiniMax-H3` (verified). **Pika-H3-Flex
-  weights NOT yet downloaded.** Disk is tight: `/data` had ~42-49 GB free.
-  The full Pika repo (2x 33B DiT + Qwen3-VL-32B vision encoder + VAE + adapters)
-  is far larger than free space — download SELECTIVELY (see phase 1).
+- Weights: MiniMax-H3 at `/data/models/MiniMax-H3` (135 GB, verified). **Pika-H3-Flex
+  weights NOT yet downloaded.** **Disk is the immediate blocker: only ~30 GB free
+  on `/data`** (2026-11-04) — reclaim before any download. Consumers: `/data/omni29/nvme`
+  64 G (host mmap weights, in use), `/data/omni29/row_padding_study` 5.1 G (block
+  captures, archivable), runs 231 M. The full Pika repo (2x 33B DiT + Qwen3-VL
+  vision encoder + VAE + adapters) will NOT fit alongside MiniMax-H3 without
+  reclaiming; download SELECTIVELY and/or free space first (see phase 1).
 - Runner: `/data/omni29/run29.sh NAME CMD...` -> `/data/omni29/runs/NAME/run.log`
   ending `=== exit N`. Launch detached with `setsid nohup ... < /dev/null &`.
 
@@ -99,9 +102,13 @@ See `docs/ARCHITECTURE.md` for the full component breakdown.
 
 ## 6. Phased port plan
 
-1. **Weights + reference (selective, disk-constrained).** Confirm whether Pika's
-   `transformer/` is bit-identical to our existing MiniMax-H3 DiT (same base) —
-   if so, reuse `/data/models/MiniMax-H3/transformer` and download ONLY:
+1. **Reclaim disk + weights + reference.** First free space on `/data` (archive
+   `/data/omni29/row_padding_study` captures and stale run artifacts to S3/host,
+   keeping only what current work needs). Then confirm whether Pika's `transformer/`
+   is bit-identical to our existing MiniMax-H3 DiT — tensor naming is already
+   confirmed IDENTICAL (638 tensors, layers 0-49, same names), so hash one tensor
+   per shard group (e.g. `transformer_blocks.0.ff.net.2.weight`) on both sides.
+   If identical, reuse `/data/models/MiniMax-H3/transformer` and download ONLY:
    `fl2va/adapter.safetensors` (start with FL2VA), `vae/`, `audio_vae/`,
    `scheduler/`, `audio_scheduler/`, `tokenizer/`, `processor/`, and the
    `text_encoder/` (Qwen3-VL vision — large; check if we can stream it like the
