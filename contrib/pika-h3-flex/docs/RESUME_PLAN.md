@@ -12,6 +12,34 @@ starting with the simplest task (T2V or FL2VA) at the 6-NFE sampling contract,
 with quality and speed measured against a reference. License: MiniMax H3
 Community License (same as MiniMax-H3) — confirm the customer's use is covered.
 
+## 1.5 Verified findings (2026-11-04) — port is much lighter than expected
+
+**Every shared weight is bit-identical to MiniMax-H3 (already on the box).**
+Hash-verified with ranged reads (no full downloads), `/data/omni29/pika_port/verify_out.txt`:
+
+| Component | Result | Action |
+|---|---|---|
+| transformer (DiT, 33B) | 4/4 tensors MATCH | reuse `/data/models/MiniMax-H3/transformer` |
+| text_encoder (Qwen3-VL-32B **incl. vision tower**) | 3/3 MATCH | reuse `/data/models/MiniMax-H3/text_encoder` (vision tower present — usable for FL2VA image conditioning) |
+| vae | 4/4 MATCH | reuse `/data/models/MiniMax-H3/vae` |
+| audio_vae | 3/3 MATCH | reuse `/data/models/MiniMax-H3/audio_vae` |
+
+Only the **~2.8 GB LoRA adapter + small configs** were downloaded to
+`/data/models/Pika-H3-Flex/` (scheduler, audio_scheduler, tokenizer, processor,
+configs, manifests, README, LICENSE, SHA256SUMS). **No disk reclaim needed to start.**
+
+**Adapter (`fl2va/adapter.safetensors`, sha256 verified 8ed6115d…):** standard PEFT
+LoRA, 624 tensors = (50 DiT blocks + 2 refiner blocks) x 6 modules x (lora_A,lora_B).
+Manifest `fl2va/manifest.json`: rank 128, alpha 128 (**scale = alpha/rank = 1.0**),
+target modules `to_q, to_k, to_v, to_out.0, ff.net.0.proj, ff.net.2`, base
+`MiniMaxAI/MiniMax-H3` rev 42ed227e, knots `[1000,750,500,250,100,40,0]`,
+video_shift 12, audio_shift 3, method `renoise`, trunk `transformer`.
+Merge formula per module: `W_merged = W_base + lora_B @ lora_A`.
+
+**Disk constraint revised:** 30 GB free is enough because the DiT/encoder/VAE are
+reused. An offline merged 33B checkpoint would NOT fit — so apply the LoRA **at
+load time in the plugin** (per-rank from adapter slices, no merged checkpoint).
+
 ## 2. Corrections to the initial brief
 
 - **The DiT is NOT smaller.** It is the same 50-layer / 33B MiniMax-H3 DiT
