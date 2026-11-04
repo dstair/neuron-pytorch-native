@@ -1,9 +1,37 @@
 # Pika-H3-Flex FL2VA Implementation Status
 
-**Last updated: 2026-11-04 (session continuation)**
+**Last updated: 2026-11-04 (evening session)**
 
 This document tracks the FL2VA (first/last-frame image-to-video) implementation progress.
 Prior session: T2V working end-to-end (285s, 12.6s/step).
+
+## trn2.48xlarge TP=8 bring-up (DONE, 2026-11-04)
+
+New box: trn2.48xlarge `i-0a981ba5acfbaef04`, ap-south-2b (capacity reservation
+`cr-049744aca3bf47932`), 16 devices / 64 logical cores (LNC2), 2 TB RAM, 500 GB root.
+CF stack `pika-h3-trn2-48xl` from `dev/trainium-model-dev/cloudformation/trn_capacity_block.yml`
+(VolumeSize bumped to 500 GB). SSH helper: `deploy/box48.sh run '<cmd>'` (key
+`~/.ssh/trn2-ap-south-2-20261104`). SG `sg-09f409131909c07f4`: SSH allowed from corp prefix
+70.232.80.0/25 + workstation egress 99.87.8.17/32.
+
+**TP=8 T2V works** (`pika_h3_flex_stage_tp8.yaml`, TP=8/ring=1/VAE-PP=8 on devices 0-7):
+- Warm request: text encode 2.9s, **denoise 53.4s (8.9s/step)**, VAE 12.6s, **total 68.9s**
+  (vs 246s warm at TP=4 on the 3xl — 4.1x per-step speedup from 2x cores; TP=8 also has
+  more HBM headroom per rank). Output video coherent, matches prompt.
+- First (cold) request 773s — all TP=8 graphs compile fresh; host-weight maps rebuild for
+  r*of8 (TP=4 maps don't transfer).
+- Run dir on box: `/data/omni29/runs/pika_t2v_tp8`.
+
+**Data plane (s5cmd, much faster than rsync):** cross-region rsync ran at ~13 MB/s; S3 via
+s5cmd (`--numworkers 64`) did ~435 MB/s up / ~1.1 GB/s down. Bucket
+`s3://pika-h3-transfer-933591302813-apse4` (ap-southeast-4) with a bucket policy granting
+the two instance roles; MiniMax-H3 (144 GB), Pika-H3-Flex (2.8 GB), venv (12 GB), plugin
+(3.3 GB) all mirrored there. **s5cmd does not preserve execute bits** — mirror them with the
+source's `find -perm -u+x` list (see session history) or venv binaries break.
+
+Lessons: kill-detached-jobs carefully (a killed rsync left a 0-byte pipeline file); corp
+egress IP differs per destination region (check from the instance side with `ss -tn`);
+ap-south-2 has no corp managed prefix list.
 
 ## Current Status: FL2VA Implementation In Progress
 
