@@ -328,6 +328,29 @@ Paired (McNemar), before vs after: 1 vs 50 discordant on parses, **p < 0.001**; 
 binds, **p < 0.001**. Sources: `runs/lab01_baseline_128_mn128.json`,
 `runs/lab07_eval_ft_128_mn128.json`.
 
+### Execution accuracy: queries that actually run
+
+Parse and bind are still proxies. The real question — *does it return the right answer?* —
+needs data, which this dataset doesn't ship. [`contrib/bird-duckdb`](../../bird-duckdb)
+builds a verified DuckDB-dialect execution benchmark from BIRD dev (1,491 questions with
+real databases, gold translated and machine-verified against the SQLite originals), and
+`labs/lab10_bird_exec_eval.py` grades result-set equality on a stratified 128-question
+subset, same prompt format and cached decode as above:
+
+| model | exec_accuracy [CI] | parse_rate | stage breakdown |
+|---|---:|---:|---|
+| Qwen3.5-4B untuned | 0.070 [0.037, 0.128] | 0.719 | ok 9, wrong 47, exec_error 36, truncated 36 |
+| **+ 1 epoch LoRA fine-tune** | **0.219** [0.156, 0.298] | **0.961** | **ok 28, wrong 41, exec_error 54, truncated 2** |
+
+Paired (McNemar): 5 vs 24 discordant, **p = 0.0005**. Sources: `runs/lab10_base_128.json`,
+`runs/lab10_ft_128.json`.
+
+The honest read: **0.961 parses but only 0.219 answers correctly.** BIRD is a much harder
+benchmark than the fine-tune's own distribution (multi-table joins over real databases,
+external-knowledge columns), and the residual failure is dominated by *schema-fidelity*
+errors — inventing column names, wrong tables, made-up functions — i.e. the thing bind_rate
+approximates, made exact. That gap is the target for the next fine-tune.
+
 **The decode cap matters more than it looks.** At max_new 48 the fine-tuned model scored
 0.883 with 14 truncations; 96 scores 0.961 (p = 0.006, paired) and 128 scores 0.969 — and
 at 128 `n_gold_over_cap` is 0, so the cap no longer confounds the metric at all (max gold
@@ -419,6 +442,7 @@ sqlft/   device.py        neuron device registration, sync, Timer, memory probe
          train.py         the training loop
          eval_sql.py      DuckDB parse+bind rate, cache-free greedy decode; Wilson CIs,
                           truncation stage, per-row records, McNemar run comparison
+         bird.py          BIRD-for-DuckDB questions, native materialization, exec grading
          infer.py         recurrent-cache decode (inference GDN kernels + static KV cache)
          tests/           CPU-only correctness tests
 
@@ -430,6 +454,7 @@ labs/    lab_smoke.py             device + autograd gate
          lab02_gdn_repro.py       ablate the captured inputs to isolate the bug
          lab04_ddp_vs_fsdp.py     the parallelism regime comparison
          lab09_cached_decode_parity.py  cached vs re-forward decode, teacher-forced logits
+         lab10_bird_exec_eval.py  execution accuracy on real BIRD databases
          run_*.sh                 serial runners for each matrix / triage
 
 runs/    gitignored: logs, result json, captured reproducers

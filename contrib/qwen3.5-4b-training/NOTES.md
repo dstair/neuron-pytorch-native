@@ -3,6 +3,36 @@
 Measured findings, things that broke, and levers tried and refuted. Newest first within a
 section. Anything asserted here has a command next to it.
 
+## Execution accuracy on BIRD-for-DuckDB: parse 0.961, exec 0.219
+
+`labs/lab10_bird_exec_eval.py` grades result-set equality against the verified
+BIRD-for-DuckDB dataset (`contrib/bird-duckdb`, 1491 questions, machine-verified gold),
+stratified 128-question subset, same prompt format + cached decode as the motherduck eval:
+
+| model | exec_accuracy [CI] | parse_rate |
+|---|---:|---:|
+| untuned | 0.070 [0.037, 0.128] | 0.719 |
+| + 1 epoch LoRA | **0.219** [0.156, 0.298] | **0.961** |
+
+Paired: 5 vs 24 discordant, **p = 0.0005**. Sources: `runs/lab10_base_128.json`,
+`runs/lab10_ft_128.json`.
+
+**The gap between 0.961 and 0.219 is the story.** Fine-tuning on single-distribution
+text2sql teaches dialect and stopping (parse 0.96), but BIRD's multi-table real databases
+punish schema fidelity: the fine-tuned model's residual failures are 54 exec_error
+(mostly Binder: invented columns/tables, e.g. `HAVING client_id = 992`, a `DIVIDE`
+function that doesn't exist) and 41 wrong (runs, wrong answer). Execution accuracy is the
+first metric in the stack that measures *semantic* SQL competence; it is the target for
+the next fine-tune, and the reason to consider training on BIRD-style multi-table data
+rather than only motherduckdb-25k.
+
+Dataset-building gotchas worth remembering: `build.py` originally stored the tier's INPUT
+sql for queries that only verified after the error-driven repair loop, so 8 repaired
+golds failed at eval time (now stores the SQL as executed); and the lab's materializer
+must be byte-identical in behaviour to the builder's, or verified gold stops running
+(the all-varchar fallback turns content-sniffed DATE columns back into VARCHAR and
+`strftime` overloads become ambiguous).
+
 ## Eval methodology rework: honest denominators, CIs, truncation, paired tests
 
 Four harness fixes in `sqlft/eval_sql.py`, each with a self-test gate and a measured

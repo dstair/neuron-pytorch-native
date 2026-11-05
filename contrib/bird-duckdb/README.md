@@ -79,7 +79,8 @@ an ordered comparison with a multiset fallback (ties are only partially determin
 ## Next steps
 
 - [x] Prototype on one database (64/64)
-- [x] Full build: 1491/1534 verified
-- [ ] Wire `execution_accuracy` into the qwen3.5-4b-training eval harness
-      (`labs/lab10_bird_exec_eval.py` in that package)
+- [x] Full build: 1493/1534 verified
+- [x] Wire `execution_accuracy` into the qwen3.5-4b-training eval harness
+      (`labs/lab10_bird_exec_eval.py`): baseline 0.070 vs fine-tuned 0.219 exec accuracy
+      (paired p = 0.0005) on a stratified 128-question subset
 - [ ] Ship native `.duckdb` database files alongside the dataset json
