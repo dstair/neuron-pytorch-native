@@ -85,8 +85,10 @@ Outputs: video frames via the engine result; the soundtrack as
 2. **Reference images > ~1.4 Mpx encode on CPU** (upstream tiled path, ~1-2 min): the
    device encode inside the swap overflows the Lite executor queue at larger tile counts.
    `reference_short_edge` defaults to the released 2048; set 768/1344 to stay on device.
-3. **2-step quality unverified** (knots [1000,250,0]); 15s quality unverified beyond a
-   successful run; FL2VA at 15s needs the CP=2 config too.
+3. **15s uses CP=8 (all 64 cores)** — no free cores for parallel engines at that config;
+   the ~225s step-0 warmup per engine boot is untargeted; FL2VA/ref2va at 15s untested
+   (same layout math, needs the CP=8 config + its compiles). 2-step and 15s T2V are
+   verified coherent.
 4. Video references (ref2va) not ported (image + audio references only).
 5. The engine leaves workers behind if the client dies mid-compile — check
    `pgrep -af "run.py|neuronx-cc"` before relaunching.
