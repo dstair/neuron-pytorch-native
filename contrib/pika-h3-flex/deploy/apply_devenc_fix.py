@@ -58,8 +58,9 @@ def main():
     path = sys.argv[1]
     with open(path) as f:
         src = f.read()
+    out = apply(src)
     with open(path, "w") as f:
-        f.write(apply(src))
+        f.write(out)
     print(f"Applied devenc fix to {path}")
 
 
