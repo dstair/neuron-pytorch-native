@@ -1,0 +1,413 @@
+{
+ "california_schools": {
+  "n": 89,
+  "verified": 84,
+  "rate": 0.9438,
+  "pass_tier0_verbatim": 46,
+  "pass_tier1_quoting": 36,
+  "pass_handfix": 0,
+  "pass_translated": 2,
+  "sqlite_gold_error": 0,
+  "duck_error": 0,
+  "mismatch": 5
+ },
+ "card_games": {
+  "n": 191,
+  "verified": 187,
+  "rate": 0.9791,
+  "pass_tier0_verbatim": 180,
+  "pass_tier1_quoting": 2,
+  "pass_handfix": 1,
+  "pass_translated": 4,
+  "sqlite_gold_error": 0,
+  "duck_error": 1,
+  "mismatch": 3
+ },
+ "codebase_community": {
+  "n": 186,
+  "verified": 183,
+  "rate": 0.9839,
+  "pass_tier0_verbatim": 166,
+  "pass_tier1_quoting": 6,
+  "pass_handfix": 0,
+  "pass_translated": 11,
+  "sqlite_gold_error": 0,
+  "duck_error": 0,
+  "mismatch": 3
+ },
+ "debit_card_specializing": {
+  "n": 64,
+  "verified": 64,
+  "rate": 1.0,
+  "pass_tier0_verbatim": 46,
+  "pass_tier1_quoting": 0,
+  "pass_handfix": 1,
+  "pass_translated": 17,
+  "sqlite_gold_error": 0,
+  "duck_error": 0,
+  "mismatch": 0
+ },
+ "european_football_2": {
+  "n": 129,
+  "verified": 121,
+  "rate": 0.938,
+  "pass_tier0_verbatim": 88,
+  "pass_tier1_quoting": 32,
+  "pass_handfix": 1,
+  "pass_translated": 0,
+  "sqlite_gold_error": 0,
+  "duck_error": 2,
+  "mismatch": 6
+ },
+ "financial": {
+  "n": 106,
+  "verified": 106,
+  "rate": 1.0,
+  "pass_tier0_verbatim": 95,
+  "pass_tier1_quoting": 7,
+  "pass_handfix": 0,
+  "pass_translated": 4,
+  "sqlite_gold_error": 0,
+  "duck_error": 0,
+  "mismatch": 0
+ },
+ "formula_1": {
+  "n": 174,
+  "verified": 168,
+  "rate": 0.9655,
+  "pass_tier0_verbatim": 157,
+  "pass_tier1_quoting": 4,
+  "pass_handfix": 1,
+  "pass_translated": 6,
+  "sqlite_gold_error": 0,
+  "duck_error": 3,
+  "mismatch": 3
+ },
+ "student_club": {
+  "n": 158,
+  "verified": 153,
+  "rate": 0.9684,
+  "pass_tier0_verbatim": 152,
+  "pass_tier1_quoting": 1,
+  "pass_handfix": 0,
+  "pass_translated": 0,
+  "sqlite_gold_error": 0,
+  "duck_error": 0,
+  "mismatch": 5
+ },
+ "superhero": {
+  "n": 129,
+  "verified": 129,
+  "rate": 1.0,
+  "pass_tier0_verbatim": 129,
+  "pass_tier1_quoting": 0,
+  "pass_handfix": 0,
+  "pass_translated": 0,
+  "sqlite_gold_error": 0,
+  "duck_error": 0,
+  "mismatch": 0
+ },
+ "thrombosis_prediction": {
+  "n": 163,
+  "verified": 152,
+  "rate": 0.9325,
+  "pass_tier0_verbatim": 99,
+  "pass_tier1_quoting": 50,
+  "pass_handfix": 1,
+  "pass_translated": 2,
+  "sqlite_gold_error": 0,
+  "duck_error": 1,
+  "mismatch": 10
+ },
+ "toxicology": {
+  "n": 145,
+  "verified": 144,
+  "rate": 0.9931,
+  "pass_tier0_verbatim": 141,
+  "pass_tier1_quoting": 0,
+  "pass_handfix": 1,
+  "pass_translated": 2,
+  "sqlite_gold_error": 0,
+  "duck_error": 0,
+  "mismatch": 1
+ },
+ "_failures": {
+  "california_schools": [
+   {
+    "qid": 37,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x4, duck 1x4) ref=[('1111 Van Ness Avenue', 'Fresno', 'CA', '93721-2002')] duck=[('222 North Virgil Avenue', 'Los Angeles', 'CA', '90004-3622')] diff=(('str', '1111 Van Ness Avenue'), ('str', 'Fresno'), ('str', 'CA'), ('str', '93721-2002')) != (('str', '222 North Virgil Avenue'), ('str', 'Los Angeles'), ('str', 'CA'), ('str', '90004-3622')) | t1: mismatch (ref 1x4, duck 1x4) ref=[('1111 Van Ness Avenue', 'Fresno', 'CA', '93721-2002')] duck=[('222 North Virgil Avenue', 'Los Angeles', 'CA', '90004-3622')] diff=(('str', '1111 Van Ness Avenue'), ('str', 'Fresno'), ('str', 'CA'), ('str', '93721-2002')) != (('str', '222 North Virgil Avenue'), ('str', 'Los Angeles'), ('str', 'CA'), ('str', '90004-3622')) | t3: mismatch (ref 1x4, duck 1x4) ref=[('1111 Van Ness Avenue', 'Fresno', 'CA', '93721-2002')] duck=[('222 North Virgil Avenue', 'Los Angeles', 'CA', '90004-3622')] diff=(('str', '1111 Van Ness Avenue'), ('str', 'Fresno'), ('str', 'CA'), ('str', '93721-2002')) != (('str', '222 North Virgil Avenue'), ('str', 'Los Angeles'), ('str', 'CA'), ('str', '90004-3622'))",
+    "sql": "SELECT T2.Street, T2.City, T2.State, T2.Zip FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode ORDER BY CAST(T1.NumGE1500 AS REAL) / T1.NumTstTakr ASC LIMIT 1"
+   },
+   {
+    "qid": 57,
+    "kind": "mismatch",
+    "error": "t0: Parser Error: errhint NOT IMPLEMENTED | t1: mismatch (ref 1x2, duck 1x2) ref=[('(916) 395-5050', None)] duck=[('(805) 641-5000', None)] diff=(('str', '(916) 395-5050'), None) != (('str', '(805) 641-5000'), None) | t3: mismatch (ref 1x2, duck 1x2) ref=[('(916) 395-5050', None)] duck=[('(805) 641-5000', None)] diff=(('str', '(916) 395-5050'), None) != (('str', '(805) 641-5000'), None)",
+    "sql": "SELECT T2.Phone, T2.Ext FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode ORDER BY T1.AvgScrWrite DESC LIMIT 332, 1"
+   },
+   {
+    "qid": 68,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[('Sacramento',)] duck=[('Calaveras',)] diff=(('str', 'Sacramento'),) != (('str', 'Calaveras'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[('Sacramento',)] duck=[('Lake',)] diff=(('str', 'Sacramento'),) != (('str', 'Lake'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[('Sacramento',)] duck=[('Lake',)] diff=(('str', 'Sacramento'),) != (('str', 'Lake'),)",
+    "sql": "SELECT County FROM schools WHERE strftime('%Y', ClosedDate) BETWEEN '1980' AND '1989' AND StatusType = 'Closed' AND SOC = 11 GROUP BY County ORDER BY COUNT(School) DESC LIMIT 1"
+   },
+   {
+    "qid": 74,
+    "kind": "mismatch",
+    "error": "t0: Parser Error: syntax error at or near \"`\" | t1: mismatch (ref 1x1, duck 1x1) ref=[('K',)] duck=[(None,)] diff=(('str', 'K'),) != (None,) | t3: mismatch (ref 1x1, duck 1x1) ref=[('K',)] duck=[(None,)] diff=(('str', 'K'),) != (None,)",
+    "sql": "SELECT MIN(T1.`Low Grade`) FROM frpm AS T1 INNER JOIN schools AS T2 ON T1.CDSCode = T2.CDSCode WHERE T2.NCESDist = '0613360' AND T2.EdOpsCode = 'SPECON'"
+   },
+   {
+    "qid": 81,
+    "kind": "mismatch",
+    "error": "t0: Parser Error: syntax error at or near \"`\" | t1: mismatch (ref 1x3, duck 1x3) ref=[('Oroville', '7', 'Central Middle - RISE')] duck=[('San Ysidro', None, 'Willow Elementary')] diff=(('str', 'Oroville'), ('num', 7.0), ('str', 'Central Middle - RISE')) != (('str', 'San Ysidro'), None, ('str', 'Willow Elementary')) | t3: mismatch (ref 1x3, duck 1x3) ref=[('Oroville', '7', 'Central Middle - RISE')] duck=[('San Ysidro', None, 'Willow Elementary')] diff=(('str', 'Oroville'), ('num', 7.0), ('str', 'Central Middle - RISE')) != (('str', 'San Ysidro'), None, ('str', 'Willow Elementary'))",
+    "sql": "SELECT T2.City, T1.`Low Grade`, T1.`School Name` FROM frpm AS T1 INNER JOIN schools AS T2 ON T1.CDSCode = T2.CDSCode WHERE T2.State = 'CA' ORDER BY T2.Latitude ASC LIMIT 1"
+   }
+  ],
+  "card_games": [
+   {
+    "qid": 342,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[(\"Ancestor's Chosen\",)] duck=[('Loyal Cathar // Unhallowed Cathar',)] diff=(('str', \"Ancestor's Chosen\"),) != (('str', 'Loyal Cathar // Unhallowed Cathar'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[(\"Ancestor's Chosen\",)] duck=[('Loyal Cathar // Unhallowed Cathar',)] diff=(('str', \"Ancestor's Chosen\"),) != (('str', 'Loyal Cathar // Unhallowed Cathar'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[(\"Ancestor's Chosen\",)] duck=[('Loyal Cathar // Unhallowed Cathar',)] diff=(('str', \"Ancestor's Chosen\"),) != (('str', 'Loyal Cathar // Unhallowed Cathar'),)",
+    "sql": "SELECT name FROM cards ORDER BY faceConvertedManaCost LIMIT 1"
+   },
+   {
+    "qid": 386,
+    "kind": "duck_error",
+    "error": "t0: Conversion Error: Could not convert string 'future' to DOUBLE | t1: Conversion Error: Could not convert string 'future' to DOUBLE | t3: Conversion Error: Could not convert string 'future' to DOUBLE",
+    "sql": "SELECT COUNT(T1.id) FROM cards AS T1 INNER JOIN legalities AS T2 ON T1.uuid = T2.uuid WHERE T1.frameVersion = 'future'"
+   },
+   {
+    "qid": 392,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 3x1, duck 3x1) ref=[('Guerrilla Tactics',)] duck=[('Guerrilla Tactics',)] diff=(('str', 'Aura of Silence'),) != (('str', 'Gloom'),) | t1: mismatch (ref 3x1, duck 3x1) ref=[('Guerrilla Tactics',)] duck=[('Orcish Artillery',)] diff=(('str', 'Aura of Silence'),) != (('str', 'Conversion'),) | t3: mismatch (ref 3x1, duck 3x1) ref=[('Guerrilla Tactics',)] duck=[('Soul Warden',)] diff=(('str', 'Aura of Silence'),) != (('str', 'Osai Vultures'),)",
+    "sql": "SELECT DISTINCT T1.name FROM cards AS T1 INNER JOIN rulings AS T2 ON T1.uuid = T2.uuid WHERE T1.rarity = 'uncommon' ORDER BY T2.date ASC LIMIT 3"
+   },
+   {
+    "qid": 514,
+    "kind": "mismatch",
+    "error": "t0: Parser Error: errhint NOT IMPLEMENTED | t1: mismatch (ref 10x1, duck 10x1) ref=[('Astral Cornucopia',)] duck=[('Astral Cornucopia',)] diff=(('str', 'Astral Cornucopia'),) != (('str', \"Builder's Bane\"),) | t3: mismatch (ref 10x1, duck 10x1) ref=[('Astral Cornucopia',)] duck=[('Astral Cornucopia',)] diff=(('str', 'Astral Cornucopia'),) != (('str', \"Builder's Bane\"),)",
+    "sql": "SELECT DISTINCT name FROM cards WHERE uuid IN ( SELECT uuid FROM legalities WHERE format = 'duel' ) ORDER BY manaCost DESC LIMIT 0, 10"
+   }
+  ],
+  "codebase_community": [
+   {
+    "qid": 580,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 10x1, duck 10x1) ref=[('whuber',)] duck=[('Harvey Motulsky',)] diff=(('str', 'Adam'),) != (('str', 'Chris Beeley'),) | t1: mismatch (ref 10x1, duck 10x1) ref=[('whuber',)] duck=[('Harvey Motulsky',)] diff=(('str', 'Adam'),) != (('str', 'Chris Beeley'),) | t3: mismatch (ref 10x1, duck 10x1) ref=[('whuber',)] duck=[('Harvey Motulsky',)] diff=(('str', 'Adam'),) != (('str', 'Chris Beeley'),)",
+    "sql": "SELECT T1.DisplayName FROM users AS T1 INNER JOIN badges AS T2 ON T1.Id = T2.UserId WHERE T2.Name = 'Necromancer' LIMIT 10"
+   },
+   {
+    "qid": 596,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[('Autobiographer',)] duck=[('Good Answer',)] diff=(('str', 'Autobiographer'),) != (('str', 'Good Answer'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[('Autobiographer',)] duck=[('Good Answer',)] diff=(('str', 'Autobiographer'),) != (('str', 'Good Answer'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[('Autobiographer',)] duck=[('Good Answer',)] diff=(('str', 'Autobiographer'),) != (('str', 'Good Answer'),)",
+    "sql": "SELECT Name FROM badges AS T1 INNER JOIN comments AS T2 ON T1.UserId = t2.UserId GROUP BY T2.UserId ORDER BY COUNT(T2.UserId) DESC LIMIT 1"
+   },
+   {
+    "qid": 692,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[(1,)] duck=[(datetime.timedelta(days=83, seconds=3911),)] diff=(('num', 1.0),) != (('str', '83 days, 1:05:11'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[(1,)] duck=[(datetime.timedelta(days=83, seconds=3911),)] diff=(('num', 1.0),) != (('str', '83 days, 1:05:11'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[(1,)] duck=[(datetime.timedelta(days=83, seconds=3911),)] diff=(('num', 1.0),) != (('str', '83 days, 1:05:11'),)",
+    "sql": "SELECT T1.Date - T2.CreationDate FROM badges AS T1 INNER JOIN users AS T2 ON T1.UserId = T2.Id WHERE T2.DisplayName = 'Zolomon'"
+   }
+  ],
+  "debit_card_specializing": [],
+  "european_football_2": [
+   {
+    "qid": 1024,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 5x1, duck 5x1) ref=[(38921,)] duck=[(38921,)] diff=(('num', 38921.0),) != (('num', 128698.0),) | t1: mismatch (ref 5x1, duck 5x1) ref=[(38921,)] duck=[(128698,)] diff=(('num', 38921.0),) != (('num', 128698.0),) | t3: mismatch (ref 5x1, duck 5x1) ref=[(38921,)] duck=[(38921,)] diff=(('num', 38921.0),) != (('num', 128698.0),)",
+    "sql": "SELECT id FROM Player_Attributes ORDER BY crossing DESC LIMIT 5"
+   },
+   {
+    "qid": 1026,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[('Piast Gliwice',)] duck=[('FC Bayern Munich',)] diff=(('str', 'Piast Gliwice'),) != (('str', 'FC Bayern Munich'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[('Piast Gliwice',)] duck=[('KAA Gent',)] diff=(('str', 'Piast Gliwice'),) != (('str', 'KAA Gent'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[('Piast Gliwice',)] duck=[('Roma',)] diff=(('str', 'Piast Gliwice'),) != (('str', 'Roma'),)",
+    "sql": "SELECT teamDetails.team_long_name FROM Match AS matchData INNER JOIN Team AS teamDetails ON matchData.home_team_api_id = teamDetails.team_api_id WHERE matchData.season = '2015/2016' AND matchData.home_team_goal - matchData.away_team_goal < 0 GROUP BY matchData.home_team_api_id ORDER BY COUNT(*) ASC LIMIT 1"
+   },
+   {
+    "qid": 1027,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 10x1, duck 10x1) ref=[('Emanuel Rivas',)] duck=[('Emanuele Calaio',)] diff=(('str', 'Manu Lanzarote'),) != (('str', 'Manu Torres'),) | t1: mismatch (ref 10x1, duck 10x1) ref=[('Emanuel Rivas',)] duck=[('Emanuele Calaio',)] diff=(('str', 'Manu Lanzarote'),) != (('str', 'Manu Torres'),) | t3: mismatch (ref 10x1, duck 10x1) ref=[('Emanuel Rivas',)] duck=[('Emanuele Calaio',)] diff=(('str', 'Manu Lanzarote'),) != (('str', 'Manu Torres'),)",
+    "sql": "SELECT t2.player_name FROM Player_Attributes AS t1 INNER JOIN Player AS t2 ON t1.id = t2.id ORDER BY t1.penalties DESC LIMIT 10"
+   },
+   {
+    "qid": 1031,
+    "kind": "duck_error",
+    "error": "t0: Parser Error: syntax error at or near \"`\" | t1: Binder Error: No function matches the given name and argument types '-(TIMESTAMP WITH TIME ZONE, VARCHAR)'. You might need to add  | t3: Binder Error: No function matches the given name and argument types '-(TIMESTAMP WITH TIME ZONE, VARCHAR)'. You might need to add ",
+    "sql": "SELECT DISTINCT DATETIME() - T2.birthday age FROM Player_Attributes AS t1 INNER JOIN Player AS t2 ON t1.player_api_id = t2.player_api_id WHERE STRFTIME('%Y',t1.`date`) >= '2013' AND STRFTIME('%Y',t1.`date`) <= '2015' AND t1.sprint_speed >= 97"
+   },
+   {
+    "qid": 1032,
+    "kind": "mismatch",
+    "error": "t-1: mismatch (ref 1x2, duck 1x2) ref=[('England Premier League', 3040)] duck=[('Belgium Jupiler League', 3040)] diff=(('str', 'England Premier League'), ('num', 3040.0)) != (('str', 'Belgium Jupiler League'), ('num', 3040.0)) | t1: Binder Error: column \"league_id\" must appear in the GROUP BY clause or must be part of an aggregate function. | t3: Binder Error: column \"league_id\" must appear in the GROUP BY clause or must be part of an aggregate function.",
+    "sql": "SELECT t2.name, t1.max_count FROM League AS t2 JOIN (SELECT league_id, MAX(cnt) AS max_count FROM (SELECT league_id, COUNT(id) AS cnt FROM Match GROUP BY league_id) AS subquery) AS t1 ON t1.league_id = t2.id"
+   },
+   {
+    "qid": 1076,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[(0.7999999999999972,)] duck=[(0.8000030517578125,)] diff=(('num', 0.7999999999999972),) != (('num', 0.8000030517578125),) | t1: mismatch (ref 1x1, duck 1x1) ref=[(0.7999999999999972,)] duck=[(0.8000030517578125,)] diff=(('num', 0.7999999999999972),) != (('num', 0.8000030517578125),) | t3: mismatch (ref 1x1, duck 1x1) ref=[(0.7999999999999972,)] duck=[(0.8000030517578125,)] diff=(('num', 0.7999999999999972),) != (('num', 0.8000030517578125),)",
+    "sql": "SELECT CAST(SUM(CASE WHEN t1.player_name = 'Abdou Diallo' THEN t2.ball_control ELSE 0 END) AS REAL) / COUNT(CASE WHEN t1.player_name = 'Abdou Diallo' THEN t2.id ELSE NULL END) - CAST(SUM(CASE WHEN t1.player_name = 'Aaron Appindangoye' THEN t2.ball_control ELSE 0 END) AS REAL) / COUNT(CASE WHEN t1.player_name = 'Aaron Appindangoye' THEN t2.id ELSE NULL END) FROM Player AS t1 INNER JOIN Player_Attributes AS t2 ON t1.player_api_id = t2.player_api_id"
+   },
+   {
+    "qid": 1121,
+    "kind": "duck_error",
+    "error": "t0: Catalog Error: Scalar Function with name datetime does not exist! | t1: Binder Error: Cannot compare values of type INTERVAL and type INTEGER_LITERAL - an explicit cast is required | t3: Binder Error: Cannot compare values of type INTERVAL and type INTEGER_LITERAL - an explicit cast is required",
+    "sql": "SELECT SUM(t2.home_team_goal) FROM Player AS t1 INNER JOIN match AS t2 ON t1.player_api_id = t2.away_player_1 WHERE datetime(CURRENT_TIMESTAMP, 'localtime') - datetime(T1.birthday) < 31"
+   },
+   {
+    "qid": 1123,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[('Lionel Messi',)] duck=[('Neymar',)] diff=(('str', 'Lionel Messi'),) != (('str', 'Neymar'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[('Lionel Messi',)] duck=[('Neymar',)] diff=(('str', 'Lionel Messi'),) != (('str', 'Neymar'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[('Lionel Messi',)] duck=[('Neymar',)] diff=(('str', 'Lionel Messi'),) != (('str', 'Neymar'),)",
+    "sql": "SELECT DISTINCT t1.player_name FROM Player AS t1 INNER JOIN Player_Attributes AS t2 ON t1.player_api_id = t2.player_api_id ORDER BY t2.potential DESC LIMIT 1"
+   }
+  ],
+  "financial": [],
+  "formula_1": [
+   {
+    "qid": 847,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[('Fisichella',)] duck=[('R\u00e4ikk\u00f6nen',)] diff=(('str', 'Fisichella'),) != (('str', 'R\u00e4ikk\u00f6nen'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[('Fisichella',)] duck=[('R\u00e4ikk\u00f6nen',)] diff=(('str', 'Fisichella'),) != (('str', 'R\u00e4ikk\u00f6nen'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[('Fisichella',)] duck=[('R\u00e4ikk\u00f6nen',)] diff=(('str', 'Fisichella'),) != (('str', 'R\u00e4ikk\u00f6nen'),)",
+    "sql": "SELECT T2.surname FROM qualifying AS T1 INNER JOIN drivers AS T2 ON T2.driverId = T1.driverId WHERE T1.raceId = 19 ORDER BY T1.q2 ASC LIMIT 1"
+   },
+   {
+    "qid": 908,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x4, duck 1x4) ref=[(78, 'Monaco Grand Prix', 2009, 'Monte-Carlo')] duck=[(78, 'Monaco Grand Prix', 2010, 'Monte-Carlo')] diff=(('num', 78.0), ('str', 'Monaco Grand Prix'), ('num', 2009.0), ('str', 'Monte-Carlo')) != (('num', 78.0), ('str', 'Monaco Grand Prix'), ('num', 2010.0), ('str', 'Monte-Carlo')) | t1: mismatch (ref 1x4, duck 1x4) ref=[(78, 'Monaco Grand Prix', 2009, 'Monte-Carlo')] duck=[(78, 'Monaco Grand Prix', 2010, 'Monte-Carlo')] diff=(('num', 78.0), ('str', 'Monaco Grand Prix'), ('num', 2009.0), ('str', 'Monte-Carlo')) != (('num', 78.0), ('str', 'Monaco Grand Prix'), ('num', 2010.0), ('str', 'Monte-Carlo')) | t3: mismatch (ref 1x4, duck 1x4) ref=[(78, 'Monaco Grand Prix', 2009, 'Monte-Carlo')] duck=[(78, 'Monaco Grand Prix', 2010, 'Monte-Carlo')] diff=(('num', 78.0), ('str', 'Monaco Grand Prix'), ('num', 2009.0), ('str', 'Monte-Carlo')) != (('num', 78.0), ('str', 'Monaco Grand Prix'), ('num', 2010.0), ('str', 'Monte-Carlo'))",
+    "sql": "SELECT T3.lap, T2.name, T2.year, T1.location FROM circuits AS T1 INNER JOIN races AS T2 ON T1.circuitId = T2.circuitId INNER JOIN lapTimes AS T3 ON T3.raceId = T2.raceId ORDER BY T3.lap DESC LIMIT 1"
+   },
+   {
+    "qid": 960,
+    "kind": "mismatch",
+    "error": "t0: Binder Error: No function matches the given name and argument types 'avg(VARCHAR)'. You might need to add explicit type casts. | t1: Binder Error: No function matches the given name and argument types 'avg(VARCHAR)'. You might need to add explicit type casts. | t3: mismatch (ref 1x1, duck 1x1) ref=[(199.6415625,)] duck=[(159.71325,)] diff=(('num', 199.6415625),) != (('num', 159.71325),)",
+    "sql": "SELECT AVG(T1.fastestLapSpeed) FROM results AS T1 INNER JOIN races AS T2 on T1.raceId = T2.raceId WHERE T2.year = 2009 AND T2.name = 'Spanish Grand Prix'"
+   },
+   {
+    "qid": 963,
+    "kind": "duck_error",
+    "error": "t0: Conversion Error: Could not convert string '1:' to INT32 | t1: Conversion Error: Could not convert string '1:' to INT32 | t3: Conversion Error: Could not convert string '1:' to INT32",
+    "sql": "SELECT COUNT(T1.driverId) FROM drivers AS T1 INNER JOIN lapTimes AS T2 on T1.driverId = T2.driverId WHERE T1.nationality = 'French' AND (CAST(SUBSTR(T2.time, 1, 2) AS INTEGER) * 60 + CAST(SUBSTR(T2.time, 4, 2) AS INTEGER) + CAST(SUBSTR(T2.time, 7, 2) AS REAL) / 1000) < 120"
+   },
+   {
+    "qid": 1006,
+    "kind": "duck_error",
+    "error": "t0: Binder Error: No function matches the given name and argument types '*(INTEGER_LITERAL, BOOLEAN)'. You might need to add explicit  | t1: Binder Error: No function matches the given name and argument types '*(INTEGER_LITERAL, BOOLEAN)'. You might need to add explicit  | t3: Binder Error: No function matches the given name and argument types '*(INTEGER_LITERAL, BOOLEAN)'. You might need to add explicit ",
+    "sql": "SELECT time FROM lapTimes ORDER BY (CASE WHEN INSTR(time, ':') <> INSTR(SUBSTR(time, INSTR(time, ':') + 1), ':') + INSTR(time, ':') THEN CAST(SUBSTR(time, 1, INSTR(time, ':') - 1) AS REAL) * 3600 ELSE 0 END) + (CAST(SUBSTR(time, INSTR(time, ':') - 2 * (INSTR(time, ':') = INSTR(SUBSTR(time, INSTR(time, ':') + 1), ':') + INSTR(time, ':')), INSTR(time, ':') - 1) AS REAL) * 60) + (CAST(SUBSTR(time, INSTR(time, ':') + 1, INSTR(time, '.') - INSTR(time, ':') - 1) AS REAL)) + (CAST(SUBSTR(time, INSTR(time, '.') + 1) AS REAL) / 1000) ASC LIMIT 1"
+   },
+   {
+    "qid": 1011,
+    "kind": "duck_error",
+    "error": "t0: Conversion Error: Could not convert string '05:07' to FLOAT | t1: Conversion Error: Could not convert string '05:07' to FLOAT | t3: Conversion Error: Could not convert string '05:07' to FLOAT",
+    "sql": "WITH lap_times_in_seconds AS (SELECT driverId, (CASE WHEN SUBSTR(time, 1, INSTR(time, ':') - 1) <> '' THEN CAST(SUBSTR(time, 1, INSTR(time, ':') - 1) AS REAL) * 60 ELSE 0 END + CASE WHEN SUBSTR(time, INSTR(time, ':') + 1, INSTR(time, '.') - INSTR(time, ':') - 1) <> '' THEN CAST(SUBSTR(time, INSTR(time, ':') + 1, INSTR(time, '.') - INSTR(time, ':') - 1) AS REAL) ELSE 0 END + CASE WHEN SUBSTR(time, INSTR(time, '.') + 1) <> '' THEN CAST(SUBSTR(time, INSTR(time, '.') + 1) AS REAL) / 1000 ELSE 0 END) AS time_in_seconds FROM lapTimes) SELECT T2.forename, T2.surname, T1.driverId FROM (SELECT driverId, MIN(time_in_seconds) AS min_time_in_seconds FROM lap_times_in_seconds GROUP BY driverId) AS T1 INNER JOIN drivers AS T2 ON T1.driverId = T2.driverId ORDER BY T1.min_time_in_seconds ASC LIMIT 20"
+   }
+  ],
+  "student_club": [
+   {
+    "qid": 1318,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[('Yearly Kickoff',)] duck=[('Registration',)] diff=(('str', 'Yearly Kickoff'),) != (('str', 'Registration'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[('Yearly Kickoff',)] duck=[('Registration',)] diff=(('str', 'Yearly Kickoff'),) != (('str', 'Registration'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[('Yearly Kickoff',)] duck=[('Registration',)] diff=(('str', 'Yearly Kickoff'),) != (('str', 'Registration'),)",
+    "sql": "SELECT T1.event_name FROM event AS T1 INNER JOIN attendance AS T2 ON T1.event_id = T2.link_to_event GROUP BY T1.event_name ORDER BY COUNT(T2.link_to_event) DESC LIMIT 1"
+   },
+   {
+    "qid": 1365,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[('Water, chips, cookies',)] duck=[('Pizza',)] diff=(('str', 'Water, chips, cookies'),) != (('str', 'Pizza'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[('Water, chips, cookies',)] duck=[('Pizza',)] diff=(('str', 'Water, chips, cookies'),) != (('str', 'Pizza'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[('Water, chips, cookies',)] duck=[('Pizza',)] diff=(('str', 'Water, chips, cookies'),) != (('str', 'Pizza'),)",
+    "sql": "SELECT T2.expense_description FROM budget AS T1 INNER JOIN expense AS T2 ON T1.budget_id = T2.link_to_budget ORDER BY T1.remaining LIMIT 1"
+   },
+   {
+    "qid": 1388,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x3, duck 1x3) ref=[('Connor', 'Hilton', 'Dues')] duck=[('Sacha', 'Harrison', 'Dues')] diff=(('str', 'Connor'), ('str', 'Hilton'), ('str', 'Dues')) != (('str', 'Sacha'), ('str', 'Harrison'), ('str', 'Dues')) | t1: mismatch (ref 1x3, duck 1x3) ref=[('Connor', 'Hilton', 'Dues')] duck=[('Sacha', 'Harrison', 'Dues')] diff=(('str', 'Connor'), ('str', 'Hilton'), ('str', 'Dues')) != (('str', 'Sacha'), ('str', 'Harrison'), ('str', 'Dues')) | t3: mismatch (ref 1x3, duck 1x3) ref=[('Connor', 'Hilton', 'Dues')] duck=[('Sacha', 'Harrison', 'Dues')] diff=(('str', 'Connor'), ('str', 'Hilton'), ('str', 'Dues')) != (('str', 'Sacha'), ('str', 'Harrison'), ('str', 'Dues'))",
+    "sql": "SELECT T1.first_name, T1.last_name, T2.source FROM member AS T1 INNER JOIN income AS T2 ON T1.member_id = T2.link_to_member GROUP BY T1.first_name, T1.last_name, T2.source ORDER BY SUM(T2.amount) DESC LIMIT 1"
+   },
+   {
+    "qid": 1389,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[('November Speaker',)] duck=[('September Speaker',)] diff=(('str', 'November Speaker'),) != (('str', 'September Speaker'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[('November Speaker',)] duck=[('September Speaker',)] diff=(('str', 'November Speaker'),) != (('str', 'September Speaker'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[('November Speaker',)] duck=[('September Speaker',)] diff=(('str', 'November Speaker'),) != (('str', 'September Speaker'),)",
+    "sql": "SELECT T1.event_name FROM event AS T1 INNER JOIN budget AS T2 ON T1.event_id = T2.link_to_event INNER JOIN expense AS T3 ON T2.budget_id = T3.link_to_budget ORDER BY T3.cost LIMIT 1"
+   },
+   {
+    "qid": 1407,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 3x1, duck 3x1) ref=[('recvKTAWAFKkVNnXQ',)] duck=[('recvKTAWAFKkVNnXQ',)] diff=(('str', 'rec0QmEc3cSQFQ6V2'),) != (('str', 'recFZ47e0eVqcQD9O'),) | t1: mismatch (ref 3x1, duck 3x1) ref=[('recvKTAWAFKkVNnXQ',)] duck=[('recvKTAWAFKkVNnXQ',)] diff=(('str', 'rec0QmEc3cSQFQ6V2'),) != (('str', 'recFZ47e0eVqcQD9O'),) | t3: mismatch (ref 3x1, duck 3x1) ref=[('recvKTAWAFKkVNnXQ',)] duck=[('recvKTAWAFKkVNnXQ',)] diff=(('str', 'rec0QmEc3cSQFQ6V2'),) != (('str', 'recFZ47e0eVqcQD9O'),)",
+    "sql": "SELECT budget_id FROM budget WHERE category = 'Advertisement' ORDER BY amount DESC LIMIT 3"
+   }
+  ],
+  "superhero": [],
+  "thrombosis_prediction": [
+   {
+    "qid": 1163,
+    "kind": "mismatch",
+    "error": "t0: Parser Error: syntax error at or near \"Date\" | t1: mismatch (ref 1x1, duck 1x1) ref=[(-10,)] duck=[(-1989.0,)] diff=(('num', -10.0),) != (('num', -1989.0),) | t3: mismatch (ref 1x1, duck 1x1) ref=[(-10,)] duck=[(-1989.0,)] diff=(('num', -10.0),) != (('num', -1989.0),)",
+    "sql": "SELECT MIN(STRFTIME('%Y', `First Date`) - STRFTIME('%Y', Birthday)) FROM Patient"
+   },
+   {
+    "qid": 1170,
+    "kind": "mismatch",
+    "error": "t0: Parser Error: syntax error at or near \"`\" | t1: mismatch (ref 1x1, duck 1x1) ref=[(11,)] duck=[(21,)] diff=(('num', 11.0),) != (('num', 21.0),) | t3: mismatch (ref 1x1, duck 1x1) ref=[(11,)] duck=[(21,)] diff=(('num', 11.0),) != (('num', 21.0),)",
+    "sql": "SELECT COUNT(DISTINCT T1.ID) FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE T1.Admission = '+' AND STRFTIME('%Y', T2.`Examination Date`) - STRFTIME('%Y', T1.`First Date`) >= 1"
+   },
+   {
+    "qid": 1190,
+    "kind": "mismatch",
+    "error": "t0: Catalog Error: Scalar Function with name `__postfix does not exist! | t1: mismatch (ref 1x1, duck 1x1) ref=[(61.00217864923747,)] duck=[(91.98056030273438,)] diff=(('num', 61.00217864923747),) != (('num', 91.98056030273438),) | t3: mismatch (ref 1x1, duck 1x1) ref=[(61.00217864923747,)] duck=[(91.98056030273438,)] diff=(('num', 61.00217864923747),) != (('num', 91.98056030273438),)",
+    "sql": "SELECT CAST(SUM(CASE WHEN UA <= 6.5 THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(ID) FROM Laboratory WHERE `U-PRO` > 0 AND `U-PRO` < 30"
+   },
+   {
+    "qid": 1234,
+    "kind": "duck_error",
+    "error": "t0: Binder Error: Referenced column \"T1\" not found in FROM clause! | t1: Binder Error: Referenced column \"T1\" not found in FROM clause! | t3: Binder Error: Referenced column \"T1\" not found in FROM clause!",
+    "sql": "SELECT DISTINCT T1.ID, T1.SEX, T1.Birthday FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.WBC <= 3.5 OR T2.WBC >= 9.0 GROUP BY T1.SEX,T1.ID ORDER BY T1.Birthday ASC"
+   },
+   {
+    "qid": 1249,
+    "kind": "mismatch",
+    "error": "t0: Parser Error: syntax error at or near \"`\" | t1: mismatch (ref 1359x1, duck 593x1) ref=[('SLE, MCTD',)] duck=[('SJS',)] diff=(('str', \"Raynaud's phenomenon\"),) != (('str', 'AORTITIS'),) | t3: mismatch (ref 1359x1, duck 593x1) ref=[('SLE, MCTD',)] duck=[('SJS',)] diff=(('str', \"Raynaud's phenomenon\"),) != (('str', 'AORTITIS'),)",
+    "sql": "SELECT T1.Diagnosis FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.`U-PRO` >= 30"
+   },
+   {
+    "qid": 1250,
+    "kind": "mismatch",
+    "error": "t0: Parser Error: syntax error at or near \"`\" | t1: mismatch (ref 24x1, duck 19x1) ref=[(48473,)] duck=[(250391,)] diff=(('num', 1130007.0),) != (('num', 1185720.0),) | t3: mismatch (ref 24x1, duck 19x1) ref=[(48473,)] duck=[(1185720,)] diff=(('num', 1130007.0),) != (('num', 1185720.0),)",
+    "sql": "SELECT DISTINCT T1.ID FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.`U-PRO` > 0 AND T2.`U-PRO` < 30 AND T1.Diagnosis = 'SLE'"
+   },
+   {
+    "qid": 1260,
+    "kind": "mismatch",
+    "error": "t0: Conversion Error: invalid date field format: \"now\", expected format is (YYYY-MM-DD) | t1: mismatch (ref 280x1, duck 8302x1) ref=[(57266,)] duck=[(27654,)] diff=(('num', 1078741.0),) != (('num', 1043570.0),) | t3: mismatch (ref 280x1, duck 8302x1) ref=[(57266,)] duck=[(27654,)] diff=(('num', 1078741.0),) != (('num', 1043570.0),)",
+    "sql": "SELECT T1.ID FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.RF < 20 AND STRFTIME('%Y', DATE('now')) - STRFTIME('%Y', T1.Birthday) > 60"
+   },
+   {
+    "qid": 1261,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[(2,)] duck=[(18,)] diff=(('num', 2.0),) != (('num', 18.0),) | t1: mismatch (ref 1x1, duck 1x1) ref=[(2,)] duck=[(18,)] diff=(('num', 2.0),) != (('num', 18.0),) | t3: mismatch (ref 1x1, duck 1x1) ref=[(2,)] duck=[(18,)] diff=(('num', 2.0),) != (('num', 18.0),)",
+    "sql": "SELECT COUNT(DISTINCT T1.ID) FROM Examination AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.RF < 20 AND T1.Thrombosis = 0"
+   },
+   {
+    "qid": 1269,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 24x1, duck 0x0) ref=[(944797,)] duck=[] diff=row-count-only | t1: mismatch (ref 24x1, duck 0x0) ref=[(944797,)] duck=[] diff=row-count-only | t3: mismatch (ref 24x1, duck 0x0) ref=[(944797,)] duck=[] diff=row-count-only",
+    "sql": "SELECT T1.ID FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.SC170 IN ('negative','0') AND T2.Date > 1997-01-01"
+   },
+   {
+    "qid": 1276,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 3x1, duck 8x1) ref=[('MCTD',)] duck=[('SJS',)] diff=(('str', 'SLE'),) != (('str', 'RA'),) | t1: mismatch (ref 3x1, duck 8x1) ref=[('MCTD',)] duck=[('SLE',)] diff=(('str', 'SLE'),) != (('str', 'RA'),) | t3: mismatch (ref 3x1, duck 8x1) ref=[('MCTD',)] duck=[('SJS',)] diff=(('str', 'SLE'),) != (('str', 'RA'),)",
+    "sql": "SELECT DISTINCT(T1.Diagnosis) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.DNA >= 8"
+   },
+   {
+    "qid": 1277,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[(4,)] duck=[(58,)] diff=(('num', 4.0),) != (('num', 58.0),) | t1: mismatch (ref 1x1, duck 1x1) ref=[(4,)] duck=[(58,)] diff=(('num', 4.0),) != (('num', 58.0),) | t3: mismatch (ref 1x1, duck 1x1) ref=[(4,)] duck=[(58,)] diff=(('num', 4.0),) != (('num', 58.0),)",
+    "sql": "SELECT COUNT(DISTINCT T1.ID) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.DNA < 8 AND T1.Description IS NULL"
+   }
+  ],
+  "toxicology": [
+   {
+    "qid": 251,
+    "kind": "mismatch",
+    "error": "t0: mismatch (ref 1x1, duck 1x1) ref=[('cu',)] duck=[('f',)] diff=(('str', 'cu'),) != (('str', 'f'),) | t1: mismatch (ref 1x1, duck 1x1) ref=[('cu',)] duck=[('f',)] diff=(('str', 'cu'),) != (('str', 'f'),) | t3: mismatch (ref 1x1, duck 1x1) ref=[('cu',)] duck=[('f',)] diff=(('str', 'cu'),) != (('str', 'f'),)",
+    "sql": "SELECT T.element FROM ( SELECT T2.element, COUNT(DISTINCT T2.molecule_id) FROM molecule AS T1 INNER JOIN atom AS T2 ON T1.molecule_id = T2.molecule_id WHERE T1.label = '+' GROUP BY T2.element ORDER BY COUNT(DISTINCT T2.molecule_id) LIMIT 1 ) t"
+   }
+  ]
+ }
+}

@@ -6,68 +6,80 @@ motherduckdb/duckdb-text2sql-25k is DuckDB dialect but ships no data). This buil
 translate gold SQL only where the dialects genuinely differ, and prove every translated gold
 by executing it against DuckDB and comparing result sets with the SQLite original.
 
-BIRD is CC BY-SA 4.0; a derivative is shareable with attribution.
+BIRD is CC BY-SA 4.0 (https://bird-bench.github.io/); a derivative is shareable with
+attribution. Source data: `dev_20240627/` from
+https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip (symlinked or copied here, gitignored).
 
-## Status: prototype validated on one database (debit_card_specializing, 64 questions)
+## Result: 1491/1534 questions verified (97.2%)
 
 ```
-pass tier0 (raw pass-through):            46/64 (71.9%)
-pass tier1 (backtick->quote):              0/64 (0.0%)
-pass tier2 (+IIF->IF, BETWEEN):           14/64 (21.9%)
-pass tier3 (+NULLIF, DATE-LIKE, hand):     4/64 (6.2%)
-TOTAL verified:                           64/64 (100.0%)
+california_schools         83/89      european_football_2        121/129
+card_games                 187/191    financial                  106/106
+codebase_community         183/186    formula_1                  168/174
+debit_card_specializing    64/64      student_club               154/158
+superhero                  129/129    thrombosis_prediction      152/163
+                                      toxicology                 143/145
 ```
-
-So the measured dialect gap on this database: **~72% of gold runs verbatim, ~94% with two
-schema-aware rules, 100% with three more targeted fixes.** Run it:
 
 ```bash
 pip install duckdb
-# dev_20240627/ from https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip
-python3 prototype.py [db_id]     # default debit_card_specializing
+python3 build.py             # full build -> bird_duckdb_dev.json + build_report.json
+python3 build.py --triage    # failures only, no artifacts
 ```
 
-## The dialect gap, measured (the real answer to "SQLite vs DuckDB")
+Artifacts:
 
-1. **`IIF` → `IF`** (12/64 here). SQLite has `IIF`; DuckDB spells it `IF`. Mechanical.
-2. **Loose vs strict typing in `BETWEEN`** (a few). SQLite coerces `date_text BETWEEN 201101
-   AND 201112`; DuckDB ≥0.10 refuses mixed-type BETWEEN. Fix is schema-aware: quote the
-   literals only when the column is TEXT (string ordering would corrupt numeric columns).
-3. **Division by zero: NULL vs inf** (2/64). SQLite `x/0` → NULL (and SUM/WHERE silently
-   drop those rows); DuckDB → `inf`, which poisons aggregates and admits extra rows.
-   `x / NULLIF(y, 0)` reproduces SQLite semantics exactly.
-4. **`LIKE` on DATE columns** (1/64). SQLite stores dates as text; DuckDB has real DATEs and
-   `~~(DATE, STRING)` doesn't bind. `CAST(col AS VARCHAR) LIKE ...`.
-5. **Bare columns in GROUP BY** (1/64). SQLite serves an arbitrary row's value; DuckDB
-   (Postgres semantics) requires the column grouped or aggregated. `ANY_VALUE(col)` is the
-   faithful translation, but detecting it needs real parsing — it lives in a short,
-   reviewed per-query hand-fix list.
+- **`bird_duckdb_dev.json`** (~1 MB): 1491 records, BIRD fields + `SQL_duckdb` (the verified
+  DuckDB gold) + `tier` (how it was produced: 0 = verbatim, 1 = quoting/syntax only,
+  3 = rule-translated, -1 = reviewed hand-fix).
+- **`build_report.json`**: per-db tier rates plus every dropped question with its full
+  error trail.
 
-Things that turned out NOT to be problems, measured:
+Tier mix, measured: ~84% of gold runs **verbatim**, ~9% needs only quoting/syntax
+normalization (backticks, `LIMIT a,b`, strftime arg order, `ILIKE`, `AS "percent"`),
+~3% needs semantic rules (IIF→IF, BETWEEN literal quoting, NULLIF division, text→number
+coercion), 8 queries carry a **reviewed hand-fix**, and **43 were dropped** (2.8%).
 
-- **Backticks.** DuckDB accepts SQLite's backtick identifier quoting natively; the
-  tier-1 rewrite rule was never needed.
-- **Result mismatches are float noise, not dialect.** All initial "mismatches" were
-  parallel-aggregation accumulation-order differences (e.g. 459.9562642871061 vs ...0896).
-  The comparator must compare multisets with a float-tolerant *pairwise* row equality
-  (sort by repr, zip, rel_tol 1e-6) — sorting reprs and string-comparing flags noise as
-  failure.
-- **SQLite gold errors: 0** on this database.
+## The drops, and why
 
-## Design decisions for the full build
+Every drop is counted and listed in `build_report.json`. Classes:
 
-- **Native tables, not the scanner.** Data is imported via `sqlite_scan` then
-  `CREATE TABLE AS` materialized, so execution semantics (types!) are DuckDB's own — which
-  is what surfaces and lets us fix differences like DATE-vs-text once, in the open.
-- **Every gold is verified against the SQLite original**, order-insensitive unless the
-  query has ORDER BY, float-tolerant. Whatever cannot be auto-verified is dropped or
-  hand-fixed *and counted* — the dataset proves its own gold answers.
-- **The translation tiers and the hand-fix list are part of the artifact.** They are the
-  measured dialect boundary, and consumers can re-run verification.
+1. **Non-deterministic gold (~2/3 of drops).** `ORDER BY` on a non-unique key plus `LIMIT`
+   (the winner is a tie), or a bare GROUP BY column where SQLite serves an arbitrary row.
+   These golds are flaky in *any* engine — they flip between runs of the same verifier.
+2. **Junk gold.** `'2011-02-23' - '2010-09-01' = 1` in SQLite (leading-year text
+   arithmetic), `OR '+-'` as a boolean, `datetime() - birthday > 35`.
+3. **Hard semantic gaps (a handful).** Mixed-type columns where the text values are
+   reachable data (`frameVersion = 'future'` vs junk-as-NULL), lap-time strings
+   ('05:07') used numerically in ways SQLite's prefix coercion handles but a faithful
+   translation can't reach without a full parser.
+
+## The measured dialect boundary (what translation actually costs)
+
+Syntax/quoting (mechanical): backtick identifiers (**not** accepted by DuckDB when they
+contain spaces/parens), `LIMIT offset, count`, `STRFTIME(fmt, date)` → `STRFTIME(date, fmt)`
+argument order, SQLite's case-insensitive `LIKE` → `ILIKE`, reserved-word aliases
+(`percent`, `Date`).
+
+Semantic (SQLite leniency DuckDB refuses): `IIF` → `IF`; mixed-type `BETWEEN`; division
+by zero (NULL vs `inf` → `NULLIF`); text in arithmetic and aggregates (SQLite
+leading-prefix coercion → `REGEXP_EXTRACT` + `TRY_CAST` + `COALESCE`); bare GROUP BY
+columns → `ANY_VALUE`; SQLite integer division → `FLOOR`.
+
+Materialization choices that matter: native tables via `sqlite_scan` + `CREATE TABLE AS`;
+REAL columns always through the all-varchar + `TRY_CAST AS DOUBLE` path (the typed scan's
+f32 rounds values before a cast can recover them); query-time conversion errors lazily
+rebuild the offending column via `TRY_CAST`.
+
+Comparator calibrations: float-tolerant *pairwise* multiset equality (parallel aggregation
+order makes 459.9562642871061 vs ...0896 routine, not a mismatch); `ORDER BY` queries get
+an ordered comparison with a multiset fallback (ties are only partially deterministic);
+`datetime` objects normalize to text; NaN equals NaN; booleans unify with 1/0.
 
 ## Next steps
 
-- [ ] Run all 11 dev databases; collect per-db tier rates and the full hand-fix list
-- [ ] Emit the dataset: questions + DuckDB gold + native DuckDB database files + verification report
+- [x] Prototype on one database (64/64)
+- [x] Full build: 1491/1534 verified
 - [ ] Wire `execution_accuracy` into the qwen3.5-4b-training eval harness
-      (gold must self-score ~100% first — the same calibration discipline as the parse ceiling)
+      (`labs/lab10_bird_exec_eval.py` in that package)
+- [ ] Ship native `.duckdb` database files alongside the dataset json
