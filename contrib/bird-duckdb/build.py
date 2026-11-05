@@ -462,8 +462,10 @@ def main() -> int:
                     continue
                 if results_match(ref, cand, ordered):
                     stats[f"pass_tier{tier}"] += 1
-                    verified_sql = cand_sql
-                    dataset.append({**d, "SQL_duckdb": cand_sql, "tier": tier,
+                    # Store the SQL AS EXECUTED (post-repair), not the tier's input:
+                    # the repair loop's ANY_VALUE wraps and TRY_CAST rebuilds are part
+                    # of the verified gold.
+                    dataset.append({**d, "SQL_duckdb": fixed_sql, "tier": tier,
                                     "verified": True})
                     break
                 tier_errors.append(

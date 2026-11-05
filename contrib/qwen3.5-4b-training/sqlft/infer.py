@@ -218,6 +218,13 @@ def cached_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 
     for n, prompt in enumerate(prompts):
         ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         L = len(ids)
+        # A prompt too long to leave decode room in the seq_len-wide buffer is
+        # truncated to its LAST tokens (the schema tail, the question, and the
+        # '-- Answer:' marker are what matter; schema middle is what is lost).
+        max_L = seq_len - chunk
+        if L > max_L:
+            ids = ids[-max_L:]
+            L = max_L
         W = -(-L // chunk) * chunk
         # Decode tokens must fit the seq_len-wide KV buffer: cursor W+t < seq_len. A
         # prompt whose bucket fills the buffer gets zero decode steps -- the old

@@ -330,17 +330,6 @@
   "verified": true
  },
  {
-  "question_id": 30,
-  "db_id": "california_schools",
-  "question": "Which cities have the top 5 lowest enrollment number for students in grades 1 through 12?",
-  "evidence": "K-12 refers to students in grades 1 through 12.",
-  "SQL": "SELECT T2.City FROM frpm AS T1 INNER JOIN schools AS T2 ON T1.CDSCode = T2.CDSCode GROUP BY T2.City ORDER BY SUM(T1.`Enrollment (K-12)`) ASC LIMIT 5",
-  "difficulty": "simple",
-  "SQL_duckdb": "SELECT T2.City FROM frpm AS T1 INNER JOIN schools AS T2 ON T1.CDSCode = T2.CDSCode GROUP BY T2.City ORDER BY SUM(T1.\"Enrollment (K-12)\") ASC LIMIT 5",
-  "tier": 3,
-  "verified": true
- },
- {
   "question_id": 31,
   "db_id": "california_schools",
   "question": "What is the eligible free rate of the 10th and 11th schools with the highest enrolment for students in grades 1 through 12?",
@@ -1909,7 +1898,7 @@
   "evidence": "Russian refers to language = 'Russian'; contains the most cards overall refers to MAX(baseSetSize)",
   "SQL": "SELECT T1.id FROM sets AS T1 INNER JOIN set_translations AS T2 ON T1.code = T2.setCode WHERE T2.language = 'Russian' GROUP BY T1.baseSetSize ORDER BY T1.baseSetSize DESC LIMIT 1",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT T1.id FROM sets AS T1 INNER JOIN set_translations AS T2 ON T1.code = T2.setCode WHERE T2.language = 'Russian' GROUP BY T1.baseSetSize ORDER BY T1.baseSetSize DESC LIMIT 1",
+  "SQL_duckdb": "SELECT ANY_VALUE(T1.id) FROM sets AS T1 INNER JOIN set_translations AS T2 ON T1.code = T2.setCode WHERE T2.language = 'Russian' GROUP BY T1.baseSetSize ORDER BY T1.baseSetSize DESC LIMIT 1",
   "tier": 0,
   "verified": true
  },
@@ -2063,7 +2052,7 @@
   "evidence": "set of Abyssal Horror refers to name = 'Abyssal Horror'; percentage refers to DIVIDE(COUNT(convertedManaCost = 16),COUNT(convertedManaCost))*100",
   "SQL": "SELECT CAST(SUM(CASE WHEN T1.convertedManaCost = 10 THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(T1.id), T1.name FROM cards AS T1 INNER JOIN sets AS T2 ON T2.code = T1.setCode WHERE T1.name = 'Abyssal Horror'",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT CAST(SUM(CASE WHEN T1.convertedManaCost = 10 THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(T1.id), T1.name FROM cards AS T1 INNER JOIN sets AS T2 ON T2.code = T1.setCode WHERE T1.name = 'Abyssal Horror'",
+  "SQL_duckdb": "SELECT CAST(SUM(CASE WHEN T1.convertedManaCost = 10 THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(T1.id), ANY_VALUE(T1.name) FROM cards AS T1 INNER JOIN sets AS T2 ON T2.code = T1.setCode WHERE T1.name = 'Abyssal Horror'",
   "tier": 0,
   "verified": true
  },
@@ -2805,6 +2794,17 @@
   "verified": true
  },
  {
+  "question_id": 514,
+  "db_id": "card_games",
+  "question": "In duels, what are the top 10 cards with the highest uncoverted mana cost?",
+  "evidence": "duels refer to format = 'duel'; the highest uncoverted mana cost refers to MAX(manaCost)",
+  "SQL": "SELECT DISTINCT name FROM cards WHERE uuid IN ( SELECT uuid FROM legalities WHERE format = 'duel' ) ORDER BY manaCost DESC LIMIT 0, 10",
+  "difficulty": "simple",
+  "SQL_duckdb": "SELECT DISTINCT name FROM cards WHERE uuid IN ( SELECT uuid FROM legalities WHERE format = 'duel' ) ORDER BY manaCost DESC LIMIT 10 OFFSET 0",
+  "tier": 1,
+  "verified": true
+ },
+ {
   "question_id": 515,
   "db_id": "card_games",
   "question": "When was the oldest mythic card released and what are its legal play formats?",
@@ -2866,7 +2866,7 @@
   "evidence": "format of the cards refers to format; illustrator refers to artist; the least amount of cards refers to MIN(artist)",
   "SQL": "SELECT T1.artist, T2.format FROM cards AS T1 INNER JOIN legalities AS T2 ON T2.uuid = T1.uuid GROUP BY T1.artist ORDER BY COUNT(T1.id) ASC LIMIT 1",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT T1.artist, T2.format FROM cards AS T1 INNER JOIN legalities AS T2 ON T2.uuid = T1.uuid GROUP BY T1.artist ORDER BY COUNT(T1.id) ASC LIMIT 1",
+  "SQL_duckdb": "SELECT T1.artist, ANY_VALUE(T2.format) FROM cards AS T1 INNER JOIN legalities AS T2 ON T2.uuid = T1.uuid GROUP BY T1.artist ORDER BY COUNT(T1.id) ASC LIMIT 1",
   "tier": 0,
   "verified": true
  },
@@ -2899,7 +2899,7 @@
   "evidence": "AVG(id); releaseDate BETWEEN 1/1/2012 AND 12/31/2015; the common language refers to MAX(COUNT(language))",
   "SQL": "SELECT (CAST(SUM(T1.id) AS REAL) / COUNT(T1.id)) / 4, T2.language FROM sets AS T1 INNER JOIN set_translations AS T2 ON T1.id = T2.id WHERE T1.releaseDate BETWEEN '2012-01-01' AND '2015-12-31' GROUP BY T1.releaseDate ORDER BY COUNT(T2.language) DESC LIMIT 1",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT (CAST(SUM(T1.id) AS REAL) / COUNT(T1.id)) / 4, T2.language FROM sets AS T1 INNER JOIN set_translations AS T2 ON T1.id = T2.id WHERE T1.releaseDate BETWEEN '2012-01-01' AND '2015-12-31' GROUP BY T1.releaseDate ORDER BY COUNT(T2.language) DESC LIMIT 1",
+  "SQL_duckdb": "SELECT (CAST(SUM(T1.id) AS REAL) / COUNT(T1.id)) / 4, ANY_VALUE(T2.language) FROM sets AS T1 INNER JOIN set_translations AS T2 ON T1.id = T2.id WHERE T1.releaseDate BETWEEN '2012-01-01' AND '2015-12-31' GROUP BY T1.releaseDate ORDER BY COUNT(T2.language) DESC LIMIT 1",
   "tier": 0,
   "verified": true
  },
@@ -4736,7 +4736,7 @@
   "evidence": "the latest created user account refers to MAX(CreationDate);",
   "SQL": "SELECT COUNT(T2.Id) FROM users AS T1 INNER JOIN posts AS T2 ON T1.Id = T2.OwnerUserId INNER JOIN comments AS T3 ON T3.PostId = T2.Id ORDER BY T1.CreationDate DESC LIMIT 1",
   "difficulty": "simple",
-  "SQL_duckdb": "SELECT COUNT(T2.Id) FROM users AS T1 INNER JOIN posts AS T2 ON T1.Id = T2.OwnerUserId INNER JOIN comments AS T3 ON T3.PostId = T2.Id ORDER BY T1.CreationDate DESC LIMIT 1",
+  "SQL_duckdb": "SELECT COUNT(T2.Id) FROM users AS T1 INNER JOIN posts AS T2 ON T1.Id = T2.OwnerUserId INNER JOIN comments AS T3 ON T3.PostId = T2.Id ORDER BY ANY_VALUE(T1.CreationDate) DESC LIMIT 1",
   "tier": 0,
   "verified": true
  },
@@ -5759,7 +5759,7 @@
   "evidence": "Final result should return the Team.team_long_name; Scotland Premier League refers to League.name = 'Scotland Premier League'; away team refers to away_team_api_id; away team that won the most refers to MAX(SUBTRACT(away_team_goal, home_team_goal) > 0); 2010 season refers to season = '2009/2010'; won the most refers to MAX(COUNT(*));",
   "SQL": "SELECT teamInfo.team_long_name FROM League AS leagueData INNER JOIN Match AS matchData ON leagueData.id = matchData.league_id INNER JOIN Team AS teamInfo ON matchData.away_team_api_id = teamInfo.team_api_id WHERE leagueData.name = 'Scotland Premier League' AND matchData.season = '2009/2010' AND matchData.away_team_goal - matchData.home_team_goal > 0 GROUP BY matchData.away_team_api_id ORDER BY COUNT(*) DESC LIMIT 1",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT teamInfo.team_long_name FROM League AS leagueData INNER JOIN Match AS matchData ON leagueData.id = matchData.league_id INNER JOIN Team AS teamInfo ON matchData.away_team_api_id = teamInfo.team_api_id WHERE leagueData.name = 'Scotland Premier League' AND matchData.season = '2009/2010' AND matchData.away_team_goal - matchData.home_team_goal > 0 GROUP BY matchData.away_team_api_id ORDER BY COUNT(*) DESC LIMIT 1",
+  "SQL_duckdb": "SELECT ANY_VALUE(teamInfo.team_long_name) FROM League AS leagueData INNER JOIN Match AS matchData ON leagueData.id = matchData.league_id INNER JOIN Team AS teamInfo ON matchData.away_team_api_id = teamInfo.team_api_id WHERE leagueData.name = 'Scotland Premier League' AND matchData.season = '2009/2010' AND matchData.away_team_goal - matchData.home_team_goal > 0 GROUP BY matchData.away_team_api_id ORDER BY COUNT(*) DESC LIMIT 1",
   "tier": 1,
   "verified": true
  },
@@ -5869,7 +5869,7 @@
   "evidence": "heights are above 180 refers to Player.height > 180; average heading accuracy = DIVIDE(SUM(heading_accuracy), COUNT(player_fifa_api_id));",
   "SQL": "SELECT t1.player_name FROM Player AS t1 INNER JOIN Player_Attributes AS t2 ON t1.player_api_id = t2.player_api_id WHERE t1.height > 180 GROUP BY t1.id ORDER BY CAST(SUM(t2.heading_accuracy) AS REAL) / COUNT(t2.`player_fifa_api_id`) DESC LIMIT 10",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT t1.player_name FROM Player AS t1 INNER JOIN Player_Attributes AS t2 ON t1.player_api_id = t2.player_api_id WHERE t1.height > 180 GROUP BY t1.id ORDER BY CAST(SUM(t2.heading_accuracy) AS REAL) / COUNT(t2.\"player_fifa_api_id\") DESC LIMIT 10",
+  "SQL_duckdb": "SELECT ANY_VALUE(t1.player_name) FROM Player AS t1 INNER JOIN Player_Attributes AS t2 ON t1.player_api_id = t2.player_api_id WHERE t1.height > 180 GROUP BY t1.id ORDER BY CAST(SUM(t2.heading_accuracy) AS REAL) / COUNT(t2.\"player_fifa_api_id\") DESC LIMIT 10",
   "tier": 1,
   "verified": true
  },
@@ -6754,6 +6754,17 @@
   "verified": true
  },
  {
+  "question_id": 1123,
+  "db_id": "european_football_2",
+  "question": "What is the name of players with the highest potential?",
+  "evidence": "highest potential refers to MAX(potential)",
+  "SQL": "SELECT DISTINCT t1.player_name FROM Player AS t1 INNER JOIN Player_Attributes AS t2 ON t1.player_api_id = t2.player_api_id ORDER BY t2.potential DESC LIMIT 1",
+  "difficulty": "simple",
+  "SQL_duckdb": "SELECT DISTINCT t1.player_name FROM Player AS t1 INNER JOIN Player_Attributes AS t2 ON t1.player_api_id = t2.player_api_id ORDER BY t2.potential DESC LIMIT 1",
+  "tier": 1,
+  "verified": true
+ },
+ {
   "question_id": 1124,
   "db_id": "european_football_2",
   "question": "Who are the players that tend to be attacking when their mates were doing attack moves? List down their name.",
@@ -7167,8 +7178,8 @@
   "evidence": "",
   "SQL": "SELECT account_id FROM trans WHERE STRFTIME('%Y', date) = '1995' ORDER BY date ASC LIMIT 1",
   "difficulty": "simple",
-  "SQL_duckdb": "SELECT account_id FROM trans WHERE STRFTIME(CAST(date AS TIMESTAMP), '%Y') = '1995' ORDER BY date ASC LIMIT 1",
-  "tier": 1,
+  "SQL_duckdb": "SELECT account_id FROM trans WHERE STRFTIME('%Y', date) = '1995' ORDER BY date ASC LIMIT 1",
+  "tier": 0,
   "verified": true
  },
  {
@@ -7849,7 +7860,7 @@
   "evidence": "status = 'A' refers to loan contracts finished with no problems",
   "SQL": "SELECT T1.A2 FROM District AS T1 INNER JOIN Account AS T2 ON T1.District_id = T2.District_id INNER JOIN Loan AS T3 ON T2.Account_id = T3.Account_id WHERE T3.status = 'A' GROUP BY T1.District_id ORDER BY COUNT(T2.Account_id) DESC LIMIT 1",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT T1.A2 FROM District AS T1 INNER JOIN Account AS T2 ON T1.District_id = T2.District_id INNER JOIN Loan AS T3 ON T2.Account_id = T3.Account_id WHERE T3.status = 'A' GROUP BY T1.District_id ORDER BY COUNT(T2.Account_id) DESC LIMIT 1",
+  "SQL_duckdb": "SELECT ANY_VALUE(T1.A2) FROM District AS T1 INNER JOIN Account AS T2 ON T1.District_id = T2.District_id INNER JOIN Loan AS T3 ON T2.Account_id = T3.Account_id WHERE T3.status = 'A' GROUP BY T1.District_id ORDER BY COUNT(T2.Account_id) DESC LIMIT 1",
   "tier": 0,
   "verified": true
  },
@@ -8190,7 +8201,7 @@
   "evidence": "the credit card is high-level refers to card.type = 'gold'; eligible for loans refers to disp.type = 'OWNER'",
   "SQL": "SELECT T1.client_id, STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', T3.birth_date) FROM disp AS T1 INNER JOIN card AS T2 ON T2.disp_id = T1.disp_id INNER JOIN client AS T3 ON T1.client_id = T3.client_id WHERE T2.type = 'gold' AND T1.type = 'OWNER'",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT T1.client_id, STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(T3.birth_date AS TIMESTAMP), '%Y') FROM disp AS T1 INNER JOIN card AS T2 ON T2.disp_id = T1.disp_id INNER JOIN client AS T3 ON T1.client_id = T3.client_id WHERE T2.type = 'gold' AND T1.type = 'OWNER'",
+  "SQL_duckdb": "SELECT T1.client_id, (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T3.birth_date AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) FROM disp AS T1 INNER JOIN card AS T2 ON T2.disp_id = T1.disp_id INNER JOIN client AS T3 ON T1.client_id = T3.client_id WHERE T2.type = 'gold' AND T1.type = 'OWNER'",
   "tier": 1,
   "verified": true
  },
@@ -8762,7 +8773,7 @@
   "evidence": "date of birth refers to drivers.dob; The larger the birthday value, the younger the person is, and vice versa; Japanese refers to nationality = 'Japanese'; age = YEAR(CURRENT_TIMESTAMP) - YEAR(dob);",
   "SQL": "SELECT STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', dob), forename , surname FROM drivers WHERE nationality = 'Japanese' ORDER BY dob DESC LIMIT 1",
   "difficulty": "simple",
-  "SQL_duckdb": "SELECT STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(dob AS TIMESTAMP), '%Y'), forename , surname FROM drivers WHERE nationality = 'Japanese' ORDER BY dob DESC LIMIT 1",
+  "SQL_duckdb": "SELECT (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(dob AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)), forename , surname FROM drivers WHERE nationality = 'Japanese' ORDER BY dob DESC LIMIT 1",
   "tier": 1,
   "verified": true
  },
@@ -8863,6 +8874,17 @@
   "difficulty": "simple",
   "SQL_duckdb": "SELECT DISTINCT T2.name, T1.country FROM circuits AS T1 INNER JOIN races AS T2 ON T2.circuitID = T1.circuitId WHERE T2.year = 2017 ORDER BY T2.date ASC",
   "tier": 0,
+  "verified": true
+ },
+ {
+  "question_id": 908,
+  "db_id": "formula_1",
+  "question": "What is the most laps f1 races had? Name the race, year and circuit location where the races with most laps was hosted.",
+  "evidence": "",
+  "SQL": "SELECT T3.lap, T2.name, T2.year, T1.location FROM circuits AS T1 INNER JOIN races AS T2 ON T1.circuitId = T2.circuitId INNER JOIN lapTimes AS T3 ON T3.raceId = T2.raceId ORDER BY T3.lap DESC LIMIT 1",
+  "difficulty": "simple",
+  "SQL_duckdb": "SELECT T3.lap, T2.name, T2.year, T1.location FROM circuits AS T1 INNER JOIN races AS T2 ON T1.circuitId = T2.circuitId INNER JOIN lapTimes AS T3 ON T3.raceId = T2.raceId ORDER BY T3.lap DESC LIMIT 1",
+  "tier": 3,
   "verified": true
  },
  {
@@ -9785,7 +9807,7 @@
   "evidence": "Monaco Grand Priz refers to the race; race in year between 1980 and 2010",
   "SQL": "SELECT SUM(T1.points), T2.name, T2.nationality FROM constructorResults AS T1 INNER JOIN constructors AS T2 ON T1.constructorId = T2.constructorId INNER JOIN races AS T3 ON T3.raceid = T1.raceid WHERE T3.name = 'Monaco Grand Prix' AND T3.year BETWEEN 1980 AND 2010 GROUP BY T2.name ORDER BY SUM(T1.points) DESC LIMIT 1",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT SUM(T1.points), T2.name, T2.nationality FROM constructorResults AS T1 INNER JOIN constructors AS T2 ON T1.constructorId = T2.constructorId INNER JOIN races AS T3 ON T3.raceid = T1.raceid WHERE T3.name = 'Monaco Grand Prix' AND T3.year BETWEEN 1980 AND 2010 GROUP BY T2.name ORDER BY SUM(T1.points) DESC LIMIT 1",
+  "SQL_duckdb": "SELECT SUM(T1.points), T2.name, ANY_VALUE(T2.nationality) FROM constructorResults AS T1 INNER JOIN constructors AS T2 ON T1.constructorId = T2.constructorId INNER JOIN races AS T3 ON T3.raceid = T1.raceid WHERE T3.name = 'Monaco Grand Prix' AND T3.year BETWEEN 1980 AND 2010 GROUP BY T2.name ORDER BY SUM(T1.points) DESC LIMIT 1",
   "tier": 0,
   "verified": true
  },
@@ -9895,7 +9917,7 @@
   "evidence": "oldest racer refers to MIN(dob); full name refers to forename, surname.",
   "SQL": "SELECT SUM(T1.wins),T2.forename, T2.surname FROM driverStandings AS T1 INNER JOIN drivers AS T2 on T1.driverId = T2.driverId ORDER BY T2.dob ASC LIMIT 1",
   "difficulty": "simple",
-  "SQL_duckdb": "SELECT SUM(T1.wins),T2.forename, T2.surname FROM driverStandings AS T1 INNER JOIN drivers AS T2 on T1.driverId = T2.driverId ORDER BY T2.dob ASC LIMIT 1",
+  "SQL_duckdb": "SELECT SUM(T1.wins),ANY_VALUE(T2.forename), ANY_VALUE(T2.surname) FROM driverStandings AS T1 INNER JOIN drivers AS T2 on T1.driverId = T2.driverId ORDER BY ANY_VALUE(T2.dob) ASC LIMIT 1",
   "tier": 0,
   "verified": true
  },
@@ -10148,7 +10170,7 @@
   "evidence": "meetings events refers to type = 'Meeting'; attended by more than 10 members refers to COUNT(event_id) > 10",
   "SQL": "SELECT T1.event_name FROM event AS T1  INNER JOIN attendance AS T2 ON T1.event_id = T2.link_to_event GROUP BY T1.event_id  HAVING COUNT(T2.link_to_event) > 10 EXCEPT SELECT T1.event_name  FROM event AS T1  WHERE T1.type = 'Meeting'",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT T1.event_name FROM event AS T1  INNER JOIN attendance AS T2 ON T1.event_id = T2.link_to_event GROUP BY T1.event_id  HAVING COUNT(T2.link_to_event) > 10 EXCEPT SELECT T1.event_name  FROM event AS T1  WHERE T1.type = 'Meeting'",
+  "SQL_duckdb": "SELECT ANY_VALUE(T1.event_name) FROM event AS T1  INNER JOIN attendance AS T2 ON T1.event_id = T2.link_to_event GROUP BY T1.event_id  HAVING COUNT(T2.link_to_event) > 10 EXCEPT SELECT T1.event_name  FROM event AS T1  WHERE T1.type = 'Meeting'",
   "tier": 0,
   "verified": true
  },
@@ -10159,7 +10181,7 @@
   "evidence": "name of events refers to event_name; attendance of over 20 students COUNT(event_id) > 20.",
   "SQL": "SELECT T1.event_name FROM event AS T1 INNER JOIN attendance AS T2 ON T1.event_id = T2.link_to_event GROUP BY T1.event_id HAVING COUNT(T2.link_to_event) > 20 EXCEPT SELECT T1.event_name FROM event AS T1  WHERE T1.type = 'Fundraiser'",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT T1.event_name FROM event AS T1 INNER JOIN attendance AS T2 ON T1.event_id = T2.link_to_event GROUP BY T1.event_id HAVING COUNT(T2.link_to_event) > 20 EXCEPT SELECT T1.event_name FROM event AS T1  WHERE T1.type = 'Fundraiser'",
+  "SQL_duckdb": "SELECT ANY_VALUE(T1.event_name) FROM event AS T1 INNER JOIN attendance AS T2 ON T1.event_id = T2.link_to_event GROUP BY T1.event_id HAVING COUNT(T2.link_to_event) > 20 EXCEPT SELECT T1.event_name FROM event AS T1  WHERE T1.type = 'Fundraiser'",
   "tier": 0,
   "verified": true
  },
@@ -10632,7 +10654,7 @@
   "evidence": "college most members go refers to MAX(COUNT(major.college))",
   "SQL": "SELECT T2.college FROM member AS T1 INNER JOIN major AS T2 ON T1.link_to_major = T2.major_id GROUP BY T2.major_id ORDER BY COUNT(T2.college) DESC LIMIT 1",
   "difficulty": "simple",
-  "SQL_duckdb": "SELECT T2.college FROM member AS T1 INNER JOIN major AS T2 ON T1.link_to_major = T2.major_id GROUP BY T2.major_id ORDER BY COUNT(T2.college) DESC LIMIT 1",
+  "SQL_duckdb": "SELECT ANY_VALUE(T2.college) FROM member AS T1 INNER JOIN major AS T2 ON T1.link_to_major = T2.major_id GROUP BY T2.major_id ORDER BY COUNT(T2.college) DESC LIMIT 1",
   "tier": 0,
   "verified": true
  },
@@ -10786,7 +10808,7 @@
   "evidence": "name of students means the full name; full name refers to first_name, last_name; attended more than 7 events refers to COUNT(link_to_event) > 7",
   "SQL": "SELECT T1.first_name, T1.last_name FROM member AS T1 INNER JOIN attendance AS T2 ON T1.member_id = T2.link_to_member GROUP BY T2.link_to_member HAVING COUNT(T2.link_to_event) > 7",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT T1.first_name, T1.last_name FROM member AS T1 INNER JOIN attendance AS T2 ON T1.member_id = T2.link_to_member GROUP BY T2.link_to_member HAVING COUNT(T2.link_to_event) > 7",
+  "SQL_duckdb": "SELECT ANY_VALUE(T1.first_name), ANY_VALUE(T1.last_name) FROM member AS T1 INNER JOIN attendance AS T2 ON T1.member_id = T2.link_to_member GROUP BY T2.link_to_member HAVING COUNT(T2.link_to_event) > 7",
   "tier": 0,
   "verified": true
  },
@@ -10854,6 +10876,17 @@
   "difficulty": "moderate",
   "SQL_duckdb": "SELECT T4.first_name, T4.last_name FROM event AS T1 INNER JOIN budget AS T2 ON T1.event_id = T2.link_to_event INNER JOIN expense AS T3 ON T2.budget_id = T3.link_to_budget INNER JOIN member AS T4 ON T3.link_to_member = T4.member_id WHERE T1.event_name = 'Yearly Kickoff'",
   "tier": 0,
+  "verified": true
+ },
+ {
+  "question_id": 1388,
+  "db_id": "student_club",
+  "question": "Which students manage to generate the highest income. State his/her full name along with the income source.",
+  "evidence": "name of students means the full name; full name refers to first_name, last_name; generate the highest income refers to MAX(income.amount);",
+  "SQL": "SELECT T1.first_name, T1.last_name, T2.source FROM member AS T1 INNER JOIN income AS T2 ON T1.member_id = T2.link_to_member GROUP BY T1.first_name, T1.last_name, T2.source ORDER BY SUM(T2.amount) DESC LIMIT 1",
+  "difficulty": "moderate",
+  "SQL_duckdb": "SELECT T1.first_name, T1.last_name, T2.source FROM member AS T1 INNER JOIN income AS T2 ON T1.member_id = T2.link_to_member GROUP BY T1.first_name, T1.last_name, T2.source ORDER BY SUM(T2.amount) DESC LIMIT 1",
+  "tier": 3,
   "verified": true
  },
  {
@@ -10929,7 +10962,7 @@
   "evidence": "major refers to major_name;",
   "SQL": "SELECT COUNT(T3.link_to_event), T1.major_name FROM major AS T1 INNER JOIN member AS T2 ON T1.major_id = T2.link_to_major INNER JOIN attendance AS T3 ON T2.member_id = T3.link_to_member WHERE T2.first_name = 'Luisa' AND T2.last_name = 'Guidi'",
   "difficulty": "simple",
-  "SQL_duckdb": "SELECT COUNT(T3.link_to_event), T1.major_name FROM major AS T1 INNER JOIN member AS T2 ON T1.major_id = T2.link_to_major INNER JOIN attendance AS T3 ON T2.member_id = T3.link_to_member WHERE T2.first_name = 'Luisa' AND T2.last_name = 'Guidi'",
+  "SQL_duckdb": "SELECT COUNT(T3.link_to_event), ANY_VALUE(T1.major_name) FROM major AS T1 INNER JOIN member AS T2 ON T1.major_id = T2.link_to_major INNER JOIN attendance AS T3 ON T2.member_id = T3.link_to_member WHERE T2.first_name = 'Luisa' AND T2.last_name = 'Guidi'",
   "tier": 0,
   "verified": true
  },
@@ -11017,7 +11050,7 @@
   "evidence": "total value refers to SUM(cost); 'October Meeting' is an event name;",
   "SQL": "SELECT T1.type, SUM(T3.cost) FROM event AS T1 INNER JOIN budget AS T2 ON T1.event_id = T2.link_to_event INNER JOIN expense AS T3 ON T2.budget_id = T3.link_to_budget WHERE T1.event_name = 'October Meeting'",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT T1.type, SUM(T3.cost) FROM event AS T1 INNER JOIN budget AS T2 ON T1.event_id = T2.link_to_event INNER JOIN expense AS T3 ON T2.budget_id = T3.link_to_budget WHERE T1.event_name = 'October Meeting'",
+  "SQL_duckdb": "SELECT ANY_VALUE(T1.type), SUM(T3.cost) FROM event AS T1 INNER JOIN budget AS T2 ON T1.event_id = T2.link_to_event INNER JOIN expense AS T3 ON T2.budget_id = T3.link_to_budget WHERE T1.event_name = 'October Meeting'",
   "tier": 0,
   "verified": true
  },
@@ -11072,7 +11105,7 @@
   "evidence": "full name refers to first_name, last name",
   "SQL": "SELECT T1.first_name, T1.last_name, SUM(T2.cost) FROM member AS T1 INNER JOIN expense AS T2 ON T1.member_id = T2.link_to_member WHERE T1.member_id = 'rec4BLdZHS2Blfp4v'",
   "difficulty": "simple",
-  "SQL_duckdb": "SELECT T1.first_name, T1.last_name, SUM(T2.cost) FROM member AS T1 INNER JOIN expense AS T2 ON T1.member_id = T2.link_to_member WHERE T1.member_id = 'rec4BLdZHS2Blfp4v'",
+  "SQL_duckdb": "SELECT ANY_VALUE(T1.first_name), ANY_VALUE(T1.last_name), SUM(T2.cost) FROM member AS T1 INNER JOIN expense AS T2 ON T1.member_id = T2.link_to_member WHERE T1.member_id = 'rec4BLdZHS2Blfp4v'",
   "tier": 0,
   "verified": true
  },
@@ -13228,7 +13261,7 @@
   "evidence": "age refers to SUBTRACT(year(current_timestamp), year(Birthday)); positive degree of coagulation refers to RVVT = '+';",
   "SQL": "SELECT DISTINCT T1.ID, STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', T1.Birthday) FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE T2.RVVT = '+'",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT DISTINCT T1.ID, STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE T2.RVVT = '+'",
+  "SQL_duckdb": "SELECT DISTINCT T1.ID, (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE T2.RVVT = '+'",
   "tier": 1,
   "verified": true
  },
@@ -13283,7 +13316,7 @@
   "evidence": "in-patient refers to Admission = '+'; age 50 and above refers to SUBTRACT(year(current_timestamp), year(Birthday)) >= '50'; average anti-cardiolipin antibody (IgG) concentration refers to AVG(aCL IgG)",
   "SQL": "SELECT AVG(T2.`aCL IgG`) FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', T1.Birthday) >= 50 AND T1.Admission = '+'",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT AVG(T2.\"aCL IgG\") FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') >= 50 AND T1.Admission = '+'",
+  "SQL_duckdb": "SELECT AVG(T2.\"aCL IgG\") FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) >= 50 AND T1.Admission = '+'",
   "tier": 1,
   "verified": true
  },
@@ -13316,7 +13349,7 @@
   "evidence": "age gap refers to SUBTRACT(MAX(year(Birthday)) - MIN(year(Birthday))); normal triglyceride refers to tg > = 200",
   "SQL": "SELECT STRFTIME('%Y', MAX(T1.Birthday)) - STRFTIME('%Y', MIN(T1.Birthday)) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.TG >= 200",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT STRFTIME('%Y', MAX(T1.Birthday)) - STRFTIME('%Y', MIN(T1.Birthday)) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.TG >= 200",
+  "SQL_duckdb": "SELECT (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME('%Y', MAX(T1.Birthday)) AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME('%Y', MIN(T1.Birthday)) AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.TG >= 200",
   "tier": 0,
   "verified": true
  },
@@ -13349,7 +13382,7 @@
   "evidence": "The larger the birthday value, the younger the person is, and vice versa; 'SJS' refers to diagnosis; (SUBTRACT(year(`First Date`)), year(Birthday)); age of the patients when they initially arrived at the hospital refers to year(Birthday)",
   "SQL": "SELECT T1.Date, STRFTIME('%Y', T2.`First Date`) - STRFTIME('%Y', T2.Birthday),T2.Birthday FROM Laboratory AS T1 INNER JOIN Patient AS T2 ON T1.ID = T2.ID WHERE T2.Diagnosis = 'SJS' AND T2.Birthday IS NOT NULL ORDER BY T2.Birthday ASC LIMIT 1",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT T1.Date, STRFTIME(CAST(T2.\"First Date\" AS TIMESTAMP), '%Y') - STRFTIME(CAST(T2.Birthday AS TIMESTAMP), '%Y'),T2.Birthday FROM Laboratory AS T1 INNER JOIN Patient AS T2 ON T1.ID = T2.ID WHERE T2.Diagnosis = 'SJS' AND T2.Birthday IS NOT NULL ORDER BY T2.Birthday ASC LIMIT 1",
+  "SQL_duckdb": "SELECT T1.Date, (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T2.\"First Date\" AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T2.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)),T2.Birthday FROM Laboratory AS T1 INNER JOIN Patient AS T2 ON T1.ID = T2.ID WHERE T2.Diagnosis = 'SJS' AND T2.Birthday IS NOT NULL ORDER BY T2.Birthday ASC LIMIT 1",
   "tier": 1,
   "verified": true
  },
@@ -13371,7 +13404,7 @@
   "evidence": "underage patients refers to year(Birthday) < 18; three-year period from 1990 to 1993 refers to year(`Examination Date`) between '1990' and '1993'",
   "SQL": "SELECT COUNT(T1.ID) FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE STRFTIME('%Y', T2.`Examination Date`) BETWEEN '1990' AND '1993' AND STRFTIME('%Y', T2.`Examination Date`) - STRFTIME('%Y', T1.Birthday) < 18",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT COUNT(T1.ID) FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE STRFTIME(CAST(T2.\"Examination Date\" AS TIMESTAMP), '%Y') BETWEEN '1990' AND '1993' AND STRFTIME(CAST(T2.\"Examination Date\" AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') < 18",
+  "SQL_duckdb": "SELECT COUNT(T1.ID) FROM Patient AS T1 INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE STRFTIME(CAST(T2.\"Examination Date\" AS TIMESTAMP), '%Y') BETWEEN '1990' AND '1993' AND (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T2.\"Examination Date\" AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) < 18",
   "tier": 1,
   "verified": true
  },
@@ -13404,7 +13437,7 @@
   "evidence": "average age of patients as of year 1999 refers to AVG(SUBTRACT('1999', year(Birthday))); October of 1991 refers to Date BETWEEN '1991-10-01' AND '1991-10-30'",
   "SQL": "SELECT AVG('1999'  - STRFTIME('%Y', T2.Birthday)) FROM Laboratory AS T1 INNER JOIN Patient AS T2 ON T1.ID = T2.ID WHERE T1.Date BETWEEN '1991-10-01' AND '1991-10-30'",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT AVG('1999'  - STRFTIME('%Y', T2.Birthday)) FROM Laboratory AS T1 INNER JOIN Patient AS T2 ON T1.ID = T2.ID WHERE T1.Date BETWEEN '1991-10-01' AND '1991-10-30'",
+  "SQL_duckdb": "SELECT AVG((COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST('1999' AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME('%Y', T2.Birthday) AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0))) FROM Laboratory AS T1 INNER JOIN Patient AS T2 ON T1.ID = T2.ID WHERE T1.Date BETWEEN '1991-10-01' AND '1991-10-30'",
   "tier": 0,
   "verified": true
  },
@@ -13415,7 +13448,7 @@
   "evidence": "How old the patient refers to SUBTRACT(year(`Examination Date`), year(Birthday)); the highest hemoglobin count refers to MAX(HGB)",
   "SQL": "SELECT STRFTIME('%Y', T2.Date) - STRFTIME('%Y', T1.Birthday), T1.Diagnosis FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID ORDER BY T2.HGB DESC LIMIT 1",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT STRFTIME('%Y', T2.Date) - STRFTIME('%Y', T1.Birthday), T1.Diagnosis FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID ORDER BY T2.HGB DESC LIMIT 1",
+  "SQL_duckdb": "SELECT (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME('%Y', T2.Date) AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME('%Y', T1.Birthday) AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)), T1.Diagnosis FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID ORDER BY T2.HGB DESC LIMIT 1",
   "tier": 0,
   "verified": true
  },
@@ -13481,7 +13514,7 @@
   "evidence": "how old at that time refers to SUBTRACT(year(test date), year(Birthday)); uric acid level as 8.4 refers to UA = '8.4'; 1991/10/21 refers to Date = '1991-10-21'",
   "SQL": "SELECT STRFTIME('%Y', T2.Date) - STRFTIME('%Y', T1.Birthday) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.UA = 8.4 AND T2.Date = '1991-10-21'",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT STRFTIME('%Y', T2.Date) - STRFTIME('%Y', T1.Birthday) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.UA = 8.4 AND T2.Date = '1991-10-21'",
+  "SQL_duckdb": "SELECT (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME('%Y', T2.Date) AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME('%Y', T1.Birthday) AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.UA = 8.4 AND T2.Date = '1991-10-21'",
   "tier": 0,
   "verified": true
  },
@@ -13723,7 +13756,7 @@
   "evidence": "DATEDIFF(`Examination Date`, `First Date`)",
   "SQL": "SELECT STRFTIME('%d', T3.`Examination Date`) - STRFTIME('%d', T1.`First Date`) FROM Patient AS T1 INNER JOIN Examination AS T3 ON T1.ID = T3.ID WHERE T1.ID = 821298",
   "difficulty": "simple",
-  "SQL_duckdb": "SELECT STRFTIME(CAST(T3.\"Examination Date\" AS TIMESTAMP), '%d') - STRFTIME(CAST(T1.\"First Date\" AS TIMESTAMP), '%d') FROM Patient AS T1 INNER JOIN Examination AS T3 ON T1.ID = T3.ID WHERE T1.ID = 821298",
+  "SQL_duckdb": "SELECT (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T3.\"Examination Date\" AS TIMESTAMP), '%d') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.\"First Date\" AS TIMESTAMP), '%d') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) FROM Patient AS T1 INNER JOIN Examination AS T3 ON T1.ID = T3.ID WHERE T1.ID = 821298",
   "tier": 1,
   "verified": true
  },
@@ -13800,7 +13833,7 @@
   "evidence": "age refers to SUBTRACT(year(current_timestamp), year(Birthday)); lactate dehydrogenase (LDH) between 100-300 index above the normal range refers to LDH between 600 and 800;",
   "SQL": "SELECT DISTINCT T1.ID, STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', T1.Birthday) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.LDH > 600 AND T2.LDH < 800",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT DISTINCT T1.ID, STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.LDH > 600 AND T2.LDH < 800",
+  "SQL_duckdb": "SELECT DISTINCT T1.ID, (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.LDH > 600 AND T2.LDH < 800",
   "tier": 1,
   "verified": true
  },
@@ -13976,7 +14009,7 @@
   "evidence": "average age = DIVIDE(SUM(SUBTRACT(YEAR(NOW()), YEAR(birthday))), COUNT(ID)); male patient refers to sex = 'M'; high cholesterol refers to `T-CHO` > = 250;",
   "SQL": "SELECT AVG(STRFTIME('%Y', date('NOW')) - STRFTIME('%Y', T1.Birthday)) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.`T-CHO` >= 250 AND T1.SEX = 'M'",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT AVG(STRFTIME(CAST(CURRENT_DATE AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y')) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.\"T-CHO\" >= 250 AND T1.SEX = 'M'",
+  "SQL_duckdb": "SELECT AVG((COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_DATE AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0))) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.\"T-CHO\" >= 250 AND T1.SEX = 'M'",
   "tier": 1,
   "verified": true
  },
@@ -13998,7 +14031,7 @@
   "evidence": "triglyceride (TG) level beyond the normal range refers to TG > = 200; more than 50 years of age = SUBTRACT(year(current_timestamp), year(Birthday)) > 50; Should consider DISTINCT in the final result;",
   "SQL": "SELECT COUNT(DISTINCT T1.ID) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.TG >= 200 AND STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', T1.Birthday) > 50",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT COUNT(DISTINCT T1.ID) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.TG >= 200 AND STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') > 50",
+  "SQL_duckdb": "SELECT COUNT(DISTINCT T1.ID) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.TG >= 200 AND (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) > 50",
   "tier": 1,
   "verified": true
  },
@@ -14031,7 +14064,7 @@
   "evidence": "age = SUBTRACT(year(current_timestamp), year(Birthday)); blood glucose (GLU) not within normal range refers to GLU > = 180; total cholesterol(T-CHO) within normal range refers to `T-CHO` < 250; ",
   "SQL": "SELECT DISTINCT T1.ID, T1.SEX , STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', T1.Birthday) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.GLU >= 180 AND T2.`T-CHO` < 250",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT DISTINCT T1.ID, T1.SEX , STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.GLU >= 180 AND T2.\"T-CHO\" < 250",
+  "SQL_duckdb": "SELECT DISTINCT T1.ID, T1.SEX , (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.GLU >= 180 AND T2.\"T-CHO\" < 250",
   "tier": 1,
   "verified": true
  },
@@ -14053,7 +14086,7 @@
   "evidence": "patient's diagnosis refers to Diagnosis; lower red blood cell refers to RBC < 3.5; age = SUBTRACT(year(current_timestamp), year(Birthday)); ",
   "SQL": "SELECT DISTINCT T1.Diagnosis, T1.ID , STRFTIME('%Y', CURRENT_TIMESTAMP) -STRFTIME('%Y', T1.Birthday) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.RBC < 3.5",
   "difficulty": "moderate",
-  "SQL_duckdb": "SELECT DISTINCT T1.Diagnosis, T1.ID , STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') -STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.RBC < 3.5",
+  "SQL_duckdb": "SELECT DISTINCT T1.Diagnosis, T1.ID , (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.RBC < 3.5",
   "tier": 1,
   "verified": true
  },
@@ -14064,7 +14097,7 @@
   "evidence": "female patient refers to Sex = 'F'; age 50 and above = SUBTRACT(year(current_timestamp), year(Birthday)) > = 50; abnormal red blood cell count refers to RBC < = 3.5 or RBC > = 6.0; Admission = '+' means the patient was admitted to the hospital; Admission = '-' means the patient was not admitted to the hospital;",
   "SQL": "SELECT DISTINCT T1.ID, T1.Admission FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T1.SEX = 'F' AND (T2.RBC <= 3.5 OR T2.RBC >= 6.0) AND STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', T1.Birthday) >= 50",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT DISTINCT T1.ID, T1.Admission FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T1.SEX = 'F' AND (T2.RBC <= 3.5 OR T2.RBC >= 6.0) AND STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') >= 50",
+  "SQL_duckdb": "SELECT DISTINCT T1.ID, T1.Admission FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T1.SEX = 'F' AND (T2.RBC <= 3.5 OR T2.RBC >= 6.0) AND (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) >= 50",
   "tier": 1,
   "verified": true
  },
@@ -14097,7 +14130,7 @@
   "evidence": "age = SUBTRACT(year(current_timestamp), year(Birthday)); patient with two or more laboratory examinations refers to COUNT(ID) > 2; hematoclit level exceeded the normal range refers to HCT > = 52;",
   "SQL": "SELECT DISTINCT T1.ID, STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', T1.Birthday) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T1.ID IN ( SELECT ID FROM Laboratory WHERE HCT >= 52 GROUP BY ID HAVING COUNT(ID) >= 2 )",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT DISTINCT T1.ID, STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T1.ID IN ( SELECT ID FROM Laboratory WHERE HCT >= 52 GROUP BY ID HAVING COUNT(ID) >= 2 )",
+  "SQL_duckdb": "SELECT DISTINCT T1.ID, (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T1.ID IN ( SELECT ID FROM Laboratory WHERE HCT >= 52 GROUP BY ID HAVING COUNT(ID) >= 2 )",
   "tier": 1,
   "verified": true
  },
@@ -14130,7 +14163,7 @@
   "evidence": "laboratory examinations take in 1984 refers to YEAR(Date) = '1984'; below 50 years old = SUBTRACT(year(current_timestamp), year(Birthday)) < 50; normal platelet level refers to PLT between 100 and 400; ",
   "SQL": "SELECT DISTINCT T1.ID FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.PLT BETWEEN 100 AND 400 AND STRFTIME('%Y', T2.Date) - STRFTIME('%Y', T1.Birthday) < 50 AND STRFTIME('%Y', T2.Date) = '1984'",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT DISTINCT T1.ID FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.PLT BETWEEN 100 AND 400 AND STRFTIME('%Y', T2.Date) - STRFTIME('%Y', T1.Birthday) < 50 AND STRFTIME('%Y', T2.Date) = '1984'",
+  "SQL_duckdb": "SELECT DISTINCT T1.ID FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.PLT BETWEEN 100 AND 400 AND (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME('%Y', T2.Date) AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME('%Y', T1.Birthday) AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) < 50 AND STRFTIME('%Y', T2.Date) = '1984'",
   "tier": 0,
   "verified": true
  },
@@ -14141,7 +14174,7 @@
   "evidence": "older than 55 years old = SUBTRACT(year(current_timestamp), year(Birthday)) > 55; abnormal prothrombin time (PT) refers to PT > = 14; percentage = DIVIDE(SUM(PT > = 14 AND SEX = 'F'), SUM(PT > = 14)) * 100; female refers to sex = 'F'; ",
   "SQL": "SELECT CAST(SUM(CASE WHEN T2.PT >= 14 AND T1.SEX = 'F' THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(*) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', T1.Birthday) > 55",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT CAST(SUM(CASE WHEN T2.PT >= 14 AND T1.SEX = 'F' THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(*) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') > 55",
+  "SQL_duckdb": "SELECT CAST(SUM(CASE WHEN T2.PT >= 14 AND T1.SEX = 'F' THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(*) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) > 55",
   "tier": 1,
   "verified": true
  },
@@ -14273,7 +14306,7 @@
   "evidence": "creatinine level is abnormal refers to CRE >= 1.5; aren't 70 yet refers to SUBTRACT((YEAR(CURDATE()), YEAR(Birthday))) < 70; ",
   "SQL": "SELECT COUNT(DISTINCT T1.ID) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.CRE >= 1.5 AND STRFTIME('%Y', Date('now')) - STRFTIME('%Y', T1.Birthday) < 70",
   "difficulty": "challenging",
-  "SQL_duckdb": "SELECT COUNT(DISTINCT T1.ID) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.CRE >= 1.5 AND STRFTIME(CAST(CURRENT_DATE AS TIMESTAMP), '%Y') - STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') < 70",
+  "SQL_duckdb": "SELECT COUNT(DISTINCT T1.ID) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.CRE >= 1.5 AND (COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(CURRENT_DATE AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0) - COALESCE(TRY_CAST(REGEXP_EXTRACT(CAST(STRFTIME(CAST(T1.Birthday AS TIMESTAMP), '%Y') AS VARCHAR), '^[-+0-9.eE]+', 0) AS DOUBLE), 0)) < 70",
   "tier": 1,
   "verified": true
  },
@@ -15001,17 +15034,6 @@
   "difficulty": "simple",
   "SQL_duckdb": "SELECT DISTINCT T1.atom_id FROM atom AS T1 INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id INNER JOIN connected AS T3 ON T1.atom_id = T3.atom_id WHERE T2.label = '-'",
   "tier": 0,
-  "verified": true
- },
- {
-  "question_id": 212,
-  "db_id": "toxicology",
-  "question": "Which element is the least numerous in non-carcinogenic molecules?",
-  "evidence": "label = '-' means molecules are non-carcinogenic; least numerous refers to MIN(COUNT(element));",
-  "SQL": "SELECT T.element FROM (SELECT T1.element, COUNT(DISTINCT T1.molecule_id) FROM atom AS T1 INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id WHERE T2.label = '-' GROUP BY T1.element ORDER BY COUNT(DISTINCT T1.molecule_id) ASC LIMIT 1) t",
-  "difficulty": "challenging",
-  "SQL_duckdb": "SELECT T.element FROM (SELECT T1.element, COUNT(DISTINCT T1.molecule_id) FROM atom AS T1 INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id WHERE T2.label = '-' GROUP BY T1.element ORDER BY COUNT(DISTINCT T1.molecule_id) ASC LIMIT 1) t",
-  "tier": 3,
   "verified": true
  },
  {
@@ -16066,7 +16088,7 @@
   "evidence": "",
   "SQL": "SELECT T1.atom_id, COUNT(DISTINCT T2.bond_type),T1.molecule_id FROM atom AS T1 INNER JOIN bond AS T2 ON T1.molecule_id = T2.molecule_id WHERE T1.molecule_id = 'TR000' GROUP BY T1.atom_id, T2.bond_type",
   "difficulty": "simple",
-  "SQL_duckdb": "SELECT T1.atom_id, COUNT(DISTINCT T2.bond_type),T1.molecule_id FROM atom AS T1 INNER JOIN bond AS T2 ON T1.molecule_id = T2.molecule_id WHERE T1.molecule_id = 'TR000' GROUP BY T1.atom_id, T2.bond_type",
+  "SQL_duckdb": "SELECT T1.atom_id, COUNT(DISTINCT T2.bond_type),ANY_VALUE(T1.molecule_id) FROM atom AS T1 INNER JOIN bond AS T2 ON T1.molecule_id = T2.molecule_id WHERE T1.molecule_id = 'TR000' GROUP BY T1.atom_id, T2.bond_type",
   "tier": 0,
   "verified": true
  },
