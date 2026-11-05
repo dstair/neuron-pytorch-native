@@ -33,16 +33,28 @@ Lessons: kill-detached-jobs carefully (a killed rsync left a 0-byte pipeline fil
 egress IP differs per destination region (check from the instance side with `ss -tn`);
 ap-south-2 has no corp managed prefix list.
 
-## Current Status: FL2VA Implementation In Progress
+## FL2VA bring-up (DONE, 2026-11-05, trn2.48xl TP=8)
 
-### Completed
+First-frame FL2VA runs end-to-end on the 48xl: `/data/omni29/runs/pika_fl2va_first`.
+Keyframe = frame 0 of the T2V output; same prompt/seed. `FL2VA: 1 keyframe(s) -> 1008
+condition rows (encode ~120s CPU per rank)`, denoise compiled a new FL2VA-shaped graph
+(seq +1008 rows, 3-entry timestep), total 736s cold. **Output frame 0 anchors on the
+keyframe (MAE 3.08, PSNR 35.5 dB — the expected t=0.999-noise + VAE-roundtrip delta)**
+and the video develops coherently (perch -> wings -> flight). Runner:
+`/data/omni29/fl2va/run_fl2va.py` (also in the repo).
 
-1. **Reference code analyzed** - `contrib/pika-h3-flex/reference_pipeline/` contains the diffusers main reference
-2. **FL2VA layout logic tested** - Position ids, token tags, and anchor placement verified
-3. **Patch created** - `patches/pika_fl2va.patch` ready to apply
-4. **Test runner created** - `run_fl2va.py` for on-box testing
-5. **Stage config created** - `deploy/pika_h3_flex_fl2va_stage.yaml` with VAE encoder enabled
-6. **Integration guide** - `docs/FL2VA_INTEGRATION.md` documents the changes
+Warm FL2VA timing not yet measured (engine shutdown after one request; expect
+~keyframe-encode 120s + denoise ~60s + VAE ~13s once graphs are cached).
+
+### Remaining FL2VA follow-ups
+
+- **Vision-tower conditioning** (quality gap): keyframes currently condition only via
+  VAE-anchor rows; the reference also prepends `"<Picture i>: " + vision block` to the
+  text presentation (Qwen3-VL vision tower, hidden_states[50], vision rows tagged 0).
+  Text encoder port is text-only today.
+- **last-frame anchor test** (`--last-frame`), and **first+last** together.
+- **Device-side VAE encode** (compile_encoder / swap) to replace the 120s CPU encode.
+- **Warm-timing run** for FL2VA.
 
 ### Files Created
 
@@ -57,22 +69,9 @@ ap-south-2 has no corp managed prefix list.
 
 ### Next Steps (On Box)
 
-1. **Deploy the patch**:
-   ```bash
-   cd /data/omni29/plugin
-   patch -p1 < /path/to/pika_fl2va.patch
-   ```
-
-2. **Test VAE encoder compilation**:
-   - Verify encoder graph compiles
-   - Test keyframe encoding with dummy image
-
-3. **Test FL2VA end-to-end**:
-   - Create test keyframe image
-   - Run `run_fl2va.py` with first-frame anchor
-   - Verify output video starts on keyframe
-
-4. **Add vision tower encoding** (future):
+1. ~~Deploy the patch~~ — DONE (via `deploy/apply_fl2va.py`, applied on both boxes)
+2. ~~Test FL2VA end-to-end~~ — DONE (first-frame, TP=8, anchors verified)
+3. **Add vision tower encoding** (future):
    - Current implementation does NOT encode keyframes through Qwen3-VL
    - Text encoder doesn't see the keyframe image
    - May produce suboptimal conditioning quality
