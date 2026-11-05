@@ -13,7 +13,7 @@ via the Neuron vLLM-Omni plugin. Branch `pika-h3-flex`.
 | 3. first-frame-and-audio (lip-sync) | **DONE** | audio reference rows (clean t=1.0); generated audio follows the track (envelope corr 0.920) |
 | 1344×768 | **DONE** | primary canvas |
 | 768×1344 | **DONE** | portrait verified |
-| up to 15 s @ 24 fps | **CP=2 config** | 362 frames OOMs TP=8 (34.6 GB peak); TP=8×ring=2 config added |
+| up to 15 s @ 24 fps | **DONE** | 362 frames + 15.07s stereo WAV at TP=8×CP=8, warm 144s e2e |
 | steps 2, 3, 6 | **DONE** | per-request `num_inference_steps`; knots subsample the trained grid; 6/3 verified |
 | fast inference | **TP=8: 8.9 s/step warm** | see numbers below |
 
@@ -32,8 +32,14 @@ compile remnants). 2-step output quality verified coherent. Keyframe device enco
 3.5 s warm / ~10 s first call (was ~120 s on CPU). Audio decode adds ~1 s per request.
 Portrait 768×1344 works at the same per-step rate.
 
-15 s (362 frames): TP=8 block graph OOMs (34.6 GB peak); TP=8×ring=2 shards the sequence
-but the plugin's ring path hits a fake-tensor tracing error at compile — **follow-up**.
+15 s (362 frames) at **TP=8×CP=8** (`pika_h3_flex_stage_tp8cp8.yaml`, all 64 cores):
+warm e2e 144s (text 8.7s, denoise ~40s at 6.4-6.5s/step, VAE decode ~90-100s,
++15.07s stereo WAV). First request per engine pays a one-time ~225s step-0 cost
+(AdaLN/neff warmup). Two hard limits shaped this: the DiT block graph OOMs past
+~60k rows/rank (34.6 GB at 108k), and attention_cte's S_q×S_k bf16 tile overflows
+uint32 past ~46k×46k — CP=8 (13.5k rows/rank) clears both. The NKI ring-attention
+kernel doesn't survive dynamo tracing, so CP uses the all-gather fallback
+(`apply_cp_fallback.py`). Host RAM at 64 workers peaks ~1.3 TB of 2 TB.
 
 ## Deployed boxes
 
