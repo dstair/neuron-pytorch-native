@@ -26,7 +26,7 @@ HELPERS = '''
         group = get_tp_group().cpu_group
         if group is None or dist.get_world_size(group) == 1:
             return tensor
-        header = torch.zeros(5, dtype=torch.long)  # [ndim, d0..d3]
+        header = torch.zeros(6, dtype=torch.long)  # [ndim, d0..d3]
         if dist.get_rank(group) == 0:
             header[0] = tensor.ndim
             header[1 : 1 + tensor.ndim] = torch.tensor(tensor.shape, dtype=torch.long)
