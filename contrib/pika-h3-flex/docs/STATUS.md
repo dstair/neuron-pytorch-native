@@ -17,6 +17,28 @@ via the Neuron vLLM-Omni plugin. Branch `pika-h3-flex`.
 | steps 2, 3, 6 | **DONE** | per-request `num_inference_steps`; knots subsample the trained grid; 6/3 verified |
 | fast inference | **TP=8: 8.9 s/step warm** | see numbers below |
 
+## Session 4 additions (2026-11-06, reservation cr-01ac64041da0ea872)
+
+- **Step-0 warmup solved**: the ~225s was the per-shape NEFF/executor load on the first
+  forward (per prompt-token-count shape, not per boot). `apply_warmup.py` runs a
+  synthetic production-shape forward at the end of `pipeline.compile()`;
+  `apply_text_bucket.py` pads the text segment to `text_seq_bucket` so all prompts
+  share ONE graph shape. Validated: boot warmup + bucket=64, then a NEW prompt:
+  step-0 10.4s (was 256s), first request 216s vs 426s. (Padded output diverges ~15 dB
+  from unpadded but stays high quality; bucket is opt-in.)
+- **Vision-tower conditioning live** (`apply_vision_conditioning.py`): "<Picture i>: " +
+  vision block per keyframe/reference through the existing Neuron Qwen3-VL vision tower
+  (1008 vision tokens for a 768p keyframe); vision rows tagged video.
+- **FL2VA at 15s verified**: frame 0 anchors (32.5 dB), 362 frames, 15.07s WAV.
+  At CP=8 the conditioning encode runs on the VAE ranks + world-group broadcast
+  (`apply_vae_rank_encode.py`), CPU path for keyframes (encoder NEFF residency OOMs
+  the decode swap; swap=25 + no encoder NEFF is the working combo; CP=8 swap maps
+  need 216 GB of host-maps disk).
+- **Multi-engine throughput validated**: 2× TP=8 engines on core groups 0-7 / 8-15
+  (distinct NEURON_RT_ROOT_COMM_ID, separate cache dirs) complete requests at
+  **81.6s vs 82.4s single-engine — zero contention**. Host RAM ~300 GB for 2 engines
+  during load; 8× TP=8 across 64 cores is the serving ceiling (~350 req/hr short-form).
+
 ## Measured numbers (trn2.48xlarge TP=8, 1344×768, 124 frames, warm repeats)
 
 | Config | text enc | denoise | VAE dec | total warm |
@@ -34,12 +56,13 @@ Portrait 768×1344 works at the same per-step rate.
 
 15 s (362 frames) at **TP=8×CP=8** (`pika_h3_flex_stage_tp8cp8.yaml`, all 64 cores):
 warm e2e 144s (text 8.7s, denoise ~40s at 6.4-6.5s/step, VAE decode ~90-100s,
-+15.07s stereo WAV). First request per engine pays a one-time ~225s step-0 cost
-(AdaLN/neff warmup). Two hard limits shaped this: the DiT block graph OOMs past
-~60k rows/rank (34.6 GB at 108k), and attention_cte's S_q×S_k bf16 tile overflows
-uint32 past ~46k×46k — CP=8 (13.5k rows/rank) clears both. The NKI ring-attention
-kernel doesn't survive dynamo tracing, so CP uses the all-gather fallback
-(`apply_cp_fallback.py`). Host RAM at 64 workers peaks ~1.3 TB of 2 TB.
++15.07s stereo WAV). The per-shape NEFF load (~225s) is covered by the boot warmup
+(`warmup_num_frames: 362` + `text_seq_bucket: 64`). Two hard limits shaped this:
+the DiT block graph OOMs past ~60k rows/rank (34.6 GB at 108k), and attention_cte's
+S_q×S_k bf16 tile overflows uint32 past ~46k×46k — CP=8 (13.5k rows/rank) clears
+both. The NKI ring-attention kernel doesn't survive dynamo tracing, so CP uses the
+all-gather fallback (`apply_cp_fallback.py`). Host RAM at 64 workers peaks ~1.3 TB
+of 2 TB; the CP=8 DiT swap maps need ~216 GB of host-maps disk (swap=25).
 
 ## Deployed boxes
 
