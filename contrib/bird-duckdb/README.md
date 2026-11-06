@@ -83,4 +83,7 @@ an ordered comparison with a multiset fallback (ties are only partially determin
 - [x] Wire `execution_accuracy` into the qwen3.5-4b-training eval harness
       (`labs/lab10_bird_exec_eval.py`): baseline 0.070 vs fine-tuned 0.219 exec accuracy
       (paired p = 0.0005) on a stratified 128-question subset
-- [ ] Ship native `.duckdb` database files alongside the dataset json
+- [x] Ship native `.duckdb` database files: `python3 build.py --emit-duckdb` writes one
+      persistent file per database next to its `.sqlite` source (gitignored; ~1 GB total),
+      verified by reopening. Consumers get the exact verified materialization with no
+      sqlite scanner needed; `sqlft/bird.py` prefers them when present.

@@ -149,12 +149,19 @@ def table_list(sqlite_path: str):
 
 
 def duckdb_native(sqlite_path: str) -> duckdb.DuckDBPyConnection:
-    """Typed scan first (content-sniffed types -- this is what lets date-ish columns come
-    through as DATE so the verified gold's date functions run); REAL columns are CAST to
-    DOUBLE at CTAS time; a scan failure falls back to all-varchar + TRY_CAST.
+    """Native DuckDB for one database.
+
+    Prefers the prebuilt `<db>.duckdb` file (the dataset's own artifact, read-only) when
+    present next to the .sqlite source. Otherwise materializes: typed scan first
+    (content-sniffed types -- this is what lets date-ish columns come through as DATE so
+    the verified gold's date functions run); REAL columns are CAST to DOUBLE at CTAS
+    time; a scan failure falls back to all-varchar + TRY_CAST.
     Must stay in sync with build.py's duckdb_native: the dataset's SQL_duckdb was
     verified against THAT materialization, and it must run identically here.
     """
+    prebuilt = pathlib.Path(sqlite_path).with_suffix(".duckdb")
+    if prebuilt.exists():
+        return duckdb.connect(str(prebuilt), read_only=True)
     con = duckdb.connect()
     con.execute("INSTALL sqlite; LOAD sqlite;")
     for t, cols in table_list(sqlite_path):

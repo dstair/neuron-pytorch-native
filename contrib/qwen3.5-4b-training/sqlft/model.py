@@ -58,6 +58,7 @@ def load_model(
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.0,
+    lora_targets=None,  # iterable of leaf names, or a sqlft.lora.TARGET_PRESETS key
     device: str | torch.device | None = "neuron",
     gradient_checkpointing: bool = False,
     verbose: bool = True,
@@ -81,9 +82,13 @@ def load_model(
     model.config.use_cache = False  # incompatible with training; also allocates KV cache
 
     if lora:
-        from sqlft.lora import apply_lora
+        from sqlft.lora import TARGET_PRESETS, apply_lora
 
-        apply_lora(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout, verbose=verbose)
+        targets = TARGET_PRESETS.get(lora_targets, lora_targets) \
+            if isinstance(lora_targets, str) else lora_targets
+        kwargs = {} if targets is None else {"targets": targets}
+        apply_lora(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout,
+                   verbose=verbose, **kwargs)
         # PEFT-style adapters are often created in fp32 while the base is bf16. Ours are
         # created in the base dtype on purpose -- FSDP's flat parameter requires a UNIFORM
         # dtype and otherwise fails with "Must flatten tensors with uniform dtype".

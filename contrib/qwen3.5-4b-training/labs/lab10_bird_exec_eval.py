@@ -35,6 +35,8 @@ def main() -> int:
     ap.add_argument("--seq", type=int, default=1024)
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
+    ap.add_argument("--lora-targets", choices=("all", "mixers"), default="all",
+                    help="must match the adapter's training targets")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="lab10_bird_exec")
     args = ap.parse_args()
@@ -60,7 +62,8 @@ def main() -> int:
 
     model = load_model(layers=32, gdn="nki-v15-split16",
                        lora=args.adapter is not None,
-                       lora_r=args.lora_r, lora_alpha=args.lora_alpha, device="neuron")
+                       lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+                       lora_targets=args.lora_targets, device="neuron")
     if args.adapter is not None:
         n = load_lora(model, args.adapter)
         print(f"loaded {n} adapter tensors from {args.adapter}")

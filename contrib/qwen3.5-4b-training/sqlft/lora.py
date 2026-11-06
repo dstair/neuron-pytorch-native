@@ -92,6 +92,16 @@ DEFAULT_TARGETS = (
     "gate_proj", "up_proj", "down_proj",
 )
 
+# Everything EXCEPT the MLP: the attention family (q/k/v/o) and the GDN projections.
+# The MLP is 56% of the adapter parameters (intermediate 9216 vs hidden 2560), so this
+# preset is the parameter-efficiency question in the sweep.
+MIXER_TARGETS = (
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj",
+)
+
+TARGET_PRESETS = {"all": DEFAULT_TARGETS, "mixers": MIXER_TARGETS}
+
 
 def _named_linears(model: nn.Module) -> Iterator[tuple[str, nn.Module, str, nn.Linear]]:
     for name, mod in model.named_modules():

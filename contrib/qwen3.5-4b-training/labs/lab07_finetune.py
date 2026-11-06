@@ -56,6 +56,8 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
+    ap.add_argument("--lora-targets", choices=("all", "mixers"), default="all",
+                    help="mixers = attention + GDN projections only, no MLP")
     ap.add_argument("--gdn", choices=GDN_CHOICES, default="nki-v15-split16")
     ap.add_argument("--grad-ckpt", action="store_true")
     ap.add_argument("--packed", action="store_true")
@@ -99,6 +101,7 @@ def main() -> int:
             layers=args.layers,
             gdn=args.gdn,
             lora=True, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+            lora_targets=args.lora_targets,
             gradient_checkpointing=args.grad_ckpt,
             device=dev, verbose=is_main(),
         )

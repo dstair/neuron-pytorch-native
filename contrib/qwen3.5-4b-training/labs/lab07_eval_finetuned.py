@@ -34,6 +34,8 @@ def main() -> int:
                     help="1 is fastest: the GDN kernel serialises over batch x heads")
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
+    ap.add_argument("--lora-targets", choices=("all", "mixers"), default="all",
+                    help="must match the adapter's training targets")
     ap.add_argument("--gdn", choices=GDN_CHOICES, default="nki-v15-split16")
     ap.add_argument("--decode", choices=("reforward", "cached"), default="reforward",
                     help="cached = recurrent/KV-cache decode (sqlft.infer; validated by "
@@ -52,6 +54,7 @@ def main() -> int:
         layers=args.layers,
         gdn=args.gdn,
         lora=True, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+        lora_targets=args.lora_targets,
         device="neuron",
     )
     n = load_lora(model, args.adapter)

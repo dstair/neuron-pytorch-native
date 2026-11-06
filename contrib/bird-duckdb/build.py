@@ -379,7 +379,56 @@ def make_translator(text_cols: set[str], date_cols: set[str]):
 # ---------------------------------------------------------------------- build
 
 
+def emit_duckdb() -> None:
+    """Write one persistent .duckdb file per database next to its .sqlite source.
+
+    These are the DATASET's native database files: same materialization the gold was
+    verified against, no sqlite scanner needed at consume time. Verified by reopening
+    each and counting tables.
+    """
+    dev = json.loads(DEV_JSON.read_text())
+    for db_id in sorted({d["db_id"] for d in dev}):
+        sqlite_path = str(DB_DIR / db_id / f"{db_id}.sqlite")
+        out = DB_DIR / db_id / f"{db_id}.duckdb"
+        out.unlink(missing_ok=True)
+        tables = table_list(sqlite_path)
+
+        dst_con = duckdb.connect(str(out))
+        dst_con.execute("INSTALL sqlite; LOAD sqlite;")
+        for t, cols in tables:
+            try:
+                exprs = ", ".join(
+                    f'CAST("{n}" AS DOUBLE) AS "{n}"'
+                    if d.startswith(("REAL", "FLOA", "DOUB")) else f'"{n}"'
+                    for n, d in cols)
+                dst_con.execute(
+                    f'CREATE TABLE "{t}" AS SELECT {exprs} FROM '
+                    f'sqlite_scan(?, ?)', [sqlite_path, t])
+                continue
+            except Exception:
+                pass
+            dst_con.execute("SET sqlite_all_varchar=true")
+            exprs = ", ".join(
+                f'TRY_CAST("{n}" AS DOUBLE) AS "{n}"'
+                if any(d.startswith(k) for k, _ in _DECL_MAP) else f'"{n}"'
+                for n, d in cols)
+            dst_con.execute(f'CREATE TABLE "{t}" AS SELECT {exprs} FROM '
+                            f'sqlite_scan(?, ?)', [sqlite_path, t])
+            dst_con.execute("SET sqlite_all_varchar=false")
+        dst_con.close()
+
+        check = duckdb.connect(str(out), read_only=True)
+        n = len(check.execute("SHOW TABLES").fetchall())
+        check.close()
+        assert n == len(tables), f"{db_id}: {n} tables, expected {len(tables)}"
+        print(f"{db_id:26} -> {out.name}  ({n} tables, "
+              f"{out.stat().st_size / 1e6:.0f} MB)")
+
+
 def main() -> int:
+    if "--emit-duckdb" in sys.argv:
+        emit_duckdb()
+        return 0
     triage = "--triage" in sys.argv
     dev = json.loads(DEV_JSON.read_text())
     db_ids = sorted({d["db_id"] for d in dev})
