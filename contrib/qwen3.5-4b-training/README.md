@@ -212,6 +212,47 @@ standard (top-1 agreement 88/88 steps, worst cos 0.99881 across kernels). End to
 last two moves are 1 and 2 queries of 128, inside greedy-chaos/binomial noise at n=128.
 `lab07_eval_finetuned.py --decode cached` selects it.
 
+### The LoRA sweep: what buys accuracy, and what doesn't
+
+Eight 1-epoch configs (`labs/run_sweep.sh`), each graded on motherduck parse/bind AND
+BIRD exec accuracy. Graphs in [`graphs/`](graphs) (`plot_sweep.py` regenerates them).
+
+| config | params | epoch wall | tok/s | loss | parse | bind | exec |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **r=4 α=8** | **8.1 M** | 81.5 min | 1878 | 0.231 | 0.961 | 0.697 | 0.180 |
+| r=8 α=16 | 16.2 M | 81.8 | 1871 | 0.202 | 0.961 | 0.674 | 0.156 |
+| r=16 α=32 (ft_epoch1, old stack) | 32.5 M | 116.6* | 1300 | 0.266 | 0.969 | 0.708 | 0.219 |
+| r=32 α=64 | 64.9 M | 81.0 | 1890 | 0.163 | **1.000** | 0.663 | 0.156 |
+| r=64 α=128 | 129.8 M | 82.4 | 1859 | 0.158 | 0.992 | 0.663 | 0.156 |
+| lr 3e-5 (r=16) | 32.5 M | 80.3 | 1896 | 0.293 | 0.984 | 0.674 | 0.156 |
+| lr 3e-4 (r=16) | 32.5 M | 79.2 | 1903 | 0.162 | 0.984 | 0.629 | 0.164 |
+| mixers r=16 (no MLP) | **14.4 M** | **72.9** | **2084** | 0.233 | 0.969 | 0.640 | 0.188 |
+
+*ft_epoch1 trained on the old box (beta6 container); the same recipe is ~81 min on this
+box's public stack, so wall times are not comparable across that row.
+
+**The most efficient config is r=4 α=8, and the runner-up is mixers r=16.** The findings,
+qualified by n=128 CIs (±5pt parse, ±7pt exec):
+
+- **Wall time barely moves across configs (73–82 min, ±13%).** The adapter is a tiny
+  share of the 4.2 B forward/backward, so "training time vs accuracy" is NOT the binding
+  tradeoff at a fixed epoch budget — the axes that matter are params and metric choice.
+- **Rank doesn't buy accuracy here.** Parse/bind are flat r=4 → r=64; r=32 even hits
+  parse 1.000 with bind *unchanged* (0.663) — perfect syntax, same semantics. Capacity
+  past r=4 is wasted on this data scale (and would matter only with more/longer training).
+- **lr 1e-4 is the sweet spot.** 3e-4 doesn't diverge (LoRA's tolerance, contrasted with
+  full-FT diverging at 1e-4) but bind degrades to 0.629; 3e-5 under-converges (loss curve
+  sits above the pack).
+- **The MLP adapters earn little.** mixers drops 56% of the parameters, runs the fastest
+  epoch (72.9 min, 2084 tok/s), and lands within noise of all-targets on parse
+  (0.969) and exec (0.188).
+- **More steps ≠ monotonic gains.** r=8 checkpoints: 0.969 @400 → 0.984 @800 → 0.961
+  @1097 — inside the ±4pt noise band; single-epoch LoRA saturates early.
+- **The motherduck metric has hit its ceiling as a discriminator** (r=32: 1.000). BIRD
+  exec accuracy is now the only metric with headroom to rank configs — and all config
+  differences there are inside its CI. Ranking configs properly means a bigger exec
+  sample, not a better motherduck number.
+
 ### The GDN kernel bug, and the fix
 
 Upstream `deltanet_fused_chunked_fwd_batched` passes synthetic parity **exactly** (cos =

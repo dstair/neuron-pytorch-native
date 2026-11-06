@@ -37,7 +37,12 @@ EVAL_ALIAS = {"ft_epoch1": ("lab07_eval_ft_128_mn128", "lab10_ft_128")}
 # at r=16 all-targets): scale linearly in r; mixers excludes the MLP share (~56%).
 PARAMS_M = {"sweep_r4": 8.1, "sweep_r8": 16.2, "ft_epoch1": 32.46,
             "sweep_r32": 64.9, "sweep_r64": 129.8,
-            "sweep_lr3e5": 32.46, "sweep_lr3e4": 32.46, "sweep_nomlp": 14.3}
+            "sweep_lr3e5": 32.46, "sweep_lr3e4": 32.46, "sweep_nomlp": 14.4}
+
+# ft_epoch1 trained on the OLD box (beta6 container): 116.6 min for the identical r=16
+# recipe that takes ~81 min on this box's public stack. Marked differently in the graphs;
+# do not read wall-time comparisons across that boundary.
+OLD_STACK = {"ft_epoch1"}
 
 
 def load(tag, suffix=""):
@@ -78,13 +83,20 @@ def fig_pareto(rows):
     fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharex=True)
     for ax, key, title in ((axes[0], "parse", "motherduck parse_rate"),
                            (axes[1], "exec", "BIRD exec_accuracy")):
-        for row in rows:
-            if row[key] is None:
-                continue
+        # Alternate annotation sides so nearby points don't overwrite each other.
+        offsets = [(6, 4), (6, -12), (-46, 4), (-46, -12), (6, 10), (-52, 10)]
+        plotted = [r for r in rows if r[key] is not None]
+        plotted.sort(key=lambda r: r[key])
+        for i, row in enumerate(plotted):
+            old = row["tag"] in OLD_STACK
             ax.scatter(row["wall_min"], row[key], s=row["params_m"] * 3,
-                       color=row["color"], alpha=0.8, edgecolors="black", linewidths=0.5)
-            ax.annotate(row["label"], (row["wall_min"], row[key]),
-                        textcoords="offset points", xytext=(6, 4), fontsize=8)
+                       color=row["color"], alpha=0.45 if old else 0.85,
+                       edgecolors="black", linewidths=0.5,
+                       facecolors="none" if old else row["color"])
+            ax.annotate(row["label"] + (" (old stack)" if old else ""),
+                        (row["wall_min"], row[key]),
+                        textcoords="offset points", xytext=offsets[i % len(offsets)],
+                        fontsize=8)
         ax.set_xlabel("training wall time (min, 1 epoch)")
         ax.set_ylabel(title)
         ax.set_title(title)
@@ -121,8 +133,9 @@ def fig_params(rows):
         ax.scatter(row["params_m"], row["parse"], marker=style, s=70,
                    color=row["color"], edgecolors="black", linewidths=0.5,
                    label="mixers (no MLP)" if style == "s" else None)
+        dy = -14 if row["label"] in ("mixers", "r=8") else 6
         ax.annotate(row["label"], (row["params_m"], row["parse"]),
-                    textcoords="offset points", xytext=(6, 4), fontsize=8)
+                    textcoords="offset points", xytext=(6, dy), fontsize=8)
         if row["exec"] is not None:
             ax.scatter(row["params_m"], row["exec"], marker=style, s=70,
                        color=row["color"], alpha=0.45, edgecolors="black", linewidths=0.5)

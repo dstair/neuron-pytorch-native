@@ -3,6 +3,28 @@
 Measured findings, things that broke, and levers tried and refuted. Newest first within a
 section. Anything asserted here has a command next to it.
 
+## The LoRA sweep: r=4 wins, and wall time is not the trade axis
+
+Eight 1-epoch configs (`labs/run_sweep.sh`, results table in README, graphs in `graphs/`).
+Headline: **r=4 α=8 all-targets matches r=16 on parse/bind (0.961/0.697)** at 8.1M
+params; **mixers r=16 (no MLP) is 56% fewer params, the fastest epoch (72.9 min / 2084
+tok/s), and within noise of all-targets**. Measured facts that shape future sweeps:
+
+- Epoch wall time is 73–82 min across r=4→64 and both lrs -- the adapter is not the cost
+  driver. "Training time vs accuracy" is the wrong axis at fixed budget; params and
+  metric choice are the right ones.
+- r=32 hit parse **1.000** with bind unchanged (0.663): the motherduck metric is
+  saturated as a config discriminator. BIRD exec is the only metric with headroom, and
+  every config difference there is inside its ±7pt CI at n=128. The next sweep needs a
+  bigger exec sample to rank configs honestly.
+- lr 3e-4 does not diverge (LoRA tolerance; full-FT diverges at 1e-4) but bind drops to
+  0.629. 3e-5 under-converges. 1e-4 confirmed optimal.
+- r=8 checkpoint evals: 0.969@400 → 0.984@800 → 0.961@1097 -- non-monotonic, inside
+  noise. One epoch of LoRA saturates well before step 1097; if time is the axis of
+  interest, ~500 steps is the efficient point.
+- ft_epoch1's 116.6 min epoch was the OLD box (beta6); the identical recipe is ~81 min on
+  this box (public stack, consistent with the 1.7× per-step claim).
+
 ## Execution accuracy on BIRD-for-DuckDB: parse 0.961, exec 0.219
 
 `labs/lab10_bird_exec_eval.py` grades result-set equality against the verified
