@@ -1,8 +1,13 @@
 # Restoring the Pika-H3-Flex environment on a fresh trn2.48xlarge
 
 Everything needed lives in `s3://pika-h3-transfer-933591302813-apse4/` and this repo
-(branch `pika-h3-flex`). The S3 bucket policy grants the two instance roles; a fresh box
-needs its role added (see the bucket policy) or use admin credentials.
+(branch `pika-h3-flex`). The S3 bucket policy grants the instance roles (add a fresh
+box's role — a deleted stack's role in the policy makes put-bucket-policy fail).
+
+**Latest mirror**: `plugin-48xl-patched-v2/` (all patches incl. warmup, text bucket,
+vision conditioning, CP fallback, vae-rank encode) and `48xl-v2/` (caches, runs,
+stage configs). The older `plugin-48xl-patched/` + `48xl/` are the session-3 state.
+`restore_48xl.sh` tracks the v1 mirror — update the two paths for v2.
 
 ## 1. Box
 
