@@ -632,6 +632,37 @@ W8A8 weights (per-Linear op boundaries + B=1 GEMV mapping regress), and DMA
 coalescing v3/v4 (targeted DMAs are off the critical path). FP8's value is memory
 headroom for larger batch, not per-step TPOT.
 
+#### Tried and refuted: FP8 W8A16 for the DeltaNet input projections only (2026-08-12)
+
+Do not retry this without a new mechanism. The idea: a decode profile suggested
+in_proj weight bandwidth dominates, so quantize *only* the four DeltaNet input
+projections (`qkv/z/a/b`) to FP8 W8A16 and leave everything else in BF16. It was
+tested as a standalone `fp8_linear` built on the `nki_fp8_matmul` kernel, and in
+the folded `deltanet.full_fp8` block. Numerics were fine (block `attn_out` cos 0.998,
+`new_state` cos 0.999). Speed was not.
+
+On a trn2.3xlarge (DLC `concourse-release-0461d3b`, RT 2.33), per core, synced,
+compiled, compared with BF16 `F.linear`:
+
+| Projection (out×in) | BF16 ms | FP8 ms | FP8 speed |
+|---|---:|---:|---:|
+| DN qkv 2560×5120 | 0.066 | 0.552 | **0.12×** |
+| DN z 1536×5120 | 0.092 | 0.347 | **0.27×** |
+| MLP gate/up 4352×5120 | 0.112 | 0.922 | **0.12×** |
+| lm_head/4 62080×5120 | 1.068 | 12.797 | **0.08×** |
+
+- **No batch crossover:** at BS=1/32/128, DN qkv stays at 0.12–0.14× and DN z at
+  0.17–0.21×. FP8 time is flat with batch because it's dominated by per-N-tile
+  transpose/store overhead, and the compiler's BF16 GEMM is already near-optimal.
+- **Whole DeltaNet block:** 1.52 ms FP8 vs 0.95 ms BF16 (−37.5%).
+- An earlier "0.111 ms/call" FP8 figure was an enqueue-time artifact, not real
+  latency.
+
+Why it differs from the 35B MoE, where FP8 *does* win at high batch: there FP8
+halves *large* expert weights to fit BS=128 at all (a capacity win) and uses a
+coalesced all-expert kernel. The in_proj weights are small, so there's no capacity
+to unlock. Revisit only with a kernel fused into the DeltaNet recurrence.
+
 ## Serving (vLLM-Neuron)
 
 `deploy/` contains scripts for serving the model through a vLLM-Neuron fork in
