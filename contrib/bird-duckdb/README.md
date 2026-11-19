@@ -87,3 +87,12 @@ an ordered comparison with a multiset fallback (ties are only partially determin
       persistent file per database next to its `.sqlite` source (gitignored; ~1 GB total),
       verified by reopening. Consumers get the exact verified materialization with no
       sqlite scanner needed; `sqlft/bird.py` prefers them when present.
+- [x] Train split: `python3 build.py --set train --jobs 6` (per-database parallel; a
+      30 s watchdog + row cap per query, because some train golds run for hours) →
+      `bird_duckdb_train.json`: **8,345 / 9,428 verified (88.5%)** over 69 databases,
+      none shared with dev. `python3 to_training_jsonl.py --set train` emits the
+      fine-tuning JSONL in the eval's exact prompt format. Fine-tuning Qwen3.5-4B on it
+      doubles dev execution accuracy, 0.228 → 0.458 (see the qwen3.5-4b-training README).
+- [ ] Port the builder's query-time `TRY_CAST` column rebuild into the eval-side
+      materializer (`sqlft/bird.py`): 7 dev golds (card_games, california_schools) only
+      run with it.
