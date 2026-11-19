@@ -1,0 +1,8 @@
+ii  aws-neuronx-collectives                2.x.80446.0-c1dd48d1d                            amd64        neuron_ccom built using CMake
+ii  aws-neuronx-dkms                       2.x.12078.0                                      all          aws-neuronx driver in DKMS format.
+ii  aws-neuronx-oci-hook                   2.18.25.0                                        amd64        Neuron oci hook package
+ii  aws-neuronx-runtime-lib                2.x.81379.0-d6fc24e5b                            amd64        neuron_runtime built using CMake
+ii  aws-neuronx-tools                      2.0.30074.0-532c67072                            amd64        Neuron profile and debug tools
+neuron-torch-mlir                        20260507.107
+neuronx-cc                               2.0.408210.0a0+56671ef7
+torch-neuronx                            2.14.3.0.2017+e7b12f7a4.dev

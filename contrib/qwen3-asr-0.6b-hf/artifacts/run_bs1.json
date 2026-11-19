@@ -1,0 +1,34 @@
+{
+ "args": {
+  "n": 1,
+  "device": "neuron",
+  "no_compile": false,
+  "dtype": "bf16",
+  "enc_buckets": "8,16,32",
+  "prefill_buckets": "128,256,512",
+  "max_seq": 768,
+  "max_new": 256,
+  "repeats": 3
+ },
+ "results": [
+  {
+   "id": "1272-128104-0000",
+   "match": true,
+   "div": null,
+   "text": "Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.",
+   "ref_text": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+   "cold": 32.6191520341672,
+   "C": 8,
+   "P": 128,
+   "ntok": 23,
+   "cpu_s": 1.2759451370220631,
+   "enc": 0.010698648868128657,
+   "prefill": 0.00802300195209682,
+   "step": NaN,
+   "step_amort": 0.004469476460309868,
+   "e2e": 0.11695409612730145
+  }
+ ],
+ "wer": 0.058823529411764705,
+ "matches": 1
+}
