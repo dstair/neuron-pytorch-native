@@ -166,7 +166,7 @@ def lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     return {k: v for k, v in model.state_dict().items() if "lora_A" in k or "lora_B" in k}
 
 
-def save_lora(model: nn.Module, path) -> int:
+def save_lora(model: nn.Module, path, *, write: bool = True) -> int:
     """Write the adapter to disk. Returns bytes written.
 
     Moved to CPU and fp32: a checkpoint that can only be loaded back onto the same device
@@ -175,10 +175,31 @@ def save_lora(model: nn.Module, path) -> int:
     import pathlib
 
     path = pathlib.Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    sd = {k: v.detach().to("cpu", torch.float32) for k, v in lora_state_dict(model).items()}
-    torch.save(sd, path)
-    return path.stat().st_size
+    sd = gather_lora_state_dict(model)
+    if write:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(sd, path)
+        return path.stat().st_size
+    return 0
+
+
+def gather_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """The adapter as full, CPU, fp32 tensors -- also under FSDP2.
+
+    FSDP2 holds every parameter as a sharded DTensor; `.to("cpu")` on one keeps it a
+    DTensor shard, so a rank-0-only save would write 1/world of each adapter matrix (or,
+    with `full_tensor()`, hang: the gather is a collective). Under FSDP2 EVERY rank must
+    call this; only one should then write (`save_lora(..., write=is_main())`).
+    """
+    from torch.distributed.tensor import DTensor
+
+    out = {}
+    for k, v in lora_state_dict(model).items():
+        v = v.detach()
+        if isinstance(v, DTensor):
+            v = v.full_tensor()
+        out[k] = v.to("cpu", torch.float32)
+    return out
 
 
 def merge_and_unwrap_lora(model: nn.Module) -> int:

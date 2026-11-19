@@ -152,6 +152,9 @@ activemq-data/
 .envrc
 .venv
 env/
+# ...but not the training package's box scripts (container/setup/remote), which the
+# Python-template rule above silently kept out of version control.
+!contrib/qwen3.5-4b-training/env/
 venv/
 ENV/
 env.bak/

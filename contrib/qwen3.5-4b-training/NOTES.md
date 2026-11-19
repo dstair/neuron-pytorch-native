@@ -3,6 +3,115 @@
 Measured findings, things that broke, and levers tried and refuted. Newest first within a
 section. Anything asserted here has a command next to it.
 
+## Qwen3.5-9B on the same recipe: 0.458 -> 0.498 (p = 2.2e-5) (2026-11-12)
+
+Same data, LoRA r16 a32 all-targets, 1 epoch, seq 1664 + activation checkpointing; only the
+base model changes. Full dev n=1,493 seq 2048: **0.498** [0.473, 0.524], parse 0.991.
+Paired vs the 4B: 68 vs 128 discordant. 10/11 databases improve. Training loss 0.579 ->
+0.115 (4B: 0.582 -> 0.121).
+
+Why it was cheap: the 9B is the 4B widened (hidden 4096, MLP 12288, untied embeddings) with
+**identical** attention (16/4/256) and GatedDeltaNet head geometry (16 k / 32 v heads,
+dim 128), and a **byte-identical tokenizer** (sha256 of tokenizer.json and
+tokenizer_config.json match), so the split16 GDN kernel, the BIRD JSONL, lab11's token
+counts and the seq-1664 bound all carry over. `SQLFT_MODEL` selects the checkpoint for every
+lab (container.sh passes it through).
+
+What had to change -- FSDP2 in lab07 (`--strategy fsdp2`), three things:
+
+1. **Load on CPU, shard onto the device.** `load_model(device=dev)` then `fully_shard` put
+   all 16.7 GiB on every core first and OOMed at the first backward (`NRT_RESOURCE`).
+   `device=None` + `fully_shard` (which moves each layer to the mesh device as it shards
+   it): 4.19 GiB/core after setup, 15.85 GiB peak at seq 1664.
+2. **Gradient clipping** through `sqlft.parallel.clip_grad_norm_` (DTensor-safe).
+3. **Adapter save is a collective.** `gather_lora_state_dict` does `full_tensor()` on every
+   rank, rank 0 writes; a rank-0-only save writes 1/world shards or hangs. Verified by
+   size: 173.3 MB = 43.28M params x 4 B.
+
+FSDP2 did NOT need `HOST_CC=1` on the public stack (it did on beta6). 16.0 s/step vs the
+4B's DDP 11.7 s/step for 1.9x the parameters. Single-core eval of the merged 9B fits and
+decodes at ~9 s/row, the same as the 4B; it needed its own `lab10 --warmup-only` pass (new
+shapes) before the 4-shard eval.
+
+Failure mix (lab13, % of all rows, 4B -> 9B): wrong values 18.5 -> 17.5, Binder errors
+8.8 -> 7.8, empty result 8.2 -> 7.1, superset rows 7.6 -> 7.8. Scale helps a little
+everywhere and fixes no single class; the execution-guided retry (errors + empties = 15.5%
+of rows) remains the next lever and applies to the 9B unchanged.
+
+## BIRD-train fine-tune: exec accuracy 0.228 -> 0.458 (p < 0.001), same adapter config (2026-11-09)
+
+**Result** (full BIRD dev n=1,493, seq 2048, all four models re-run under the same
+protocol; table + paired tests in README): untuned 0.094, motherduck r4 0.221,
+motherduck r16 0.228, **BIRD-train r16 0.458** [0.433, 0.483]. ft_epoch1 vs bird_r16:
+54 vs 398 discordant. exec_error 573 -> 150; the residual is now 642 *wrong* (runs,
+wrong answer). Wins on all 11 dev databases. Motherduck r4 vs r16 is a tie on exec
+too (60 vs 50, p = 0.39). ft_epoch1 at seq 2048 (0.228) is ~ its seq-1024 number
+(0.219), so the doubling is the data, not the context budget.
+
+Not yet tried, in order of expected value: mixing motherduck + BIRD data (does dialect
+breadth survive?), a 2nd epoch (loss still falling at 0.12), r4 on BIRD data, and
+length-bucketed batching (65% padding at seq 1664). 7 dev rows are unwinnable for every
+model: their verified gold needs build.py's query-time TRY_CAST rebuild, which
+`sqlft/bird.py` does not replicate -- port it before quoting exec numbers to 3 digits.
+
+The next fine-tune trains on BIRD's own train split, verified for DuckDB, because the
+motherduck-trained model's BIRD failures are schema-fidelity failures (invented
+columns/tables), and BIRD train is the multi-table, real-database distribution.
+
+**Data.** `contrib/bird-duckdb/build.py --set train --jobs 6` verified **8,345 / 9,428
+(88.5%)** train golds by result-set equality (dev was 97.2%; BIRD train has noisier gold,
+e.g. app_store 44/63). `to_training_jsonl.py --set train` -> `bird_train_train.jsonl`.
+`labs/lab12_bird_train_data.py` gates it: **8,345/8,345 training prompts byte-identical
+to the exec eval's prompt**, 0 shared databases (69 train / 11 dev), 0 shared question
+texts, 0 unparseable golds.
+
+**The context budget was silently capping the BIRD eval.** `labs/lab11_bird_lengths.py`:
+BIRD prompts carry the full DDL, so length is a property of the database. The lab10
+default `--seq 1024` left-truncates any prompt over 896 tokens -- **49.9% of dev
+prompts** lose the head of their schema (75 of the 128-question subset behind the 0.219
+headline). At seq 2048 it is 8.2% (only european_football_2, 2,202 DDL tokens); at 3072,
+0%. Every exec number before this section was measured with half the schemas cut, so
+the BIRD comparisons here are re-run at **seq 2048 on the full dev set (1,493)** and
+each row records `prompt_tokens` / `prompt_cut`.
+
+| seq | train rows trainable whole | dev prompts eval truncates |
+|---:|---:|---:|
+| 1024 | 71.9% | 49.9% |
+| 2048 | 88.0% | 8.2% |
+| 4096 | 95.0% | 0.0% |
+
+Train at **seq 1664**: the four databases whose DDL alone is >2k tokens (works_cycles
+7,194, mondial_geo, hockey, professional_basketball) drop at any seq <= 2048, and the
+longest surviving row is 1,649 tokens, so 1664 keeps exactly the 7,325 seq-2048 rows.
+Padding waste is still 65% (p50 row 611 tokens) -- length bucketing is the obvious
+throughput lever if this recipe is repeated.
+
+**Memory.** seq 1664, bs 1, LoRA r16, 32L: OOM in backward (`NRT_RESOURCE on retry
+after drain`). With `--grad-ckpt`: 13.8 GiB peak single-rank, 14.4 GiB under DDP world 4,
+11.7 s/step (effective batch 16 x 1664 = 26.6k tokens) = 2,277 agg tok/s, 457 steps/epoch
+= ~89 min. First measured use of activation checkpointing here; it is what makes seq
+>1024 training possible.
+
+**Two infrastructure traps on the shared box** (training tree moved off `/mnt/nvme`, which
+links into another project there; see `QWEN35_TRAIN_REMOTE_ROOT`):
+
+1. *Parallel containers poison the compile cache.* Lowered modules in the shared
+   `hlo_cache` reference NKI kernel binaries by ABSOLUTE `/var/tmp/nki-intermediate-cache`
+   path, and `/var/tmp` was container-private. Two evals hitting a new prompt bucket at
+   the same moment fail with `NCC_EVRF059 Kernel file ... does not exist on the host` --
+   and the failure is then **permanent**: the cached HLO keeps pointing at a file that
+   died with its container, so even a lone process fails on that shape afterwards.
+   Fix: `container.sh` now mounts `$CACHE_DIR/var_tmp:/var/tmp`; evict with
+   `sudo rm -rf cache-public/hlo_cache` (NEFFs are unaffected and stay); then
+   `lab10 --warmup-only` compiles every bucket once, alone, before parallel evals.
+   Also: `container.sh clean-cache` only deleted the beta6 cache dirs
+   (`neuron_cache`/`nbackend`), so on the public stack it cleaned nothing; it now also
+   removes `neff_cache`/`hlo_cache`/`local_cache`.
+2. *The base model never emits EOS*, so its eval runs every row to the 128-token cap:
+   ~23 s/row vs ~9 s for a fine-tuned model. Full-dev base eval is ~9.5 h on one core;
+   sharded over 4 cores (`labs/run_bird_eval_sharded.sh`, `lab10 --shard/--merge-shards`,
+   merge asserts the unsharded row order) it is ~2.5 h.
+
 ## The LoRA sweep: r=4 wins, and wall time is not the trade axis
 
 Eight 1-epoch configs (`labs/run_sweep.sh`, results table in README, graphs in `graphs/`).

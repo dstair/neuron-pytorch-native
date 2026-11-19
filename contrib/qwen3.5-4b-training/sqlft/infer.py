@@ -192,7 +192,8 @@ def _forward_last(model, ids, attn_mask, pos_ids, cache, input_mask=None) -> tor
 @torch.no_grad()
 def cached_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 48,
                     seq_len: int = 1024, chunk: int = 128, device: str = "neuron",
-                    progress: bool = True) -> tuple[list[str], list[bool]]:
+                    progress: bool = True,
+                    stop_ids: "set[int] | None" = None) -> tuple[list[str], list[bool]]:
     """Greedy decode with a recurrent/KV cache. Returns (texts, finished_flags).
 
     finished[i] is True when the row emitted EOS inside the cap; False means the output
@@ -210,6 +211,9 @@ def cached_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 
     dt = next(model.parameters()).dtype
     eos = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
+    # Chat-format generations end with <|im_end|> (== eos for Qwen3.5) but may also emit
+    # <|endoftext|>; stop on any of them. Default: eos only (the plain format's behaviour).
+    stops = {eos} if stop_ids is None else set(stop_ids) | {eos}
 
     texts: list[str] = []
     finished: list[bool] = []
@@ -249,7 +253,7 @@ def cached_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 
 
         # ---- decode ----
         for t in range(n_decode):
-            if gen[-1] == eos:
+            if gen[-1] in stops:
                 break
             ids_t = torch.tensor([[gen[-1]]], device=dev)
             pos = torch.tensor([[L + t]], device=dev)
@@ -259,9 +263,10 @@ def cached_generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 
             cache.cursor += 1
         sync(dev)
 
-        finished.append(eos in gen)
-        if eos in gen:
-            gen = gen[: gen.index(eos)]
+        stop_at = next((k for k, t in enumerate(gen) if t in stops), None)
+        finished.append(stop_at is not None)
+        if stop_at is not None:
+            gen = gen[:stop_at]
         texts.append(tokenizer.decode(gen, skip_special_tokens=True))
         if progress:
             el = time.perf_counter() - t_start

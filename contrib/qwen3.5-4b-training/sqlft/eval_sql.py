@@ -477,15 +477,19 @@ def compare_runs(path_a, path_b, *, key: str = "parses") -> dict:
     DISAGREE, is the split consistent with a coin flip? Only a large, lopsided discordant
     count is a real difference.
 
-    `key` is the per-row boolean to compare: "parses" or "binds".
+    `key` is the per-row boolean to compare: "parses", "binds", or "exec_ok" (lab10).
     """
-    a = json.loads(pathlib.Path(path_a).read_text())
-    b = json.loads(pathlib.Path(path_b).read_text())
+    path_a, path_b = pathlib.Path(path_a), pathlib.Path(path_b)  # CLI passes str
+    a = json.loads(path_a.read_text())
+    b = json.loads(path_b.read_text())
     ra, rb = a.get("per_row"), b.get("per_row")
     if not ra or not rb:
         raise ValueError("both runs need per_row records (re-run with the current harness)")
     if len(ra) != len(rb):
         raise ValueError(f"different row counts ({len(ra)} vs {len(rb)}); not the same eval set")
+    ids_a = [x.get("question_id") for x in ra]
+    if ids_a[0] is not None and ids_a != [y.get("question_id") for y in rb]:
+        raise ValueError("per_row question_ids differ; not the same eval set in the same order")
 
     a_only = sum(1 for x, y in zip(ra, rb) if x[key] and not y[key])
     b_only = sum(1 for x, y in zip(ra, rb) if y[key] and not x[key])
@@ -610,7 +614,8 @@ if __name__ == "__main__":
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--compare", nargs=2, metavar=("RUN_A.json", "RUN_B.json"),
                     help="paired (McNemar) comparison of two eval run files")
-    ap.add_argument("--key", choices=("parses", "binds"), default="parses")
+    ap.add_argument("--key", choices=("parses", "binds", "exec_ok"), default="parses",
+                    help="exec_ok: lab10 BIRD execution accuracy")
     args = ap.parse_args()
     if args.compare:
         raise SystemExit(0 if compare_runs(*args.compare, key=args.key)["p_value"] >= 0

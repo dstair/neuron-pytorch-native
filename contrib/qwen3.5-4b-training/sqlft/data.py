@@ -13,6 +13,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import os
 import pathlib
 from typing import Iterator, Sequence
 
@@ -20,7 +21,9 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 DATA_JSONL = pathlib.Path("/work/data/duckdb-text2sql-25k/train.jsonl")
-MODEL_DIR = pathlib.Path("/work/models/Qwen3.5-4B")
+# SQLFT_MODEL selects the checkpoint for every lab (container.sh passes it through), e.g.
+# SQLFT_MODEL=/work/models/Qwen3.5-9B. Same family = same tokenizer and vocab.
+MODEL_DIR = pathlib.Path(os.environ.get("SQLFT_MODEL", "/work/models/Qwen3.5-4B"))
 
 # Loss is computed only on completion tokens. -100 is torch's cross_entropy ignore_index.
 IGNORE = -100
@@ -36,6 +39,12 @@ class Row:
     query: str
     schema: str
     category: str
+    # Pre-rendered text for formats other than the plain completion format (e.g. the
+    # chat-template reasoning-trace rows built by labs/lab15_trace_data.py). When set,
+    # render_prompt/render_completion return them verbatim; `query` stays the SQL alone
+    # so filter_parseable still checks it.
+    prompt_text: str | None = None
+    completion_text: str | None = None
 
 
 def load_rows(path: pathlib.Path = DATA_JSONL) -> list[Row]:
@@ -43,7 +52,8 @@ def load_rows(path: pathlib.Path = DATA_JSONL) -> list[Row]:
     with path.open() as fh:
         for line in fh:
             d = json.loads(line)
-            rows.append(Row(d["prompt"], d["query"], d["schema"], d.get("category", "")))
+            rows.append(Row(d["prompt"], d["query"], d["schema"], d.get("category", ""),
+                            d.get("prompt_text"), d.get("completion_text")))
     return rows
 
 
@@ -90,12 +100,14 @@ def split_rows(rows: Sequence[Row], eval_frac: float = 0.05) -> tuple[list[Row],
 
 
 def render_prompt(row: Row) -> str:
-    """Plain completion format.
+    """Plain completion format (unless the row carries pre-rendered prompt_text).
 
     Deliberately NOT the chat template: `plain` keeps the prompt/completion boundary exact
     (so masking is unambiguous) and avoids Qwen3.5's thinking mode emitting a <think> block
     before the SQL. The model learns this format during fine-tuning -- that is the point.
     """
+    if row.prompt_text is not None:
+        return row.prompt_text
     return (
         "-- DuckDB SQL generation\n"
         "-- Schema:\n"
@@ -106,6 +118,8 @@ def render_prompt(row: Row) -> str:
 
 
 def render_completion(row: Row) -> str:
+    if row.completion_text is not None:
+        return row.completion_text
     return row.query.strip()
 
 

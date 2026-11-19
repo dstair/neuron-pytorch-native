@@ -9,12 +9,15 @@ that FSDP and the optimizer both depend on.
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 
 import torch
 import torch.nn as nn
 
-MODEL_DIR = pathlib.Path("/work/models/Qwen3.5-4B")
+# SQLFT_MODEL selects the checkpoint for every lab (container.sh passes it through), e.g.
+# SQLFT_MODEL=/work/models/Qwen3.5-9B. Same family = same tokenizer and vocab.
+MODEL_DIR = pathlib.Path(os.environ.get("SQLFT_MODEL", "/work/models/Qwen3.5-4B"))
 
 # Qwen3.5-4B is a hybrid stack: every 4th layer (index 3, 7, 11, ...) is full_attention,
 # the rest are linear_attention (GatedDeltaNet). Truncating to N layers therefore changes

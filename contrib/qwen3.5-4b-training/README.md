@@ -65,6 +65,12 @@ One `trn2.3xlarge`: 1 Trainium2 chip, 96 GB HBM, 12 vCPU, 124 GB host RAM.
 | `LNC=2` (default) | 4 | 24 GB | correctness, LoRA, full-FT under FSDP — the proven regime |
 | `LNC=1` | 8 | 12 GB | scaling labs, where rank *count* is the point |
 
+Which box, region and SSH key to use is deployment state, not code: set
+`QWEN35_TRAIN_INSTANCE_ID`, `QWEN35_TRAIN_REGION` and `QWEN35_TRAIN_SSH_KEY` in the
+repo-root `.env` (copy `.env.example`; it is gitignored). The training tree defaults to
+`/mnt/nvme/qwen35-training`; on a shared box where that path belongs to another project,
+set `QWEN35_TRAIN_REMOTE_ROOT`.
+
 `/mnt/nvme` is **instance store**. A reboot preserves it; a stop/start destroys the weights,
 the compile caches and every artifact. `env/setup_box.sh` is the recovery path — keep it working.
 
@@ -76,7 +82,7 @@ the compile caches and every artifact. `env/setup_box.sh` is the recovery path �
 ./env/remote.sh ssh /mnt/nvme/qwen35-training/src/env/setup_box.sh all
 ```
 
-`setup_box.sh all` builds the derived container image (beta6 DLC + transformers / datasets /
+`setup_box.sh all` builds the derived container image (the `STACK` DLC + transformers / datasets /
 duckdb / kernels), downloads the 8.8 GB checkpoint, the dataset, and the pinned GDN kernel,
 then asserts everything imports.
 
@@ -392,6 +398,68 @@ external-knowledge columns), and the residual failure is dominated by *schema-fi
 errors — inventing column names, wrong tables, made-up functions — i.e. the thing bind_rate
 approximates, made exact. That gap is the target for the next fine-tune.
 
+### Fine-tuning on BIRD train: execution accuracy 0.228 → 0.458 (4B) → 0.498 (9B)
+
+The next fine-tune trains on BIRD's own train split, verified for DuckDB the same way as
+dev (8,345 / 9,428 golds verified; 69 databases, none shared with dev; prompts
+byte-identical to the eval's — `labs/lab12_bird_train_data.py`). Recipe: LoRA r16 α32
+all-targets, the **same config as `ft_epoch1`**, so only the data differs. 1 epoch = 457
+steps, seq 1664 with activation checkpointing (OOMs without), DDP world 4, 90.6 min,
+2,273 agg tok/s, 14.4 GiB/rank (`labs/run_bird_ft.sh`).
+
+The eval protocol changed at the same time, and every model below was re-run under it:
+**full dev (n = 1,493), seq 2048.** The old seq 1024 cut the head off 49.9% of dev
+schemas (`labs/lab11_bird_lengths.py`); at 2048 only european_football_2 (122 rows,
+2.2k-token DDL) is still truncated.
+
+| model (full dev, seq 2048) | train data | exec_accuracy [95% CI] | parse_rate | exec_error | wrong |
+|---|---|---:|---:|---:|---:|
+| Qwen3.5-4B untuned | — | 0.094 [0.080, 0.110] | 0.766 | 452 | 545 |
+| LoRA r4 (`sweep_r4`) | motherduck 25k | 0.221 [0.201, 0.243] | 0.967 | 568 | 540 |
+| LoRA r16 (`ft_epoch1`) | motherduck 25k | 0.228 [0.207, 0.250] | 0.961 | 573 | 516 |
+| LoRA r16 (`bird_r16`) | BIRD train | 0.458 [0.433, 0.483] | 0.993 | 150 | 642 |
+| **Qwen3.5-9B + LoRA r16 (`bird9b_r16`)** | **BIRD train** | **0.498** [0.473, 0.524] | 0.991 | **141** | **598** |
+
+Paired (McNemar, `sqlft.eval_sql --compare --key exec_ok`, identical rows):
+
+| A vs B | discordant (A-only / B-only) | p |
+|---|---:|---:|
+| ft_epoch1 vs **bird_r16** | 54 / 398 | < 0.001 |
+| sweep_r4 vs **bird_r16** | 46 / 400 | < 0.001 |
+| base vs bird_r16 | 36 / 580 | < 0.001 |
+| base vs ft_epoch1 | 72 / 272 | < 0.001 |
+| ft_epoch1 vs sweep_r4 | 60 / 50 | 0.391 |
+| bird_r16 (4B) vs **bird9b_r16 (9B)** | 68 / 128 | 2.2e-5 |
+
+What it means:
+
+- **The data, not the context budget, doubled execution accuracy.** `ft_epoch1` scores
+  0.228 at seq 2048 vs 0.219 at seq 1024 on 128 rows — the longer context barely moved
+  it. Same adapter config, BIRD-train data: 0.458.
+- **Schema-fidelity errors collapsed**: exec_error (invented columns/tables, missing
+  functions) 573 → 150. The residual is now dominated by *wrong* (642: runs, wrong
+  answer) — semantic errors, not hallucinated schema.
+- **It wins on every database**, including ones where motherduck training did nothing
+  (thrombosis_prediction 0.112 → 0.414, california_schools 0.072 → 0.313,
+  debit_card_specializing 0.141 → 0.469), and on the truncated-schema rows
+  (european_football_2 0.131 → 0.320).
+- **r4 vs r16 on motherduck data is a tie on exec too** (p = 0.39), confirming the sweep.
+- **The 9B adds +4.0 points (0.458 → 0.498)** with the identical recipe and data. Same
+  architecture, wider (hidden 4096 vs 2560, same attention/GatedDeltaNet head geometry, byte-
+  identical tokenizer), so the NKI kernel and its fix carry over unchanged. It is trained
+  with **FSDP2**, not DDP: 16.7 GiB of bf16 weights leave no room in a 24 GiB/core DDP
+  replica; sharded it is 4.2 GiB/core, 15.9 GiB peak, 16.0 s/step, 122 min/epoch,
+  1,664 agg tok/s (`SQLFT_MODEL=/work/models/Qwen3.5-9B labs/run_bird_ft.sh bird9b_r16 457
+  16 32 --strategy fsdp2`). It improves 10 of 11 dev databases (largest: california_schools
+  0.313 → 0.434, financial 0.274 → 0.368; superhero 0.798 → 0.767 is the one dip), and the
+  gains are spread across failure modes rather than one bucket (`labs/lab13_bird_error_analysis.py`).
+- 7 rows are unwinnable for every model (`gold_error`): the verified gold relies on the
+  builder's query-time `TRY_CAST` column rebuild, which `sqlft/bird.py` does not replicate
+  (card_games `number`/`toughness`/`frameVersion`, california_schools `Low Grade`).
+
+Sources: `runs/bird2k_{base,ft_epoch1,sweep_r4,bird_r16}.json` (per-row records, incl.
+`prompt_tokens` / `prompt_cut`), `runs/bird_r16.json` (training history).
+
 **The decode cap matters more than it looks.** At max_new 48 the fine-tuned model scored
 0.883 with 14 truncations; 96 scores 0.961 (p = 0.006, paired) and 128 scores 0.969 — and
 at 128 `n_gold_over_cap` is 0, so the cap no longer confounds the metric at all (max gold
@@ -469,7 +537,7 @@ saying out loud before quoting an improvement.
 env/     remote.sh        box access: IP discovery, ssh, push/pull
          container.sh     launch the DLC with device + volumes + clean env
          run_env.sh       the clean NEURON_* flags (and the HOST_CC opt-in)
-         Dockerfile       beta6 DLC + transformers/datasets/duckdb/kernels
+         Dockerfile       native-PyTorch DLC (public | beta6) + transformers/datasets/duckdb/kernels
          setup_box.sh     image, weights, dataset, kernel, check
 
 sqlft/   device.py        neuron device registration, sync, Timer, memory probe
@@ -495,7 +563,14 @@ labs/    lab_smoke.py             device + autograd gate
          lab02_gdn_repro.py       ablate the captured inputs to isolate the bug
          lab04_ddp_vs_fsdp.py     the parallelism regime comparison
          lab09_cached_decode_parity.py  cached vs re-forward decode, teacher-forced logits
-         lab10_bird_exec_eval.py  execution accuracy on real BIRD databases
+         lab10_bird_exec_eval.py  execution accuracy on real BIRD databases (--shard,
+                                  --merge-shards, --warmup-only)
+         lab11_bird_lengths.py    BIRD prompt lengths vs seq budget (fit / truncation)
+         lab12_bird_train_data.py gate: train/eval prompt parity, no leakage, coverage
+         lab13_bird_error_analysis.py  classify exec misses by result shape
+         run_bird_ft.sh           BIRD-train fine-tune + sharded full-dev eval
+         run_bird_eval_sharded.sh one model's full-dev exec eval over all 4 cores
+         run_bird_queue.sh        re-eval the reference models under the same protocol
          run_*.sh                 serial runners for each matrix / triage
 
 runs/    gitignored: logs, result json, captured reproducers
@@ -512,7 +587,7 @@ Default (`STACK=public`): the public-beta TorchNeuron DLC
 Python 3.14. Plus transformers 5.20.2, duckdb 2.0.0 from `env/Dockerfile`. Measured **1.7×**
 faster per step than beta6 on the same box with identical losses (NOTES.md).
 
-`STACK=beta6`: the pre-GA DLC (not public) behind
+`STACK=beta6`: the pre-GA DLC (not public; set `QWEN35_TRAIN_BETA6_IMAGE` in `.env`) behind
 every number measured before 2026-10-21 — torch 2.14.0, torch-neuronx 2.14.3, neuronx-cc
 2.0.404830, nki 0.7.0b1, transformers 5.17.0, duckdb 1.5.5.
 

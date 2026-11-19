@@ -64,6 +64,14 @@ def main() -> int:
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--save-every", type=int, default=200)
     ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--data", type=pathlib.Path, default=None,
+                    help="JSONL of training rows (default: the motherduck dataset). "
+                         "All rows are used for training when given -- the BIRD dev "
+                         "set is the eval, so no split is carved out.")
+    ap.add_argument("--strategy", choices=("ddp", "fsdp2"), default="ddp",
+                    help="ddp for anything whose frozen base fits one core (4B); fsdp2 shards "
+                         "the base 4 ways -- required for the 9B (18 GiB of bf16 weights vs "
+                         "24 GiB/core). FSDP needed HOST_CC=1 on beta6.")
     ap.add_argument("--tag", default="lab07_finetune")
     args = ap.parse_args()
 
@@ -71,7 +79,8 @@ def main() -> int:
     from sqlft.device import Timer, device_memory_bytes, get_device, set_dynamo_limits, sync
     from sqlft.lora import save_lora
     from sqlft.model import load_model, trainable_parameters
-    from sqlft.parallel import apply_ddp, init_distributed, is_main, main_first
+    from sqlft.parallel import (apply_ddp, apply_strategy, clip_grad_norm_, init_distributed,
+                                is_main, main_first)
 
     rank, world, _ = init_distributed()
     set_dynamo_limits()
@@ -79,7 +88,10 @@ def main() -> int:
     out_dir = RUNS / args.tag
 
     tok = data.get_tokenizer()
-    train_rows, eval_rows = data.split_rows(data.load_rows())
+    if args.data is not None:
+        train_rows = data.load_rows(args.data)
+    else:
+        train_rows, eval_rows = data.split_rows(data.load_rows())
     train_rows = data.filter_parseable(train_rows, report=is_main())
     loader = data.build_loader(
         train_rows, tok, args.seq, args.bs,
@@ -103,10 +115,26 @@ def main() -> int:
             lora=True, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
             lora_targets=args.lora_targets,
             gradient_checkpointing=args.grad_ckpt,
-            device=dev, verbose=is_main(),
+            # FSDP2: stay on CPU. fully_shard moves each layer to the mesh device as it
+            # shards it, so the device never holds more than one unsharded layer. Loading
+            # to the device first put all 16.7 GiB of the 9B on every core and OOMed at the
+            # first backward.
+            device=dev if args.strategy == "ddp" else None, verbose=is_main(),
         )
     inner = model
-    model = apply_ddp(model)
+    if args.strategy == "ddp":
+        model = apply_ddp(model)
+    else:
+        # fully_shard is in place: `inner` IS the sharded model; state_dict keys unchanged.
+        model, _mesh = apply_strategy(model, "fsdp2", world)
+        sync(dev)
+        on_dev = {p.device.type for p in model.parameters()}
+        assert on_dev == {dev.type}, f"params left off-device after fully_shard: {on_dev}"
+    if is_main():
+        mem = device_memory_bytes()
+        print(f"after {args.strategy} setup: device mem in use "
+              f"{mem.get('allocated', 0) / 2**30:.2f} GiB, peak {mem.get('peak', 0) / 2**30:.2f} GiB",
+              flush=True)
 
     params = trainable_parameters(model)
     opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0,
@@ -141,7 +169,8 @@ def main() -> int:
                     out = model(**batch)
                     (out.loss / args.grad_accum).backward()
                 micro.append(out.loss.detach())
-            gnorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+            # DTensor-safe under FSDP2; identical to the stock clip for plain tensors.
+            gnorm = clip_grad_norm_(params, 1.0)
             opt.step()
             loss = float(torch.stack(micro).mean().float().cpu())
 
@@ -164,13 +193,15 @@ def main() -> int:
                             "s_per_step": t.seconds})
             window = []
 
-        if is_main() and args.save_every and (step + 1) % args.save_every == 0:
-            n = save_lora(inner, out_dir / f"adapter_step{step + 1}.pt")
-            print(f"  saved adapter ({n / 1e6:.1f} MB) at step {step + 1}", flush=True)
+        if args.save_every and (step + 1) % args.save_every == 0:
+            # All ranks: under FSDP2 gathering the adapter is a collective.
+            n = save_lora(inner, out_dir / f"adapter_step{step + 1}.pt", write=is_main())
+            if is_main():
+                print(f"  saved adapter ({n / 1e6:.1f} MB) at step {step + 1}", flush=True)
 
     sync(dev)
+    size = save_lora(inner, out_dir / "adapter_final.pt", write=is_main())
     if is_main():
-        size = save_lora(inner, out_dir / "adapter_final.pt")
         warm = times[5:] or times
         result = {
             "tag": args.tag, "args": vars(args), "world": world,

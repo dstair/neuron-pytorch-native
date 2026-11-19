@@ -186,10 +186,35 @@ def duckdb_native(sqlite_path: str) -> duckdb.DuckDBPyConnection:
     return con
 
 
+MODEL_SQL_TIMEOUT_S = 30.0
+MODEL_SQL_ROW_CAP = 200_000
+
+
+def _run_watchdog(con, sql: str, timeout: float | None = None, cap: int | None = None):
+    """Execute with an interrupt watchdog and a row cap.
+
+    Model SQL is untrusted: an accidental cross join over european_football_2 runs for
+    hours (or exhausts host RAM) and would stall the whole eval after generation. A
+    watchdog interrupt surfaces as an exception, graded as `timeout`.
+    """
+    import threading
+
+    timeout = MODEL_SQL_TIMEOUT_S if timeout is None else timeout
+    cap = MODEL_SQL_ROW_CAP if cap is None else cap
+    t = threading.Timer(timeout, con.interrupt)
+    t.start()
+    try:
+        rows = con.execute(sql).fetchmany(cap + 1)
+    finally:
+        t.cancel()
+    return rows
+
+
 def grade_one(con: duckdb.DuckDBPyConnection, model_sql: str, gold_sql: str) -> dict:
     """Execute model SQL and verified gold on one database; compare result sets.
 
-    Returns stage: ok / exec_error (model SQL would not run) / wrong (ran, differed).
+    Returns stage: ok / exec_error (model SQL would not run) / timeout (model SQL ran past
+    the watchdog) / wrong (ran, differed).
     """
     ordered = bool(re.search(r"\border\s+by\b", gold_sql, re.I))
     try:
@@ -197,9 +222,12 @@ def grade_one(con: duckdb.DuckDBPyConnection, model_sql: str, gold_sql: str) -> 
     except Exception as e:
         return {"stage": "gold_error", "error": str(e).splitlines()[0][:150]}
     try:
-        cand = con.execute(model_sql).fetchall()
+        cand = _run_watchdog(con, model_sql)
     except Exception as e:
-        return {"stage": "exec_error", "error": str(e).splitlines()[0][:150]}
+        msg = str(e).splitlines()[0][:150]
+        return {"stage": "timeout" if "nterrupt" in msg else "exec_error", "error": msg}
+    if len(cand) > MODEL_SQL_ROW_CAP:
+        return {"stage": "wrong", "error": f"model returned > {MODEL_SQL_ROW_CAP} rows"}
     if results_match(ref, cand, ordered):
         return {"stage": "ok"}
     return {"stage": "wrong",
