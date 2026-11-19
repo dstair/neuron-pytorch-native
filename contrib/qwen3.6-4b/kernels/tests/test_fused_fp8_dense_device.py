@@ -15,6 +15,7 @@ import torch.nn.functional as F
 HERE = os.path.dirname(os.path.abspath(__file__))
 KERNELS = os.path.dirname(HERE)
 sys.path.insert(0, KERNELS)
+sys.path.insert(0, os.path.join(KERNELS, "legacy"))  # generic fp8_matmul reference
 
 import fp8_fused_head_ops  # noqa: E402,F401
 import fp8_fused_mlp_ops  # noqa: E402,F401

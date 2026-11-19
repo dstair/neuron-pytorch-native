@@ -12,7 +12,7 @@ profile_exec="${QWEN4B_PROFILE_EXEC:-2}"
 profile_data_path="${QWEN4B_PROFILE_DATA_PATH:-$profile_root/ne-data}"
 explorer="${QWEN4B_NEURON_EXPLORER:-/opt/aws/neuron/bin/neuron-explorer}"
 profile_python="${QWEN4B_PROFILE_PYTHON:-/mnt/nvme/profile-venv/bin/python}"
-source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+profile_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 run_id="${QWEN4B_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 run_dir="$profile_root/$run_id"
 neff="$run_dir/fullgraph.neff"
@@ -88,7 +88,7 @@ parquet_dir="$profile_data_path/profiles/global/$display_name@latest"
   exit 1
 }
 
-"$profile_python" "$source_dir/analyze_profile.py" \
+"$profile_python" "$profile_dir/analyze_profile.py" \
   "$parquet_dir" \
   --output-json "$run_dir/analysis.json" \
   >"$run_dir/analysis.stdout"

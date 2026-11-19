@@ -20,9 +20,20 @@ DeltaNet: 16 K heads, 32 V heads, head dim 128
 GQA: 16 Q heads, 4 KV heads, head dim 256, partial-64 RoPE
 ```
 
-See [PORT_PLAN.md](PORT_PLAN.md) for the transfer and validation plan,
-[RESULTS.md](RESULTS.md) for the device measurements, and
-[PROFILE_RESULTS.md](PROFILE_RESULTS.md) for the LNC=1 profile.
+See [RESULTS.md](RESULTS.md) for the device measurements, the profile, open
+work, and the exact command behind every row.
+
+Layout:
+
+```text
+static_decode.py        model + TP=4 benchmark (torchrun)
+static_decode_dp8.py    independent TP=1 replica benchmark (DP8 / DP4)
+aggregate_dp8.py        sums per-replica JSON into an aggregate result
+deploy/bench_trn2.sh    one launcher for every topology: compile|run  tp4|dp8|dp4-lnc2
+kernels/                NKI kernels on the fastest (DP8 fused) path
+kernels/legacy/         generic per-linear FP8 matmul (TP=4 FP8 variants, DP4, tests)
+profiling/              neuron-explorer capture + parquet analysis
+```
 
 ## Run
 
@@ -49,33 +60,22 @@ Use `--dtype fp8-mlp-head` for the selective TP=4 variant,
 `--dtype fp8-lm-head` to quantize only the vocabulary projection, or
 `--dtype fp8` to quantize every dense projection.
 
-For maximum aggregate throughput, first create an LNC=1 TP=1 cache and then
-launch eight replicas:
+For maximum aggregate throughput, compile one LNC=1 TP=1 replica, then launch
+eight:
 
 ```bash
 export QWEN4B_NATIVE_IMAGE=<native-neuron-image>
 export QWEN4B_MODEL_DIR=<Qwen3.5-4B-checkpoint>
 export QWEN4B_RUNTIME_TEMPLATE=<persistent-cache-directory>
-export QWEN4B_CACHE_DIR=<compiler-cache-directory>
-deploy/compile_dp1_trn2.sh
-
 export QWEN4B_RUN_ROOT=<benchmark-output-directory>
-deploy/run_dp8_trn2.sh
+deploy/bench_trn2.sh compile dp8
+deploy/bench_trn2.sh run dp8
 ```
 
-The DP8 launchers enable both fused FP8 kernels by default. Set
-`QWEN4B_FUSED_FP8_MLP=0` or `QWEN4B_FUSED_FP8_HEAD=0` to run an ablation.
-
-To run four complete models with LNC=2, use the matching cache and launcher:
-
-```bash
-export QWEN4B_RUNTIME_TEMPLATE=<lnc2-cache-directory>
-export QWEN4B_BATCH_SIZE=64
-deploy/compile_dp4_lnc2_trn2.sh
-
-export QWEN4B_RUN_ROOT=<benchmark-output-directory>
-deploy/run_dp4_lnc2_trn2.sh
-```
+`dp8` enables both fused FP8 kernels by default. Set `QWEN4B_FUSED_FP8_MLP=0` or
+`QWEN4B_FUSED_FP8_HEAD=0` to run an ablation. Use `dp4-lnc2` for four LNC=2
+replicas, and `deploy/bench_trn2.sh run tp4 <static_decode.py args>` for the
+TP=4 command above inside the container.
 
 ## Results
 
@@ -94,6 +94,4 @@ The original TP=4/LNC=2 results at BS=128/seq=256 are:
 - FP8 on every projection: **573.3 tok/s**
 
 See [RESULTS.md](RESULTS.md) for the topology comparison, memory numbers,
-numerical gates, and FP8 follow-up. See
-[PROFILE_RESULTS.md](PROFILE_RESULTS.md) for the representative-core
-performance bounds and optimization priorities.
+numerical gates, profile, and open work.

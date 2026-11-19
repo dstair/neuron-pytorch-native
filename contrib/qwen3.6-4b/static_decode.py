@@ -44,6 +44,9 @@ os.environ.setdefault("DN_TILED_CONV", "1")
 
 _KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
 sys.path.insert(0, _KERNELS)
+# Generic per-linear FP8 matmul: not on the DP8 winner path (fused kernels
+# replace it), but still used by --dtype fp8 / fp8-lm-head / fp8-mlp-head.
+sys.path.insert(0, os.path.join(_KERNELS, "legacy"))
 import deltanet_full_batched_ops  # noqa: E402,F401
 import fp8_fused_head_ops  # noqa: E402,F401
 import fp8_fused_mlp_ops  # noqa: E402,F401

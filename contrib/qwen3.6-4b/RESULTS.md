@@ -92,29 +92,71 @@ graph. This matches the failure mode already documented by the 27B work:
 FP8 is a capacity win until dequantization and adjacent operations are fused
 into wider kernels.
 
-The fused-kernel follow-up completed two of the original priorities:
-
-1. Fuse the DeltaNet QKV/Z/A/B FP8 projections into the batched DeltaNet
-   kernel, loading and transposing the activation once per layer.
-2. **Completed:** the fused-W8 MLP combines gate, up, SwiGLU, and down while
-   retaining the 9216-wide intermediate in SBUF.
-3. **Completed:** the fused vocabulary kernel applies per-channel scales and
-   performs greedy argmax without materializing `[B, vocab]` logits in HBM.
-4. Re-run the batch sweep around BS=32 and profile the new winner before
-   selecting the next fusion target.
-
 Use the fused DP8 `mlp-head` recipe for maximum aggregate throughput, TP=4
 BF16 for a model-parallel replica, and full FP8 when minimum module footprint
 matters more than speed.
 
-## Profile follow-up
+## Profile (pre-fusion DP8 winner, 748.1 tok/s)
 
-A representative-core profile of the earlier DP8 winner found GpSimd to be
-the longest-active engine at 168.84 ms, 24.7% of peak DMA bandwidth while
-active, 57.3% of bytes in transfers below 4 KiB, 6.07 GB of spill traffic, and
-a 127.77 ms serialization/overlap gap. Those findings directly motivated the
-fused kernels above, which improved throughput from 748.1 to 935.1 tok/s
-without increasing module storage.
+Captured September 10, 2026 with `profiling/profile_dp8_lnc1_trn2.sh`: one
+representative full-graph NEFF replayed alone on one LNC=1 core, then queried
+with `profiling/analyze_profile.py`. The replay took 296.61 ms (107.9 tok/s at
+BS=32). It does **not** reproduce the shared-HBM contention of the eight-copy
+run, whose mean is 13.3% lower per core.
 
-See [PROFILE_RESULTS.md](PROFILE_RESULTS.md) for the methodology, quality
-caveats, performance bounds, and source-level findings.
+| Engine | Active | Share of 296.61 ms |
+|---|---:|---:|
+| GpSimd | **168.84 ms** | **56.9%** |
+| Tensor | 145.88 ms | 49.2% |
+| DMA | 123.84 ms | 41.8% |
+| Scalar | 80.83 ms | 27.3% |
+| Vector | 72.82 ms | 24.5% |
+| Serialization/overlap gap | **127.77 ms** | **43.1%** |
+
+- GpSimd was dominated by `DMA_DIRECT2D` from the generic `fp8_matmul` kernel
+  (116.79 ms merged at its line 127).
+- DMA reached only 24.7% of the 435 GB/s per-core peak. 57.3% of bytes moved in
+  transfers of at most 4 KiB, and spill traffic was 6.07 GB (2.63 GB save, 3.44 GB
+  reload).
+- Transposes were 59.7% of Tensor Engine work, 96.6% of it compiler-generated,
+  but worth only 4.66 ms at peak.
+- Caveat: source-attributed DMA covered only 17.8% of packet bytes, so per-line DMA
+  and spill rankings are directional.
+
+That profile motivated the two fused kernels, which replaced every generic FP8
+call on the winner path and raised DP8 from 748.1 to 935.1 tok/s. The raw NTFF,
+`metrics.json`/`analysis.json` and the parquet ingest are on the trn2 host under
+`/mnt/nvme/qwen4b-work/profiles/` (instance store, so gone after a stop/start).
+
+## Open work
+
+1. Profile the fused 935.1 tok/s winner. The profile above predates the fused
+   kernels, so the next bottleneck is unmeasured.
+2. Re-run the batch sweep around BS=32 with the fused kernels.
+3. Reduce the 6.07 GB spill round-trip. Partial attribution points at DeltaNet
+   and GQA state/cache handling; it needs a higher-coverage trace first.
+4. Fuse the DeltaNet QKV/Z/A/B projections into the batched DeltaNet kernel,
+   loading and transposing the activation once per layer. A *standalone* FP8
+   in_proj kernel measured 4–12× slower than compiled BF16 on the 27B, so this
+   only pays off if fused.
+5. Add prefill (the 35B chunked DeltaNet and CTE/flash GQA paths) and integrate
+   the decode graph with a serving stack.
+
+## Reproducing
+
+All rows use `deploy/bench_trn2.sh` (see its header for the environment
+variables). DP topologies compile one replica into a runtime template, then
+`run` clones it per core.
+
+| Row | Commands |
+|---|---|
+| DP8 fused MLP + head, 935.1 | `compile dp8` then `run dp8` |
+| DP8 fused MLP, generic head, 898.8 | `QWEN4B_FUSED_FP8_HEAD=0` on both |
+| DP8 generic FP8, 748.1 | `QWEN4B_FUSED_FP8_MLP=0 QWEN4B_FUSED_FP8_HEAD=0` on both |
+| DP8 all-FP8, BS=32 / 64 | `QWEN4B_FP8_SCOPE=all` (+ `QWEN4B_BATCH_SIZE=64`), fused off, `QWEN4B_BENCH_ITERS=20` |
+| DP4 LNC=2, 513.0 | `compile dp4-lnc2` then `run dp4-lnc2` |
+| TP=4 BF16 / FP8 head / all-FP8 | `run tp4 --dtype bf16\|fp8-lm-head\|fp8 --batch-size 128 --max-seq-len 256 --warmup 3 --bench-iters 20` |
+
+Use a separate `QWEN4B_RUNTIME_TEMPLATE` for each topology/scope/fused/batch
+combination. Every replica copies the whole template, and the profiler captures
+the largest NEFF it finds there.
