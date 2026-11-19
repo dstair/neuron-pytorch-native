@@ -12,6 +12,17 @@ if [[ -f "$ENV_FILE" ]]; then
   source "$ENV_FILE"
 fi
 
+# Host Neuron runtime mount (docker args). beta-4/beta-5 needed the host /opt/aws/neuron
+# libs mounted over the image (NRT init "ucode_ll_create error 6"); beta-6 ships a
+# NEWER runtime (NRT 3.0) and that mount SHADOWS it, breaking torch_neuronx import
+# ("undefined symbol: nrta_tensor_cast, version NRT_3.0.0"). Default OFF; set
+# QWEN35_MOUNT_HOST_NEURON=1 only for an OLD image on an older-driver host.
+if [[ "${QWEN35_MOUNT_HOST_NEURON:-0}" == "1" ]]; then
+  NEURON_HOST_MOUNT="-e LD_LIBRARY_PATH=/opt/aws/neuron/lib -v /opt/aws/neuron:/opt/aws/neuron:ro"
+else
+  NEURON_HOST_MOUNT=""
+fi
+
 die() {
   echo "error: $*" >&2
   exit 2
@@ -278,7 +289,7 @@ trap cleanup EXIT
 # HANGS at execute and is SIGTERM'd before the persistent-cache write finalizes, so
 # only tiny NKI-kernel NEFFs land (fullgraph lost). See deploy/profile/README-profile-neff.md.
 docker run -d --name "$container_name" --privileged --network host --ipc host \
-  -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
+  $NEURON_HOST_MOUNT \
   -e LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so \
   -e QWEN35_CACHE_PLATFORM_TARGET=trn2 \
   -e NEURON_LOGICAL_NC_CONFIG=1 \
@@ -301,7 +312,6 @@ docker run -d --name "$container_name" --privileged --network host --ipc host \
   -e "NEURON_FRAMEWORK_DEBUG=${NEURON_FRAMEWORK_DEBUG:-0}" \
   -e DN_K_HEADS=2 -e DN_V_HEADS=4 -e GQA_Q_HEADS=2 \
   "${mode_env[@]}" \
-  -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$shim":/opt/qwen35/libnrt_platform_target_override.so:ro \
   -v "$SOURCE_DIR":/qwen:ro \
   -v "$nkilib_dir":/nki-library:ro \

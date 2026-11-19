@@ -1,0 +1,8 @@
+{
+    "name": "qwen35-moe-fp8-block-coalesced",
+    "id": "qwen35-moe-fp8-block-coalesced",
+    "version": 1,
+    "license": "Apache-2.0",
+    "backend": {"type": "neuron", "archs": []},
+    "python-depends": []
+}

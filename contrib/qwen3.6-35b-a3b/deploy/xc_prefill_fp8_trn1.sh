@@ -94,11 +94,10 @@ fi
 # a real cache-key construction via _C.compile_graph(), and with SHIM_DEBUG=1 assert
 # the shim's own line reports the override. NRT family 5 == trn2 (2 == trn1).
 PREFLIGHT=$(docker run --rm --privileged \
-  -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
+  $NEURON_HOST_MOUNT \
   -e LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so \
   -e QWEN35_CACHE_PLATFORM_TARGET=trn2 -e NEURON_LOGICAL_NC_CONFIG=1 \
   -e QWEN35_PLATFORM_TARGET_SHIM_DEBUG=1 \
-  -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$SHIM":/opt/qwen35/libnrt_platform_target_override.so:ro \
   -v "$SRC/deploy/cross_compile/validate_cache_override.py":/opt/qwen35/v.py:ro \
   "$IMAGE" bash -lc 'source /opt/torch-neuronx/.venv/bin/activate 2>/dev/null || true
@@ -128,7 +127,7 @@ mkdir -p "$CACHE"
 } | tee -a "$LOG"
 
 docker run --rm --name "$NAME" --privileged --network host --ipc host \
-  -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
+  $NEURON_HOST_MOUNT \
   -e LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so \
   -e NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
   -e QWEN35_CACHE_PLATFORM_TARGET=trn2 \
@@ -147,7 +146,6 @@ docker run --rm --name "$NAME" --privileged --network host --ipc host \
   -e PREFILL_SHARDED_LM_HEAD=1 -e PREFILL_SHARDED_EMBED=1 \
   ${DBG_ENV[@]+"${DBG_ENV[@]}"} \
   -e PYTHONPATH=/nki-library/src/nkilib_src \
-  -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$SHIM":/opt/qwen35/libnrt_platform_target_override.so:ro \
   -v "$SRC":/work:ro -v "$NKILIB":/nki-library:ro \
   -v "$MODEL":/models/Qwen3.5-35B-A3B:ro \

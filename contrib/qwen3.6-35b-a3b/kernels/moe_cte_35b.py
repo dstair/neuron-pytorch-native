@@ -699,7 +699,12 @@ def _pack_local_routes_impl(
                     value=0,
                     name=f"route_pack_direct_zero_source_offset_e{expert_idx}",
                 )
-                for _ in nl.dynamic_range(block_count_reg):
+                # nki >= 0.7 rejects nl.dynamic_range in the tracer frontend; the
+                # register-bounded loop is nl.fori_loop with a body callable. Defaults
+                # bind this lane's values at definition time.
+                def _route_pack_block(
+                    _i, expert_idx=expert_idx, gpsimd_partition=gpsimd_partition
+                ):
                     nisa.tensor_copy(
                         dst=route_block,
                         src=routed_indices.ap(
@@ -734,6 +739,8 @@ def _pack_local_routes_impl(
                         operand0=block_size,
                         name=f"route_pack_direct_advance_write_e{expert_idx}",
                     )
+
+                nl.fori_loop(0, block_count_reg, _route_pack_block)
 
         sbm.close_scope()
         sbm.close_scope()

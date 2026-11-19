@@ -47,15 +47,23 @@ harness for a 35B sparse-MoE hybrid model: 40 layers = [DeltaNet ×3, GQA ×1] �
   Native adds a `neuron` device via PrivateUse1 and is only in the Native DLC. The
   harness reads weights with a dependency-free safetensors parser (`st_reader.py`),
   so it does not need `transformers`/`safetensors` in the image.
-- **⚠️ Runtime/driver version match.** The Neuron runtime bundled in the DLC image
-  must be compatible with the host's kernel driver (`aws-neuronx-dkms`). A mismatch
-  fails `nrt_init()` even single-core with `ucode_ll_create ... error 6` /
-  `Copy from buffer to memory failed`. If the host driver is *older* than the
-  image's runtime, bind-mount the host runtime over the image's:
-  `-v /opt/aws/neuron:/opt/aws/neuron:ro -e LD_LIBRARY_PATH=/opt/aws/neuron/lib`.
-  Diagnose by checking whether the host's own stack initializes the device (a tiny
-  XLA `xm.xla_device()` tensor op) — if that works, the device is fine and it's
-  purely a runtime-in-image mismatch.
+- **⚠️ Runtime/driver version match — and which way the mismatch runs.** The Neuron
+  runtime bundled in the DLC image must be compatible with the host's kernel driver
+  (`aws-neuronx-dkms`). The fix DEPENDS ON WHICH SIDE IS OLDER:
+  - **Image runtime OLDER than host driver** (beta-4/beta-5: bundled ~2.25 vs host
+    2.29–2.34) → `nrt_init()` fails even single-core with `ucode_ll_create ... error 6`
+    / `Copy from buffer to memory failed`. Fix: bind-mount the host runtime over the
+    image's — `-v /opt/aws/neuron:/opt/aws/neuron:ro -e LD_LIBRARY_PATH=/opt/aws/neuron/lib`
+    (the `deploy/` scripts expose this as `QWEN35_MOUNT_HOST_NEURON=1`).
+  - **Image runtime NEWER than host driver** (beta-6: bundled **NRT 3.0** vs host 2.34)
+    → do the OPPOSITE: mount **nothing**. The image is self-contained; mounting host
+    libs over it, or putting them on `LD_LIBRARY_PATH`, shadows the newer runtime and
+    `import torch_neuronx` fails with
+    `undefined symbol: nrta_tensor_cast, version NRT_3.0.0`. This is the default
+    (`QWEN35_MOUNT_HOST_NEURON=0`).
+  - Note beta-6 is the **PrivateUse1 `neuron` device only** — it has no `torch_xla`, so
+    diagnose device init with a one-tensor op on `torch.device("neuron")`, not
+    `xm.xla_device()`.
 - **Weights packaging.** This code's loader is validated against a 14-shard /
   1811-tensor packing of the checkpoint. The current HF repo may be re-sharded
   (e.g. 26 shards / 1169 tensors, with fused expert `gate_up`); the parameters are

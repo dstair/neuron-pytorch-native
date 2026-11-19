@@ -12,6 +12,17 @@ if [[ -f "$ENV_FILE" ]]; then
   source "$ENV_FILE"
 fi
 
+# Host Neuron runtime mount (docker args). beta-4/beta-5 needed the host /opt/aws/neuron
+# libs mounted over the image (NRT init "ucode_ll_create error 6"); beta-6 ships a
+# NEWER runtime (NRT 3.0) and that mount SHADOWS it, breaking torch_neuronx import
+# ("undefined symbol: nrta_tensor_cast, version NRT_3.0.0"). Default OFF; set
+# QWEN35_MOUNT_HOST_NEURON=1 only for an OLD image on an older-driver host.
+if [[ "${QWEN35_MOUNT_HOST_NEURON:-0}" == "1" ]]; then
+  NEURON_HOST_MOUNT="-e LD_LIBRARY_PATH=/opt/aws/neuron/lib -v /opt/aws/neuron:/opt/aws/neuron:ro"
+else
+  NEURON_HOST_MOUNT=""
+fi
+
 die() {
   echo "error: $*" >&2
   exit 2
@@ -34,10 +45,9 @@ fi
 shim="$(cd "$(dirname "$shim")" && pwd)/$(basename "$shim")"
 
 docker run --rm --privileged \
-  -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
+  $NEURON_HOST_MOUNT \
   -e LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so \
   -e QWEN35_CACHE_PLATFORM_TARGET="$override_target" \
-  -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$shim":/opt/qwen35/libnrt_platform_target_override.so:ro \
   -v "$SCRIPT_DIR/validate_shim.py":/opt/qwen35/validate_shim.py:ro \
   "$image" /opt/torch-neuronx/.venv/bin/python \

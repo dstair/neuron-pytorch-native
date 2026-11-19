@@ -63,4 +63,23 @@ NKILIB="${QWEN35_NKILIB_DIR:-$WORK/nki-library}"
 MODEL="${QWEN35_MODEL_DIR:-$(dirname "$WORK")/Qwen3.5-35B-A3B}"
 FP8MODEL="${QWEN35_FP8_MODEL_DIR:-${MODEL}-FP8}"
 
+# Host Neuron runtime mount, as `docker run` args (word-split, unquoted, at use
+# site -- the paths have no spaces). Empty by default.
+#
+# beta-4/beta-5 bundled a Neuron runtime OLDER than the host driver, and NRT init
+# failed with `ucode_ll_create error 6` unless the host `/opt/aws/neuron` libs were
+# mounted over the image's and put on LD_LIBRARY_PATH. beta-6 ships NRT 3.0 (NEWER
+# than the host's 2.34) and is self-contained; that same mount now SHADOWS the
+# container's newer libs and breaks `import torch_neuronx` with
+# `undefined symbol: nrta_tensor_cast, version NRT_3.0.0`. So the default is OFF.
+#
+# Set QWEN35_MOUNT_HOST_NEURON=1 only when running an OLD image (beta-4/beta-5) on
+# a host whose driver is older than the image's runtime -- e.g. a trn1 cross-compile
+# host that still pins an older DLC. Verify with a one-tensor probe either way.
+if [ "${QWEN35_MOUNT_HOST_NEURON:-0}" = "1" ]; then
+  NEURON_HOST_MOUNT="-e LD_LIBRARY_PATH=/opt/aws/neuron/lib -v /opt/aws/neuron:/opt/aws/neuron:ro"
+else
+  NEURON_HOST_MOUNT=""
+fi
+
 unset _bench_env_dir
