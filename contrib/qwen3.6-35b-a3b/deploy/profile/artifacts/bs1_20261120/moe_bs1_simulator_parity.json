@@ -1,0 +1,66 @@
+{
+  "bf16_simulator_vs_bf16_cpu": {
+    "allclose_atol_2e-4_rtol_2e-2": true,
+    "cosine": 0.9999906420707703,
+    "difference_l2": 0.0013896638993173838,
+    "finite": true,
+    "max_abs": 0.0001856740564107895,
+    "mean_abs": 2.2297905161394738e-05,
+    "relative_l2": 0.004375735763460398
+  },
+  "fp8_quantized_cpu_vs_bf16_cpu": {
+    "allclose_atol_2e-4_rtol_2e-2": false,
+    "cosine": 0.9991851449012756,
+    "difference_l2": 0.012823493219912052,
+    "finite": true,
+    "max_abs": 0.0010564385447651148,
+    "mean_abs": 0.00022553032613359392,
+    "relative_l2": 0.04037826880812645
+  },
+  "fp8_simulator_vs_bf16_cpu": {
+    "allclose_atol_2e-4_rtol_2e-2": false,
+    "cosine": 0.9991743564605713,
+    "difference_l2": 0.012912103906273842,
+    "finite": true,
+    "max_abs": 0.0010822631884366274,
+    "mean_abs": 0.00022712122881785035,
+    "relative_l2": 0.04065728187561035
+  },
+  "fp8_simulator_vs_quantized_cpu": {
+    "allclose_atol_2e-4_rtol_2e-2": true,
+    "cosine": 0.9999905824661255,
+    "difference_l2": 0.0013950613792985678,
+    "finite": true,
+    "max_abs": 0.00018224027007818222,
+    "mean_abs": 2.22138060053112e-05,
+    "relative_l2": 0.004401289392262697
+  },
+  "quantization_relative_l2": {
+    "down": 0.025965968146920204,
+    "gate": 0.026408366858959198,
+    "up": 0.026421943679451942
+  },
+  "selected_experts": [
+    1,
+    12,
+    11,
+    19,
+    9,
+    26,
+    14,
+    2
+  ],
+  "shape": {
+    "batch_size": 1,
+    "expert_count": 32,
+    "expert_start": 0,
+    "hidden_size": 2048,
+    "intermediate_size": 512,
+    "layer": 0,
+    "top_k": 8
+  },
+  "simulator_seconds": {
+    "bf16": 4.019094442000096,
+    "fp8": 4.397672195999803
+  }
+}
