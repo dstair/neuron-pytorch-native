@@ -1,9 +1,5 @@
 # Profiling the 40-layer TP=8 BS=128 FP8 decode graph
 
-For the isolated BS=1 BF16-versus-row-FP8 device profiles, numerical parity,
-and replacement-boundary analysis, see
-[`artifacts/bs1_20261120/`](artifacts/bs1_20261120/).
-
 End-to-end recipe to capture a source-attributed full-graph profile of the
 Qwen3.6-35B-A3B FP8 decode graph. Verified working 2026-07-23 (tiled BS=128 FP8:
 Vector 170 ms / DMA 162 ms / total 353 ms, 66 MB debug NEFF).

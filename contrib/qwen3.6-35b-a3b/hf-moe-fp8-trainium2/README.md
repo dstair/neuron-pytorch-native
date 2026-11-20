@@ -44,7 +44,6 @@ This code closes both gaps, losslessly by default.
 | File | What it is |
 |---|---|
 | `moe_w8.py` | CPU-side weight prep. `OfficialFP8ExpertReader.load_layer(...)` turns one layer's experts into kernel operands; `build_local_affinities` turns router top-k into a dense `[B, E]` affinity matrix; `fused_moe_reference` is a CPU fp32 reference on the same operands. Also the E4M3FN / legacy-E4M3 codecs. Pure torch. |
-| `bf16_weight_prep.py` | Direct BF16-to-legacy-E4M3 quantization. Supports row scales for `moe_tkg` and one scale per 128 output rows for the coalesced output-block kernel. `BF16ExpertReader.load_layer(...)` reads the BF16 checkpoint without going through FP8 weights. |
 | `st_reader.py` | Dependency-free `.safetensors` reader. Keeps `F8_E4M3` tensors as raw bytes. |
 | `kernels/moe_fused_w8_35b.py` | Fused all-local-expert MoE NKI kernels (gate/up GEMM → SwiGLU → down GEMM → affinity scale → expert sum) that never materialize `[experts, batch, hidden]`. |
 | `kernels/moe_fused_w8_35b_ops.py` | `torch.ops.moe_w8.*` registration, so the kernels sit in a `torch.compile(fullgraph=True, backend="neuron")` graph without a graph break. |
@@ -69,32 +68,6 @@ accuracy cost. Using the `_ob` op on pow2 weights would be silently wrong, so `l
 checks the scale grid (`assert_output_block_scale_grid`).
 
 Pass the same `fp8_impl` to the weight prep and pick the matching op.
-
-## Quantize directly from BF16
-
-Use `BF16ExpertReader` when the BF16 checkpoint is available. The
-`output_block` layout computes each scale from the original BF16 tensor and
-keeps the input-independent per-128-output-row scale grid required by the
-coalesced kernel:
-
-```python
-from bf16_weight_prep import BF16ExpertReader
-
-reader = BF16ExpertReader("/path/to/Qwen3.5-35B-A3B")
-w, report = reader.load_layer(
-    layer=0,
-    expert_start=0,
-    expert_end=32,
-    layout="output_block",
-)
-print(report.relative_l2)
-reader.close()
-```
-
-Use `layout="row"` for the nkilib `moe_tkg` row-scaled layout used by the BS=1
-profile. Both paths return legacy-E4M3 bytes as `torch.int8`; neither reads an
-FP8 checkpoint. On layer 0, expert 0 of the BF16 checkpoint, the output-block
-path measured 2.657% / 2.648% / 2.640% relative L2 for gate / up / down.
 
 ## Usage
 
@@ -145,7 +118,6 @@ activations into the kernel), so the conversion adds nothing measurable. Measure
 2.14 / torch-neuronx 2.14.3 / nki 0.7.0b1 (PyTorch Native dev build).
 
 ```bash
-python3 tests/test_bf16_weight_prep.py                       # direct BF16 quantization
 python3 tests/test_moe_fp8.py --cpu-only                     # any host
 python3 tests/test_moe_fp8.py --experts 32                   # trn2, synthetic weights
 python3 tests/test_moe_fp8.py --experts 32 --checkpoint /path/to/Qwen3.5-35B-A3B-FP8 --layer 0
