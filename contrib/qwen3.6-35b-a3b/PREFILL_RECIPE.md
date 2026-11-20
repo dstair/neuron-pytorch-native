@@ -42,6 +42,17 @@ This recipe references: `QWEN35_NATIVE_IMAGE`, `QWEN35_MODEL_DIR` (BF16 — pref
 is BF16, no FP8 experts needed), `QWEN35_NKILIB_DIR`, `QWEN35_COMPILER_CACHE_DIR`,
 `QWEN35_RUN_HOST`/`QWEN35_RUN_REGION` (Trn2). Nothing is hard-coded here.
 
+> **Container generations — beta-6 (2026-09, `@sha256:404df22771…`).** The `deploy/`
+> run/compile scripts no longer mount the host Neuron runtime by default
+> (`QWEN35_MOUNT_HOST_NEURON=0`). beta-4/beta-5 needed that mount (older bundled
+> runtime → `ucode_ll_create error 6`); beta-6 ships **NRT 3.0**, newer than the
+> host's 2.34, and the mount now breaks `import torch_neuronx`
+> (`undefined symbol: nrta_tensor_cast, version NRT_3.0.0`). Set the flag to `1` only
+> for an old image on an older-driver host. Also: beta-6 is a **distinct compiler
+> identity**, so every beta-5 NEFF cache MISSES against it — the ≈4,371 / ≈4,096 tok/s
+> figures below are **beta-5** measurements; re-measure on beta-6, don't quote them
+> across the image change or A/B a beta-5 cache against a beta-6 run.
+
 ---
 
 ## 1. Host requirements — compile **and** run on the SAME Trn2
@@ -342,14 +353,20 @@ NEURON_CC_FLAGS="--target trn2 --lnc 1 --optlevel 1 --hbm-scratchpad-page-size 2
 5.08 GB/core, `top5=[220,13,197,198,62]`, all finite. (2026-09-02, trn2.3xlarge; the specific
 instance is in the gitignored `.env`.)
 
-Host neuron stack for this number — **record this with every benchmark**, the container
-bind-mounts the host's `/opt/aws/neuron` so these versions are part of the measurement:
+Host neuron stack for this number — **record this with every benchmark**. On the
+**beta-5** container that produced this figure the host `/opt/aws/neuron` was mounted
+in, so these host versions were part of the measurement:
 
 ```
 aws-neuronx-dkms 2.30.2.0   aws-neuronx-runtime-lib 2.34.10.0-ac18d186d
 aws-neuronx-collectives 2.34.10.0-74eaafac6   aws-neuronx-tools 2.32.28.0-526c2b7f6
 kernel 6.17.0-1019-aws
 ```
+
+On **beta-6** the host runtime is NOT mounted (it breaks the newer in-image NRT), so
+the runtime that executes is the **container's** NRT 3.0, not the host's 2.34 — record
+the container's runtime version alongside the host driver (`aws-neuronx-dkms`, still
+part of the measurement) when quoting a beta-6 number.
 
 > **This was published as 4,383.9 and is now 4,370.6.** That figure came from 2026-08-22 on
 > a trn2.3xlarge since terminated, with its host stack unrecorded. On the current

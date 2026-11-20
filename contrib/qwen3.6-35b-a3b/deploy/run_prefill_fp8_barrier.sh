@@ -27,7 +27,7 @@ if grep -q "only work on TRN2" "$NKILIB/src/nkilib_src/nkilib/core/moe/moe_cte/b
 fi
 echo "START $(date -u +%FT%TZ) tag=$TAG maxseq=$MAXSEQ blk=$BLK maxtok=$MAXTOK barrier=${BARRIER:-default} tiled=${TILED:-default} ablate=${ABLATE:-none}" | tee "$LOG"
 docker run --rm --name "$NAME" --privileged --network host --ipc host \
-  -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
+  $NEURON_HOST_MOUNT \
   -e NEURON_LOGICAL_NC_CONFIG=1 -e QWEN35_LNC=1 \
   -e NEURON_SCRATCHPAD_PAGE_SIZE=256 \
   -e NEURON_CC_FLAGS="--target trn2 --lnc 1 --optlevel 1 --hbm-scratchpad-page-size 256" \
@@ -41,7 +41,6 @@ docker run --rm --name "$NAME" --privileged --network host --ipc host \
   -e DN_K_HEADS=2 -e DN_V_HEADS=4 -e GQA_Q_HEADS=2 \
   -e PREFILL_SHARDED_LM_HEAD=1 -e PREFILL_SHARDED_EMBED=1 \
   -e PYTHONPATH=/nki-library/src/nkilib_src \
-  -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$SRC":/work:ro -v "$NKILIB":/nki-library:ro \
   -v "$MODEL":/models/Qwen3.5-35B-A3B:ro \
   -v "$CACHE":/tmp \

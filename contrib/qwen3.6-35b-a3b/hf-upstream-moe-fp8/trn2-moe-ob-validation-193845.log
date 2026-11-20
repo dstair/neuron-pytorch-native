@@ -1,0 +1,14 @@
+]0;-i /home/dstair/.ssh/trn2-ap-southeast-4.pem -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=20 ubuntu@16.26.56.105 
+docker run --rm --privileged --device=/dev/neuron0 --network host \
+  -e NEURON_CC_FLAGS="--target trn2" -e PYTHONUNBUFFERED=1 \
+  -v /opt/aws/neuron:/opt/aws/neuron:ro -v /home/ubuntu/moe-ab:/work -w /work \
+  421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest \
+  bash -lc "source /opt/torch-neuronx/.venv/bin/activate 2>/dev/null || true; \
+    python3 kernels/tests/test_moe_fused_w8_device.py --mode fp8 --fp8-impl block_ob_coalesced \
+      --batch-sizes 32,64,128 --local-experts 2 --hidden-size 2048 --intermediate-size 512"
+
+mode=fp8/block_ob_coalesced layout=weight BS=32 E=2: cosine=1.0000004 nrmse=0.00011% max_abs=0.000000
+mode=fp8/block_ob_coalesced layout=weight BS=64 E=2: cosine=1.0000021 nrmse=0.00114% max_abs=0.000000
+mode=fp8/block_ob_coalesced layout=weight BS=128 E=2: cosine=1.0000051 nrmse=0.00136% max_abs=0.000000
+PASS: fused W8 device outputs match the quantized CPU reference
+

@@ -42,20 +42,13 @@ harness for a 35B sparse-MoE hybrid model: 40 layers = [DeltaNet ×3, GQA ×1] �
 
 ## Environment
 
-- **You need the PyTorch-Native DLC image**, not a host XLA venv. Host
-  `torch-neuronx` venvs on the DLAMI import `torch_xla` (the XLA lowering path);
-  Native adds a `neuron` device via PrivateUse1 and is only in the Native DLC. The
-  harness reads weights with a dependency-free safetensors parser (`st_reader.py`),
-  so it does not need `transformers`/`safetensors` in the image.
-- **⚠️ Runtime/driver version match.** The Neuron runtime bundled in the DLC image
-  must be compatible with the host's kernel driver (`aws-neuronx-dkms`). A mismatch
-  fails `nrt_init()` even single-core with `ucode_ll_create ... error 6` /
-  `Copy from buffer to memory failed`. If the host driver is *older* than the
-  image's runtime, bind-mount the host runtime over the image's:
-  `-v /opt/aws/neuron:/opt/aws/neuron:ro -e LD_LIBRARY_PATH=/opt/aws/neuron/lib`.
-  Diagnose by checking whether the host's own stack initializes the device (a tiny
-  XLA `xm.xla_device()` tensor op) — if that works, the device is fine and it's
-  purely a runtime-in-image mismatch.
+- **Use the public Neuron DLAMI directly — no Docker container.** Launch trn2 from
+  *Deep Learning AMI Neuron torch-neuronx 2.14.0 (Ubuntu 26.04) SDK 2.33.1 20261112*
+  or newer and run on the host in its torch-neuronx environment. It provides the
+  PyTorch-Native `neuron` device (PrivateUse1); diagnose device init with a
+  one-tensor op on `torch.device("neuron")`. The harness reads weights with a
+  dependency-free safetensors parser (`st_reader.py`), so it does not need
+  `transformers`/`safetensors` installed.
 - **Weights packaging.** This code's loader is validated against a 14-shard /
   1811-tensor packing of the checkpoint. The current HF repo may be re-sharded
   (e.g. 26 shards / 1169 tensors, with fused expert `gate_up`); the parameters are
@@ -68,17 +61,16 @@ harness for a 35B sparse-MoE hybrid model: 40 layers = [DeltaNet ×3, GQA ×1] �
   BF16 block scales from the latter. `MOE_OFFICIAL_FP8_REFERENCE=1` builds the
   matching BF16 hybrid oracle from those same experts. Both modes are
   high-batch, decode-only, full-graph validation paths.
-- **CTE GQA needs a newer nkilib than the current DLC bundle.** The bundled
-  `attention_cte` rejects head-dim 256. The validated source is nki-library commit
+- **CTE GQA needs an nkilib whose `attention_cte` supports head-dim 256.** Older
+  bundled builds reject it. The validated source is nki-library commit
   `1ee625782cb1bf91b40bccab741a82c726445080`, exposed with
   `PYTHONPATH=<nki-library>/src/nkilib_src`. Any replacement must support
   head-dim 256, prefix K/V, and runtime `prior_used_len`.
 - **Preserve complete compiler cache roots.** Native prefill compile products land
-  under the host directory mounted as container `/tmp`, notably `hlo_cache`,
-  `neff_cache`, and NKI compiler subtrees. Use `deploy/cache/push.sh` and
-  `pull.sh` to stage/restore the full tree through S3; a bare `.neff` is not a
-  reusable cache entry. Restore before starting the container, keep the `/tmp`
-  mount and image/compiler flags/graph/shapes/TP/LNC topology identical, then use
+  under `/tmp`, notably `hlo_cache`, `neff_cache`, and NKI compiler subtrees. Use
+  `deploy/cache/push.sh` and `pull.sh` to stage/restore the full tree through S3;
+  a bare `.neff` is not a reusable cache entry. Restore before the run, keep the
+  SDK version/compiler flags/graph/shapes/TP/LNC topology identical, then use
   `inspect.sh <cache-dir> <run-log>` plus process monitoring to diagnose misses.
   In this Native stack the completed NEFFs are under `neff_cache`, not just the
   configured `NEURON_COMPILE_CACHE_URL`; a log can lack explicit hit markers, so
@@ -423,8 +415,7 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   hardware* with a *2-shard LNC=2 logical core* — we are on TRN2 either way, so it
   guards shard count, not hardware. The real fix is ~30 **additive** lines, carried
   as `patches/nkilib-lnc1-moe-cte.patch` (pinned nkilib rev `1ee625782`) and applied
-  host-side by `deploy/compile_prefill_trn2.sh` (idempotent; the container mounts
-  `/nki-library:ro`). Every hunk is inert at `NUM_SHARDS == 2`, so the LNC=2 record is
+  host-side by `deploy/compile_prefill_trn2.sh` (idempotent). Every hunk is inert at `NUM_SHARDS == 2`, so the LNC=2 record is
   untouched. At 1 shard: relax the assert, drop the three `core_barrier(..., (0,1))`
   calls (no peer core exists), and in `compute_down_proj_shard_on_intermediate`
   **alias** `block_new_lnc_recv_sbuf_lst = block_new_lst` and skip the peer
@@ -499,19 +490,14 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   512, and N=10,000 (which would also require a matched LNC=2 re-baseline, since agg
   tok/s is seq-length-sensitive and a 20k-vs-10k cross-topology comparison is
   meaningless).
-- **beta-4 container = 3,645.0 agg prompt tok/s (+5.4%), and it changes no numerics.**
-  ~~source-identical, +12.5% pure compiler win~~ ~~3,889.4 tok/s~~ — **settled
-  2026-08-05.** The original A/B was not source-pinned (`gqa_rope_kv_35b`, its op
-  wrapper and the call site were rewritten 2026-07-30 00:44–00:45 UTC, between the two
-  compiles). Running the **pre-07-30 source under beta-4** closes the 2×2: it
-  reproduces `sum=-3.17835375e+05 norm=1.20818213e+03 top5=[517,607,261,294,15089]`
-  **exactly**, at 10,974.1 ms / 3,645.0 tok/s vs 3,456.8 on the old image at the same
-  page size. So beta-4 is a clean +5.4% compiler win with zero numerical effect, on
-  both source revisions. Module resident 8.95 GB/core throughout.
-  **The 3,889.4 figure is withdrawn: it was a broken build** — see the rope-KV bullet
-  below. Lessons that keep applying: **pin the source before attributing anything to a
-  compiler**, and note `run_prefill_lnc1.sh` defaults `PAGE=64`, so a tag without
-  `pg256` is a page-64 run.
+- **Pin the source before attributing a throughput change to a compiler/SDK
+  upgrade (2026-08-05).** An SDK A/B once credited +12.5% (3,889.4 tok/s) to the
+  compiler because `gqa_rope_kv_35b`, its op wrapper and the call site were rewritten
+  between the two compiles; with the source pinned, the real compiler gain was +5.4%
+  (3,645.0 tok/s, fingerprint `sum=-3.17835375e+05 norm=1.20818213e+03
+  top5=[517,607,261,294,15089]` reproduced exactly) and the 3,889.4 figure was a broken
+  build — see the rope-KV bullet below. Also note `run_prefill_lnc1.sh` defaults
+  `PAGE=64`, so a tag without `pg256` is a page-64 run.
 - **rope-KV in-place write (2026-07-30) drops ~60% of its cache writes — do not land
   it as-is (root-caused 2026-08-05).** Only the **first in-place mutation of a given
   buffer inside one traced graph** is carried back; every later mutation of that buffer
@@ -535,15 +521,15 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
   graph, not just the addressing** — `test_gqa_rope_kv_alias_probe.py` and
   `test_gqa_rope_kv_multicall_probe.py` both passed while the production path was
   losing 6 of 10 writes.
-- **beta-4 full-graph decode: use `--optlevel 1` (2026-08-04).** Three attempts died
+- **Full-graph decode: use `--optlevel 1` (2026-08-04).** Three attempts died
   with `[F137] neuronx-cc was forcibly killed` because decode was compiling at the
   neuronx-cc *default* optlevel while prefill used an explicit O1. Adding
-  `--optlevel 1` compiled on the first try in **24m21s** (`run_decode_beta4_o1.sh`),
+  `--optlevel 1` compiled on the first try in **24m21s**,
   7.09 GB/core, **TPOT 395.11 ms/tok / 324.0 tok/s** at BS=128/seq=256, and
   **`gen hash 0cc59fb25112` — token-identical to the baseline** on rows 0 and 127.
-  That is **−26.7%** vs the 289.53 ms/tok / 442.1 tok/s default-optlevel baseline, and
-  the O1-vs-default and old-vs-beta-4 confounds **cannot be separated on this host**
-  (default optlevel is the config that OOMs; the old image is gone). **Swap is not the
+  That is **−26.7%** vs the 289.53 ms/tok / 442.1 tok/s default-optlevel baseline
+  (measured on an older SDK, so the O1-vs-default and SDK-version effects are
+  confounded). **Swap is not the
   lever** — peak use was 64/124 GB with 0 B of 63 GB swap touched, which is why 159 GB
   of swap never helped: the kill is a fast allocation spike, not gradual exhaustion.
   Rank-count reduction is not available (the LNC=1 fit needs 8 shards), and
@@ -702,8 +688,9 @@ DN_CHUNK_NKI=1 CHUNK_SIZE=16 DN_NKI=1 GQATAIL=1 \
 
 ## Device / ops hygiene
 
-- **Free the device before a new run.** A live container holds all 4 cores →
-  "Logical Neuron Core(s) not available". Kill stray containers first.
+- **Free the device before a new run.** A live process holds all 4 cores →
+  "Logical Neuron Core(s) not available". Kill stray runs first (`neuron-ls`
+  shows the owning PIDs).
 - **Cap per-config compile time** and watch host RAM on high-BS or long-seq
   compiles — a runaway neuronx-cc compile can exhaust host memory and wedge the box
   (recover by reboot). Instance-store NVMe is typically not in fstab → remount after

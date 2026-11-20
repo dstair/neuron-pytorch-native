@@ -12,6 +12,17 @@ if [[ -f "$ENV_FILE" ]]; then
   source "$ENV_FILE"
 fi
 
+# Host Neuron runtime mount (docker args). beta-4/beta-5 needed the host /opt/aws/neuron
+# libs mounted over the image (NRT init "ucode_ll_create error 6"); beta-6 ships a
+# NEWER runtime (NRT 3.0) and that mount SHADOWS it, breaking torch_neuronx import
+# ("undefined symbol: nrta_tensor_cast, version NRT_3.0.0"). Default OFF; set
+# QWEN35_MOUNT_HOST_NEURON=1 only for an OLD image on an older-driver host.
+if [[ "${QWEN35_MOUNT_HOST_NEURON:-0}" == "1" ]]; then
+  NEURON_HOST_MOUNT="-e LD_LIBRARY_PATH=/opt/aws/neuron/lib -v /opt/aws/neuron:/opt/aws/neuron:ro"
+else
+  NEURON_HOST_MOUNT=""
+fi
+
 die() {
   echo "error: $*" >&2
   exit 2
@@ -167,11 +178,10 @@ shim="$(cd "$(dirname "$shim")" && pwd)/$(basename "$shim")"
 shim_sha256="$(sha256sum "$shim" | awk '{print $1}')"
 if ! platform_check_output="$(
   docker run --rm --privileged \
-    -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
+    $NEURON_HOST_MOUNT \
     -e LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so \
     -e QWEN35_CACHE_PLATFORM_TARGET="$cache_platform_target" \
     -e NEURON_LOGICAL_NC_CONFIG="$lnc" \
-    -v /opt/aws/neuron:/opt/aws/neuron:ro \
     -v "$shim":/opt/qwen35/libnrt_platform_target_override.so:ro \
     "$resolved_image" \
     /opt/torch-neuronx/.venv/bin/python -c \
@@ -290,7 +300,7 @@ cleanup() {
 trap cleanup EXIT
 
 docker run -d --name "$container_name" --privileged \
-  -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
+  $NEURON_HOST_MOUNT \
   -e LD_PRELOAD=/opt/qwen35/libnrt_platform_target_override.so \
   -e QWEN35_MODEL_PATH=/models/Qwen3.5-35B-A3B \
   -e QWEN35_LNC="$lnc" \
@@ -310,7 +320,6 @@ docker run -d --name "$container_name" --privileged \
   -e DN_NKI=1 -e GQATAIL=1 -e PREFILL_FINGERPRINT=1 \
   -e DN_K_HEADS="$dn_k_heads" -e DN_V_HEADS="$dn_v_heads" \
   -e GQA_Q_HEADS="$gqa_q_heads" \
-  -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$shim":/opt/qwen35/libnrt_platform_target_override.so:ro \
   -v "$source_dir":/work:ro \
   -v "$nkilib_dir":/nki-library:ro \

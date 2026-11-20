@@ -2672,9 +2672,11 @@ class StaticDecode35B(nn.Module):
         # limit of 8. At compile_splits > 8 that raised FailOnRecompileLimitHit
         # (fullgraph=True) rather than anything to do with the graphs themselves.
         if compile_splits > 1:
-            import torch._dynamo
+            # `from torch import` -- a bare `import torch._dynamo` here would bind
+            # `torch` as a local of this whole function and break the splits==1 path.
+            from torch import _dynamo
             want = max(16, 2 * compile_splits + 4)
-            _dyn = torch._dynamo.config
+            _dyn = _dynamo.config
             _dyn.cache_size_limit = max(_dyn.cache_size_limit, want)
             _dyn.accumulated_cache_size_limit = max(
                 getattr(_dyn, "accumulated_cache_size_limit", 0), 4 * want

@@ -45,10 +45,13 @@ Runs in the DLC. Needs the host neuron lib mount (driver mismatch) AND
 instance is native LNC=2 = 4 cores).
 
 ```bash
+# beta-6+: no host mount, no LD_LIBRARY_PATH override — the container ships its own
+# neuron-explorer (2.32) and a self-contained NRT 3.0; mounting host /opt/aws/neuron
+# breaks the in-image runtime (undefined symbol: nrta_tensor_cast, version NRT_3.0.0).
+# On beta-4/beta-5 only, add `-v /opt/aws/neuron:/opt/aws/neuron:ro -e LD_LIBRARY_PATH=/opt/aws/neuron/lib`.
 docker run --rm --privileged --device=/dev/neuron0 \
-  -v /opt/aws/neuron/lib:/host_neuron_lib:ro -e NEURON_LOGICAL_NC_CONFIG=1 \
+  -e NEURON_LOGICAL_NC_CONFIG=1 \
   -v $PWD:/work -w /work <DLC> bash -c '
-  export LD_LIBRARY_PATH=/host_neuron_lib:$LD_LIBRARY_PATH
   neuron-explorer capture -n /work/fullgraph.neff -s /work/fg.ntff \
     --collectives-worker-count 8 -r 8 -i 0 --single-io \
     --profile-nth-exec=2 --ignore-exec-errors'   # DGE OFF (no --enable-dge-notifs)

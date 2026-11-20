@@ -25,13 +25,12 @@ sudo rm -rf "$CACHE"
 mkdir -p "$CACHE" $WORK/logs
 echo "START $(date -u +%FT%TZ) tag=$TAG force_tiled=$TILED tokens=$TOKENS barrier=${BARRIER:-default}" | tee "$LOG"
 docker run --rm --name "$NAME" --privileged --network host --ipc host \
-  -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
+  $NEURON_HOST_MOUNT \
   -e NEURON_LOGICAL_NC_CONFIG="$LNC" -e QWEN35_LNC="$LNC" \
   -e NEURON_CC_FLAGS="--target trn2 --lnc $LNC --optlevel 1" \
   -e MOE_CTE=1 -e MOE_CTE_NKI_PACK=1 -e MOE_CTE_BLOCK=512 \
   -e MOE_CTE_FORCE_TILED="${TILED}" -e MOE_CTE_SCATTER_BARRIER="${BARRIER}" \
   -e PYTHONPATH=/nki-library/src/nkilib_src \
-  -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$SRC":/work:ro -v "$NKILIB":/nki-library:ro \
   -v "$CACHE":/tmp \
   -w /work "$IMAGE" bash -lc "

@@ -16,13 +16,12 @@ if grep -q "only work on TRN2" "$NKILIB/src/nkilib_src/nkilib/core/moe/moe_cte/b
 fi
 echo "START $(date -u +%FT%TZ) tok=$TOK hid=$HID int=$INT blk=$BLK" | tee "$LOG"
 docker run --rm --name "$NAME" --privileged --network host --ipc host \
-  -e LD_LIBRARY_PATH=/opt/aws/neuron/lib \
+  $NEURON_HOST_MOUNT \
   -e NEURON_LOGICAL_NC_CONFIG="$LNC" \
   -e NEURON_CC_FLAGS="--target trn2 --lnc $LNC" \
   -e PYTHONPATH=/nki-library/src/nkilib_src \
   -e NEURON_LAUNCH_BLOCKING=1 \
   -e TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS=1 \
-  -v /opt/aws/neuron:/opt/aws/neuron:ro \
   -v "$SRC":/work:ro \
   -v "$NKILIB":/nki-library:ro \
   -v $WORK/nbackend:/tmp/neuron_backend \
