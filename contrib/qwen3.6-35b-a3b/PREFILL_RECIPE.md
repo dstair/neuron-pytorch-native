@@ -1,9 +1,15 @@
 # Max Prefill Throughput Recipe — Qwen3.6-35B-A3B (packed C32)
 
-**Fastest measured: ≈4,371 aggregate prompt tok/s** — the **FP8 CTE MoE** path at
+**Fastest measured: ≈4,404 aggregate prompt tok/s** — the **FP8 CTE MoE** path at
 TP=8/LNC=1, BS=6, **N=10,000**, in **5.08 GB/core**. See **§3d**, and read its scope
 note: that is BS=6/N=10,000, whereas the long-context BF16 headline below is
 BS=2/N=20,000, so the two are not a like-for-like swap.
+
+The public PyTorch Native DLAMI remeasurement on 2026-11-20 produced **4,404.1
+and 4,404.2 aggregate tok/s**, with the historical
+`top5=[220,13,197,198,62]` fingerprint and all state finite. This is **+0.77%**
+over the previous shipping measurement of 4,370.6. See
+[PUBLIC_AMI_BENCHMARK_2026-11-20.md](PUBLIC_AMI_BENCHMARK_2026-11-20.md).
 
 **Best at the targeted N=20,000 long-context regime: ≈4,096 tok/s** (BF16, §3c). If you
 want the number for this model's stated regime, that is still the one to quote.

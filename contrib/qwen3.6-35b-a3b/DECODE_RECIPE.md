@@ -13,6 +13,12 @@ O1 stack with the shared-base writeback (on beta-4: 202.54 vs 397.45 ms/tok, 632
 numerics gate `gen hash 7f4b446344cf`, both arms) and passing the DeltaNet-state
 occupancy gate on both arms. Requires `DN_DIRECT_STATE_OUT=1`.
 
+> **Public-DLAMI remeasurement (2026-11-20): 526.5 and 527.1 tok/s.** The exact
+> BS=128/seq=256 configuration and pinned historical source reproduced the
+> `0cc59fb25112` hashes and full ten-group KV occupancy, but averaged 526.8 tok/s
+> (242.98 ms/token), **-22.68%** from the beta-5 best. See
+> [PUBLIC_AMI_BENCHMARK_2026-11-20.md](PUBLIC_AMI_BENCHMARK_2026-11-20.md).
+
 **beta-5 (2026-08-10): 681.3 tok/s, +7.8% over beta-4's 632.0**, gen hash
 `0cc59fb25112` (== the beta-4 2-token reference) — a clean compiler-only win on the
 newer DLC (beta-5, built 2026-08-05), bit-identical. At **seq=1024**

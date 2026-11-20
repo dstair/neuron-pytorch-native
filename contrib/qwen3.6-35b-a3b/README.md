@@ -37,8 +37,16 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 
 | Phase | Best | Config | Recipe |
 |---|---|---|---|
-| **Prefill (FP8 CTE MoE)** | **4,370.6 agg prompt tok/s** | **FP8 CTE MoE** (`MOE_CTE_FP8=1`) with the **output-block scale grid + PSUM hoist** and the **uncapped route packer** (`MOE_CTE_MAX_TOKENS=0` → 6,144 tokens/MoE call), on the same packed **C32 n=4** DeltaNet at **TP=8/LNC=1**; BS=6, **N=10,000**, bucket 1024, O1, beta-5, **5.08 GB/core** (BF16 CTE is 8.95 at BS=2 — different batch, see the scope note). Fingerprint `top5=[220,13,197,198,62]`. Measured at BS=6/N=10,000 — see the scope note. Was published as 4,383.9; see the reproduction note. | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) §3d |
+| **Prefill (FP8 CTE MoE)** | **4,404.2 agg prompt tok/s** | **FP8 CTE MoE** (`MOE_CTE_FP8=1`) with the **output-block scale grid + PSUM hoist** and the **uncapped route packer** (`MOE_CTE_MAX_TOKENS=0` → 6,144 tokens/MoE call), on the same packed **C32 n=4** DeltaNet at **TP=8/LNC=1**; BS=6, **N=10,000**, bucket 1024, O1, public PyTorch Native DLAMI, **5.08 GB/core** (BF16 CTE is 8.95 at BS=2 — different batch, see the scope note). Fingerprint `top5=[220,13,197,198,62]`. Reproduced at 4,404.1 and 4,404.2; see the public-AMI remeasurement. | [PREFILL_RECIPE.md](PREFILL_RECIPE.md) §3d |
 | **Decode** | **681.3 tok/s @ BS=128** | FP8 `block_ob_coalesced` (Reduction B1) MoE + tiled DeltaNet conv + per-layer DeltaNet state (`DN_PERLAYER_STATE=1`), TP=8/LNC=1, O1, **beta-5 container**, seq=256 (**+7.8%** over beta-4's 632.0; **582.3 tok/s** at seq=1024; bit-identical `0cc59fb25112`) | [DECODE_RECIPE.md](DECODE_RECIPE.md) |
+
+> **Public-DLAMI remeasurement (2026-11-20).** With the source pinned to the
+> shipping prefill commit and the exact headline shapes/settings, prefill measured
+> **4,404.1 / 4,404.2 aggregate tok/s** (**+0.77%** versus 4,370.6). Decode measured
+> **526.5 / 527.1 tok/s** at BS=128 (**-22.68%** versus the historical beta-5
+> best), while reproducing the reference hashes and full KV-state occupancy.
+> See [PUBLIC_AMI_BENCHMARK_2026-11-20.md](PUBLIC_AMI_BENCHMARK_2026-11-20.md)
+> for the pinned source, exact configurations, versions, and correctness gates.
 
 > **Scope of the prefill headline: it is BS=6 at N=10,000, not the 20,000-token regime
 > this model targets.** Aggregate tok/s is nearly flat in prompt length — measured
@@ -53,8 +61,8 @@ DN_NKI=1 MOE_SPARSE=1 MOE_DECODE_TP=1 GQATAIL=1 DNBATCHED_V2=1 \
 > collectives` (measured 2026-09-02; host RAM was never the constraint). FP8's 5.08 GB/core
 > leaves 3.86 GB/core more headroom, which is precisely what makes BS=6 reachable.
 >
-> So the honest comparison is *best-to-best at equal N*, not like-for-like: FP8 **4,370.6** at
-> BS=6 versus BF16's **4,227.7** at BS=2, both N=10,000 — **+3.4%**. Read that as FP8
+> So the honest comparison is *best-to-best at equal N*, not like-for-like: FP8 **4,404.2** at
+> BS=6 versus BF16's **4,227.7** at BS=2, both N=10,000 — **+4.2%**. Read that as FP8
 > unlocking an operating point BF16 cannot occupy, **not** as FP8 being the faster kernel. At
 > the one configuration where both fit (BS=2/bucket 1024) **BF16 was faster** — 4,227.7 vs
 > FP8's 3,920.3, the ~7% dequant tax the output-block hoist later removed.
